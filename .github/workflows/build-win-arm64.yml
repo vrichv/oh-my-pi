@@ -1,0 +1,156 @@
+# Build the omp CLI binary for Windows arm64.
+#
+# This is a standalone workflow (not part of the main CI release pipeline)
+# that handles the full win32-arm64 cross-compilation: Rust native addon
+# via cargo-xwin, then bun --compile with aarch64-msvc target.
+#
+# Usage:
+#   - Trigger manually (workflow_dispatch) for ad-hoc builds.
+#   - Supply a tag (e.g. v0.12.0) to also create/update a GitHub Release
+#     with the binary attached.
+
+name: Build win-arm64 binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag (e.g., v0.12.0). When set, the built binary is uploaded to
+          an existing release with this tag.
+        required: false
+        type: string
+      source_ref:
+        description: >-
+          Git ref to check out (defaults to the triggering ref). Useful when
+          recovering a release after a failed run.
+        required: false
+        type: string
+
+# No top-level permissions — each job declares what it needs.
+permissions: {}
+
+concurrency:
+  group: build-win-arm64-${{ github.event.inputs.tag || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build win32-arm64 binary
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write        # gh release upload
+      id-token: write        # npm trusted publishing (optional)
+    env:
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      # ---------- toolchain ----------
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3"
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-04-29
+          targets: aarch64-pc-windows-msvc
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Enable sccache for cargo
+        shell: bash
+        run: |
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> "$GITHUB_ENV"
+
+      # ---------- MSVC cross-compile tooling ----------
+      - name: Install LLVM tooling (MSVC cross-compile)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+
+      - name: Install cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: Cache cargo-xwin Windows SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-win-arm64-v1
+
+      - name: Accept xwin license
+        run: echo "XWIN_ACCEPT_LICENSE=1" >> "$GITHUB_ENV"
+
+      # ---------- deps ----------
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+
+      - run: bun install --frozen-lockfile
+
+      # ---------- native addon ----------
+      - name: Compute native source hash
+        id: hash
+        shell: bash
+        run: |
+          source_hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
+                  packages/natives/scripts packages/natives/package.json \
+                  scripts/ci-build-native.ts scripts/host-detect.ts \
+                  -type f -print0 \
+                | sort -z \
+                | xargs -0 sha256sum \
+                | sha256sum \
+                | cut -c1-16)
+          echo "source-hash=$source_hash" >> "$GITHUB_OUTPUT"
+          echo "Native source hash: $source_hash"
+
+      - name: Build native addon (win32-arm64)
+        shell: bash
+        env:
+          CROSS_TARGET: aarch64-pc-windows-msvc
+          TARGET_PLATFORM: win32
+          TARGET_ARCH: arm64
+          TARGET_VARIANTS: ""
+        run: bun run ci:build:native
+
+      # ---------- compiled binary ----------
+      - name: Build release binary (win32-arm64)
+        env:
+          RELEASE_TARGETS: win32-arm64
+        run: bun run ci:release:build-binaries
+
+      # ---------- upload / release ----------
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-windows-arm64
+          path: packages/coding-agent/binaries/omp-windows-arm64.exe
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Attach binary to GitHub Release
+        if: ${{ github.event.inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          BINARY="packages/coding-agent/binaries/omp-windows-arm64.exe"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${BINARY}" --clobber
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              "${BINARY}"
+          fi
