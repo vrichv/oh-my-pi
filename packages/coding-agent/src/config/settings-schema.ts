@@ -1,5 +1,8 @@
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
+import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
+import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "../thinking";
 import {
 	TINY_MODEL_DEVICE_DEFAULT,
@@ -22,8 +25,16 @@ import {
 	TINY_TITLE_MODEL_OPTIONS,
 	TINY_TITLE_MODEL_VALUES,
 } from "../tiny/models";
+import {
+	DEFAULT_TTS_LOCAL_MODEL_KEY,
+	DEFAULT_TTS_VOICE,
+	TTS_LOCAL_MODEL_OPTIONS,
+	TTS_LOCAL_MODEL_VALUES,
+	TTS_LOCAL_VOICE_OPTIONS,
+	TTS_LOCAL_VOICE_VALUES,
+} from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES } from "../web/search/types";
+import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES, type SearchProviderId } from "../web/search/types";
 
 /** Unified settings schema - single source of truth for all settings.
  *
@@ -95,18 +106,21 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
  */
 export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	appearance: ["Theme", "Status Line", "Display", "Images"],
-	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback"],
+	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Vision"],
 	interaction: [
 		"Input",
 		"Approvals",
 		"Notifications",
 		"Speech",
+		"Collab",
 		"Magic Keywords",
 		"Startup & Updates",
 		"Power (macOS)",
+		"Agent",
+		"Git",
 	],
 	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
-	memory: ["General", "Mnemopi", "Hindsight"],
+	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Python"],
 	tools: [
@@ -147,7 +161,8 @@ export type StatusLineSegmentId =
 	| "cache_write"
 	| "cache_hit"
 	| "session_name"
-	| "usage";
+	| "usage"
+	| "collab";
 
 /** Submenu choice metadata. */
 export type SubmenuOption<V extends string = string> = {
@@ -245,6 +260,8 @@ type SettingDef =
 export interface ModelTagDef {
 	name: string;
 	color?: string;
+	/** If true, the role is functional but not shown in the model selector UI. */
+	hidden?: boolean;
 }
 
 export interface ModelTagsSettings {
@@ -365,7 +382,69 @@ export const SETTINGS_SCHEMA = {
 			description: "Keep the display from idle-sleeping while a session is open (caffeinate -d)",
 		},
 	},
+	"advisor.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Enable Advisor",
+			description:
+				"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and injects notes.",
+		},
+	},
+	"advisor.subagents": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor for Subagents",
+			description: "Also enable the advisor on spawned task/eval subagents.",
+		},
+	},
+	"advisor.syncBacklog": {
+		type: "enum",
+		values: ["off", "1", "3", "5"] as const,
+		default: "off",
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor Sync Backlog",
+			description:
+				"Pause the main agent for up to 30 seconds if the advisor falls behind by this many turns. Off disables catch-up delays.",
+		},
+	},
+	"advisor.immuneTurns": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor Immune Turns",
+			description:
+				"After an advisor concern or blocker interrupts, route further concerns/blockers non-interruptingly for this many primary turns.",
+			options: [
+				{ value: "0", label: "0 turns", description: "Allow every concern/blocker to interrupt." },
+				{ value: "1", label: "1 turn", description: "Default." },
+				{ value: "2", label: "2 turns" },
+				{ value: "3", label: "3 turns" },
+				{ value: "4", label: "4 turns" },
+				{ value: "5", label: "5 turns" },
+			],
+		},
+	},
 	shellPath: { type: "string", default: undefined },
+	"git.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Git",
+			label: "Enable Git Integration",
+			description: "Show git branch, status, and PR information in the TUI and watch repository metadata.",
+		},
+	},
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
@@ -663,6 +742,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"images.describeForTextModels": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Describe Images for Text Models",
+			description:
+				"When an image is attached to a model without vision support, save it under local:// and inject a description from a vision-capable model instead of dropping it",
+		},
+	},
+
 	"tui.maxInlineImageColumns": {
 		type: "number",
 		default: 100,
@@ -706,6 +797,16 @@ export const SETTINGS_SCHEMA = {
 			label: "Terminal Hyperlinks",
 			description:
 				"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+		},
+	},
+	"tui.tight": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Tight Layout",
+			description: "Remove the 1-character horizontal padding from the left and right of the terminal output",
 		},
 	},
 	// Display rendering
@@ -994,6 +1095,32 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	fastModeScope: {
+		type: "enum",
+		values: ["both", "openai", "claude"] as const,
+		default: "both",
+		ui: {
+			tab: "model",
+			group: "Sampling",
+			label: "Fast Mode Scope",
+			description:
+				'Which providers `/fast on` (and the fast-mode toggle) target. "both" = priority on every supported provider; "openai"/"claude" scope it to one family (mirrors serviceTier openai-only/claude-only).',
+			options: [
+				{ value: "both", label: "Both", description: "Priority on every supported provider" },
+				{
+					value: "openai",
+					label: "OpenAI only",
+					description: "Priority on OpenAI/OpenAI-Codex requests; ignored elsewhere",
+				},
+				{
+					value: "claude",
+					label: "Claude only",
+					description: "Anthropic fast mode on direct Claude requests; ignored elsewhere",
+				},
+			],
+		},
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 
@@ -1179,6 +1306,25 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"paste.largeMenuThreshold": {
+		type: "number",
+		default: 100,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Large Paste Menu",
+			description:
+				"When a paste reaches this many lines, offer a menu to wrap it in a code block, wrap it in XML tags, or save it to a file. 0 disables the menu (large pastes still collapse to a [Paste] marker).",
+			options: [
+				{ value: "0", label: "Off" },
+				{ value: "100", label: "100 lines" },
+				{ value: "250", label: "250 lines" },
+				{ value: "500", label: "500 lines" },
+				{ value: "1000", label: "1000 lines" },
+			],
+		},
+	},
+
 	"startup.quiet": {
 		type: "boolean",
 		default: false,
@@ -1327,6 +1473,52 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Collab
+	"collab.relayUrl": {
+		type: "string",
+		default: DEFAULT_RELAY_URL,
+		ui: {
+			tab: "interaction",
+			group: "Collab",
+			label: "Relay URL",
+			description: "Relay used by /collab (wss://host[:port])",
+		},
+	},
+
+	"collab.displayName": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			group: "Collab",
+			label: "Display Name",
+			description: "Name shown to other collab participants (default: OS username)",
+		},
+	},
+
+	"share.serverUrl": {
+		type: "string",
+		default: DEFAULT_SHARE_URL,
+		ui: {
+			tab: "interaction",
+			group: "Collab",
+			label: "Share Server",
+			description:
+				"Share viewer/upload base used by /share (encrypted blob upload + viewer; links are <base>/<id>#<key>)",
+		},
+	},
+
+	"share.redactSecrets": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Collab",
+			label: "Share Secret Redaction",
+			description: "Run the secret obfuscator over /share snapshots before upload (uses the secrets.* config)",
+		},
+	},
+
 	// Speech-to-text
 	"stt.enabled": {
 		type: "boolean",
@@ -1346,24 +1538,15 @@ export const SETTINGS_SCHEMA = {
 
 	"stt.modelName": {
 		type: "enum",
-		values: ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large"] as const,
-		default: "base.en",
+		values: STT_MODEL_VALUES,
+		default: DEFAULT_STT_MODEL_KEY,
 		ui: {
 			tab: "interaction",
 			group: "Speech",
 			label: "Speech Model",
-			description: "Whisper model size (larger = more accurate but slower)",
-			options: [
-				{ value: "tiny", label: "tiny", description: "Multilingual; fastest, lowest accuracy" },
-				{ value: "tiny.en", label: "tiny.en", description: "English-only; fastest" },
-				{ value: "base", label: "base", description: "Multilingual; small and fast" },
-				{ value: "base.en", label: "base.en", description: "English-only; default" },
-				{ value: "small", label: "small", description: "Multilingual; balanced" },
-				{ value: "small.en", label: "small.en", description: "English-only; balanced" },
-				{ value: "medium", label: "medium", description: "Multilingual; accurate but slower" },
-				{ value: "medium.en", label: "medium.en", description: "English-only; accurate but slower" },
-				{ value: "large", label: "large", description: "Multilingual; most accurate" },
-			],
+			description:
+				"Local on-device speech model. Parakeet TDT v3 (sherpa-onnx) is the SoTA default; Whisper base/small/large-v3-turbo tiers (transformers.js) trade size for multilingual coverage. Downloaded on first use.",
+			options: STT_MODEL_OPTIONS,
 		},
 	},
 
@@ -1374,7 +1557,7 @@ export const SETTINGS_SCHEMA = {
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "context",
 			group: "General",
@@ -1571,6 +1754,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"compaction.dropUseless": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Elide Uneventful Results",
+			description:
+				"Prune tool results flagged contextually useless (no matches, timed-out waits) once consumed (cache-aware)",
+		},
+	},
+
 	// Experimental: snapcompact inline imaging (transient, per-request; never persisted)
 	"snapcompact.systemPrompt": {
 		type: "enum",
@@ -1607,6 +1802,54 @@ export const SETTINGS_SCHEMA = {
 			label: "Snapcompact Tool Results",
 			description:
 				"Experimental: render large historical tool results as dense PNG image(s) instead of text (vision models only). Saves tokens on accumulated read/search output.",
+		},
+	},
+
+	"tools.format": {
+		type: "enum",
+		values: [
+			"auto",
+			"native",
+			"glm",
+			"hermes",
+			"kimi",
+			"xml",
+			"anthropic",
+			"deepseek",
+			"harmony",
+			"pi",
+			"qwen3",
+			"gemini",
+			"gemma",
+			"minimax",
+		] as const,
+		default: "auto",
+		ui: {
+			tab: "context",
+			group: "Experimental",
+			label: "Tool Calling Mode",
+			description:
+				"Controls how tools are exposed to the model. Auto uses provider-native tool calls unless the selected model is marked as not supporting them, then falls back to the GLM owned dialect. Native forces provider-native tools; the other values force the named owned dialect. Applies on session start.",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Use native tool calls unless the model is known not to support them.",
+				},
+				{ value: "native", label: "Native", description: "Use provider-native tool calls." },
+				{ value: "glm", label: "GLM", description: "Use GLM-style in-band tool calls." },
+				{ value: "hermes", label: "Hermes", description: "Use Hermes-style in-band tool calls." },
+				{ value: "kimi", label: "Kimi", description: "Use Kimi-style in-band tool calls." },
+				{ value: "xml", label: "XML", description: "Use generic XML in-band tool calls." },
+				{ value: "anthropic", label: "Anthropic", description: "Use Anthropic-style in-band tool calls." },
+				{ value: "deepseek", label: "DeepSeek", description: "Use DeepSeek-style in-band tool calls." },
+				{ value: "harmony", label: "Harmony", description: "Use Harmony-style in-band tool calls." },
+				{ value: "pi", label: "Pi", description: "Use the Pi owned dialect." },
+				{ value: "qwen3", label: "Qwen3", description: "Use the Qwen3 owned dialect." },
+				{ value: "gemini", label: "Gemini", description: "Use the Gemini owned dialect." },
+				{ value: "gemma", label: "Gemma", description: "Use the Gemma owned dialect." },
+				{ value: "minimax", label: "MiniMax", description: "Use the MiniMax owned dialect." },
+			],
 		},
 	},
 
@@ -1681,6 +1924,18 @@ export const SETTINGS_SCHEMA = {
 					value: "8on16-bw",
 					label: "8x13 on 16px pitch, black",
 					description: "8x13 glyphs on an 8x16 cell (extra leading), black ink.",
+				},
+				{
+					value: "8on22-bw",
+					label: "8x13 on 22px pitch (leading), black",
+					description:
+						"8x13 glyphs on an 8x22 cell — extra line spacing so rows don't crowd. Default for OpenAI/Google.",
+				},
+				{
+					value: "11on16-bw",
+					label: "8x13 on 11px advance (tracking), black",
+					description:
+						"8x13 glyphs on an 11x16 cell — extra letter spacing so characters don't merge. Default for Anthropic.",
 				},
 				{
 					value: "doc-8on16-bw",
@@ -1779,6 +2034,35 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Auto-Learn (experimental): post-stop nudge to capture lessons to memory
+	// and mint/enhance isolated managed skills under ~/.omp/agent/managed-skills.
+	// Master flag is default-off → zero footprint; sub-flags gate behaviour.
+	"autolearn.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "memory",
+			group: "Auto-Learn",
+			label: "Auto-Learn (experimental)",
+			description:
+				"After the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills",
+		},
+	},
+	"autolearn.autoContinue": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "memory",
+			group: "Auto-Learn",
+			label: "Auto-run capture at stop",
+			description:
+				"When on, auto-run one capture turn at stop (uses extra tokens). Off = passive reminder on your next turn.",
+			condition: "autolearnActive",
+		},
+	},
+	// Config-file-only knob (numbers without `options` are hidden from the UI).
+	"autolearn.minToolCalls": { type: "number", default: 5 },
+
 	// Mnemopi local SQLite memory backend.
 	"mnemopi.dbPath": {
 		type: "string",
@@ -1827,6 +2111,31 @@ export const SETTINGS_SCHEMA = {
 					value: "per-project-tagged",
 					label: "Per project (tagged)",
 					description: "Write to a project-local bank but merge project + shared recall results",
+				},
+			],
+			condition: "mnemopiActive",
+		},
+	},
+	"mnemopi.embeddingVariant": {
+		type: "enum",
+		values: ["en", "multilingual"] as const,
+		default: "en",
+		ui: {
+			tab: "memory",
+			group: "Mnemopi",
+			label: "Embedding variant",
+			description:
+				"Local embedding model family. en = stronger English model; multilingual = cross-language model. Changing this rebuilds existing memory embeddings on next start.",
+			options: [
+				{
+					value: "en",
+					label: "English (bge-base-en-v1.5)",
+					description: "BAAI/bge-base-en-v1.5 (768d), English-only",
+				},
+				{
+					value: "multilingual",
+					label: "Multilingual (multilingual-e5-large)",
+					description: "intfloat/multilingual-e5-large (1024d), cross-language recall",
 				},
 			],
 			condition: "mnemopiActive",
@@ -1894,7 +2203,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "memory",
 			group: "Mnemopi",
 			label: "Mnemopi Embedding Model",
-			description: "Optional embedding model override passed to Mnemopi",
+			description:
+				"Advanced: explicit embedding model id that overrides the variant. Leave empty to use mnemopi.embeddingVariant.",
 			condition: "mnemopiActive",
 		},
 	},
@@ -2402,7 +2712,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Read Summaries",
 			label: "Read Summary Unfold Ceiling",
 			description:
-				"Hard ceiling on summary size while BFS-unfolding. An unfold that would exceed this is reverted and unfolding stops.",
+				"Hard ceiling on summary size while BFS-unfolding. An unfold whose revealed lines would exceed this is skipped (that span stays folded) and unfolding continues with the remaining spans.",
 		},
 	},
 
@@ -2710,13 +3020,23 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"todo.eager": {
-		type: "boolean",
-		default: false,
+		type: "enum",
+		values: ["default", "preferred", "always"] as const,
+		default: "default",
 		ui: {
 			tab: "tools",
 			group: "Todos",
 			label: "Create Todos Automatically",
-			description: "Automatically create a comprehensive todo list after the first message",
+			description: "How strongly to push automatic todo-list creation after the first message",
+			options: [
+				{ value: "default", label: "Default", description: "Model decides; no automatic todo list" },
+				{
+					value: "preferred",
+					label: "Preferred",
+					description: "Suggests a todo list on the first message (reminder, not forced)",
+				},
+				{ value: "always", label: "Always", description: "Forces a comprehensive todo list on the first message" },
+			],
 		},
 	},
 
@@ -2804,17 +3124,6 @@ export const SETTINGS_SCHEMA = {
 
 	// Optional tools
 
-	"renderMermaid.enabled": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tools",
-			group: "Available Tools",
-			label: "Render Mermaid",
-			description: "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
-		},
-	},
-
 	"debug.enabled": {
 		type: "boolean",
 		default: true,
@@ -2826,14 +3135,14 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"tts.enabled": {
+	"speechgen.enabled": {
 		type: "boolean",
 		default: false,
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
-			label: "Text-to-Speech",
-			description: "Enable the tts tool for xAI Grok Voice speech synthesis",
+			label: "Speech Generation",
+			description: "Enable the tts tool for on-device (Kokoro) or xAI Grok Voice speech-file synthesis",
 		},
 	},
 
@@ -2962,6 +3271,18 @@ export const SETTINGS_SCHEMA = {
 			description: "Launch browser in headless mode (disable to show browser UI)",
 		},
 	},
+
+	"browser.cmux": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Search & Browser",
+			label: "cmux Browser",
+			description:
+				"Use cmux WKWebView surfaces for browser automation when a cmux socket is available. Set PI_BROWSER_CMUX=0 or PI_BROWSER_CMUX=1 to override.",
+		},
+	},
 	"browser.screenshotDir": {
 		type: "string",
 		default: undefined,
@@ -2983,6 +3304,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Execution",
 			label: "Intent Tracing",
 			description: "Ask the agent to describe the intent of each tool call before executing it",
+		},
+	},
+	"tools.abortOnFabricatedResult": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Execution",
+			label: "Abort On Fabricated Tool Result",
+			description:
+				"With in-band tool calls, stop the model immediately when it starts hallucinating a tool result mid-turn. Disable to let the model finish generating and discard the fabricated continuation instead.",
 		},
 	},
 
@@ -3024,19 +3356,21 @@ export const SETTINGS_SCHEMA = {
 
 	"async.pollWaitDuration": {
 		type: "enum",
-		values: ["5s", "10s", "30s", "1m", "5m"] as const,
-		default: "30s",
+		values: ["5s", "10s", "30s", "1m", "5m", "smart"] as const,
+		default: "smart",
 		ui: {
 			tab: "tools",
 			group: "Execution",
-			label: "Poll Wait Duration",
-			description: "How long the poll tool waits for background job updates before returning the current state",
+			label: "Max Poll Time",
+			description:
+				"How long the poll tool waits for background job updates before returning the current state. A fixed value waits that exact duration every time. `smart` adapts: it starts at 5s and lengthens with each back-to-back poll (up to 5m), then resets to 5s after about a minute without polling.",
 			options: [
 				{ value: "5s", label: "5 seconds" },
 				{ value: "10s", label: "10 seconds" },
-				{ value: "30s", label: "30 seconds", description: "Default" },
+				{ value: "30s", label: "30 seconds" },
 				{ value: "1m", label: "1 minute" },
 				{ value: "5m", label: "5 minutes" },
+				{ value: "smart", label: "Smart", description: "Default — adaptive 5s→5m, resets when you stop polling" },
 			],
 		},
 	},
@@ -3163,6 +3497,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"plan.defaultOnStartup": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Start in Plan Mode",
+			description: "Automatically enter plan mode at the start of every new session",
+			condition: "planModeEnabled",
+		},
+	},
+
 	"goal.enabled": {
 		type: "boolean",
 		default: true,
@@ -3278,13 +3624,19 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	"task.eager": {
-		type: "boolean",
-		default: false,
+		type: "enum",
+		values: ["default", "preferred", "always"] as const,
+		default: "default",
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Prefer Task Delegation",
-			description: "Encourage the agent to delegate work to subagents unless changes are trivial",
+			description: "How strongly to push delegating work to subagents",
+			options: [
+				{ value: "default", label: "Default", description: "Model decides when to delegate" },
+				{ value: "preferred", label: "Preferred", description: "Adds delegation guidance to the system prompt" },
+				{ value: "always", label: "Always", description: "Prompt guidance plus a first-turn delegation reminder" },
+			],
 		},
 	},
 
@@ -3465,6 +3817,10 @@ export const SETTINGS_SCHEMA = {
 
 	"skills.enablePiProject": { type: "boolean", default: true },
 
+	"skills.enableAgentsUser": { type: "boolean", default: true },
+
+	"skills.enableAgentsProject": { type: "boolean", default: true },
+
 	"skills.customDirectories": { type: "array", default: [] as string[] },
 
 	"skills.ignoredSkills": { type: "array", default: [] as string[] },
@@ -3545,6 +3901,44 @@ export const SETTINGS_SCHEMA = {
 			options: SEARCH_PROVIDER_OPTIONS,
 		},
 	},
+	"providers.webSearchExclude": {
+		type: "array",
+		default: [] as SearchProviderId[],
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Excluded Web Search Providers",
+			description: "Providers that web_search should never use, even as fallbacks",
+		},
+	},
+	"providers.antigravityEndpoint": {
+		type: "enum",
+		values: ["auto", "production", "sandbox"] as const,
+		default: "auto",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Antigravity Endpoint Mode",
+			description: "Endpoint routing strategy for google-antigravity providers (chat, search, image, discovery)",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Try production endpoint, fail over to sandbox on 5xx/429",
+				},
+				{
+					value: "production",
+					label: "Production Only",
+					description: "Force production endpoint only",
+				},
+				{
+					value: "sandbox",
+					label: "Sandbox Only",
+					description: "Force sandbox endpoint only",
+				},
+			],
+		},
+	},
 	"providers.image": {
 		type: "enum",
 		values: ["auto", "openai", "antigravity", "xai", "gemini", "openrouter"] as const,
@@ -3574,6 +3968,93 @@ export const SETTINGS_SCHEMA = {
 				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
 				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
 			],
+		},
+	},
+	"providers.tts": {
+		type: "enum",
+		values: ["auto", "local", "xai"] as const,
+		default: "auto",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Text-to-Speech Provider",
+			description: "Backend for the tts tool: local on-device neural TTS (Kokoro-82M) or xAI Grok Voice",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Prefer local on-device TTS; route .mp3 output to xAI when credentials exist",
+				},
+				{ value: "local", label: "Local", description: "On-device neural TTS (Kokoro-82M); output is WAV/PCM16" },
+				{
+					value: "xai",
+					label: "xAI Grok Voice",
+					description: "Requires xAI Grok OAuth or XAI_API_KEY; MP3 or WAV",
+				},
+			],
+		},
+	},
+	"tts.localModel": {
+		type: "enum",
+		values: TTS_LOCAL_MODEL_VALUES,
+		default: DEFAULT_TTS_LOCAL_MODEL_KEY,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Local TTS Model",
+			description: "On-device neural TTS model (Kokoro-82M) used by the local TTS backend",
+			options: TTS_LOCAL_MODEL_OPTIONS,
+		},
+	},
+	"tts.localVoice": {
+		type: "enum",
+		values: TTS_LOCAL_VOICE_VALUES,
+		default: DEFAULT_TTS_VOICE,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Local TTS Voice",
+			description: "Kokoro voice used by the local TTS backend (American/British, female/male)",
+			options: TTS_LOCAL_VOICE_OPTIONS,
+		},
+	},
+	"speech.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Speech Vocalization",
+			description: "Speak the assistant's output aloud through the speakers as it streams",
+		},
+	},
+	"speech.mode": {
+		type: "enum",
+		values: ["all", "assistant", "yield"] as const,
+		default: "assistant",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Speech Vocalization Mode",
+			description:
+				"What to speak: all = assistant messages + thinking; assistant = messages only; yield = only the final message at turn end",
+			options: [
+				{ value: "all", label: "All (messages + thinking)" },
+				{ value: "assistant", label: "Assistant messages" },
+				{ value: "yield", label: "Final message only" },
+			],
+		},
+	},
+	"speech.voice": {
+		type: "enum",
+		values: TTS_LOCAL_VOICE_VALUES,
+		default: DEFAULT_TTS_VOICE,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Speech Vocalization Voice",
+			description: "Kokoro voice used when speaking the assistant's output aloud",
+			options: TTS_LOCAL_VOICE_OPTIONS,
 		},
 	},
 	"providers.tinyModel": {
@@ -3641,6 +4122,30 @@ export const SETTINGS_SCHEMA = {
 				"Difficulty classifier for the `auto` thinking level: online smol by default, or a local on-device model",
 			condition: "autoThinkingActive",
 			options: AUTO_THINKING_MODEL_OPTIONS,
+		},
+	},
+	"features.unexpectedStopDetection": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Agent",
+			label: "Detect unexpected stops",
+			description:
+				"Use a small model to detect when the assistant says it will continue but stops without tool calls; automatically prompt it to continue.",
+		},
+	},
+	"providers.unexpectedStopModel": {
+		type: "enum",
+		values: TINY_MEMORY_MODEL_VALUES,
+		default: ONLINE_MEMORY_MODEL_KEY,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "Unexpected Stop Model",
+			description: "Classifier for unexpected-stop detection: online smol by default, or a local on-device model.",
+			condition: "unexpectedStopDetection",
+			options: TINY_MEMORY_MODEL_OPTIONS,
 		},
 	},
 
@@ -3725,14 +4230,24 @@ export const SETTINGS_SCHEMA = {
 	},
 	// Codex saved rate-limit resets (auto-redeem)
 	"codexResets.autoRedeem": {
-		type: "boolean",
-		default: false,
+		type: "enum",
+		values: ["unset", "yes", "no"] as const,
+		default: "unset" as const,
 		ui: {
 			tab: "providers",
 			group: "Services",
 			label: "Codex Auto-Redeem Saved Resets",
 			description:
-				"When a turn is blocked by the Codex weekly limit on the active account and no other account is available, automatically spend one saved rate-limit reset (ChatGPT 'save rate limit resets'). Conservative: never fires for 5-hour-only or Spark limits, near a natural reset, or twice for the same block. Requires retries enabled.",
+				"When a turn is blocked by the Codex weekly limit on the active account and no other account is available, run the conservative saved-reset check. unset asks before spending the first eligible reset, yes spends eligible resets without prompting, and no disables the check entirely. Requires retries enabled.",
+			options: [
+				{
+					value: "unset",
+					label: "Unset",
+					description: "Check eligibility, then ask before spending the first saved reset.",
+				},
+				{ value: "yes", label: "Yes", description: "Spend eligible saved resets without prompting." },
+				{ value: "no", label: "No", description: "Do not run the saved-reset auto-redeem check." },
+			],
 		},
 	},
 	"codexResets.minBlockedMinutes": {
@@ -3876,9 +4391,6 @@ export const SETTINGS_SCHEMA = {
 
 	"dev.autoqaPush.endpoint": {
 		type: "string",
-		// Bundled QA collector — runs `/work/pi-www/autoqa` behind qa.omp.sh.
-		// Override via `PI_AUTO_QA_PUSH_URL` or `dev.autoqaPush.endpoint`
-		// in `config.yml` to point at a self-hosted instance.
 		default: "https://qa.omp.sh/v1/grievances" as const,
 		ui: {
 			tab: "tools",
@@ -4019,6 +4531,7 @@ export interface CompactionSettings {
 	idleThresholdTokens: number;
 	idleTimeoutSeconds: number;
 	supersedeReads: boolean;
+	dropUseless: boolean;
 }
 
 export interface ContextPromotionSettings {
@@ -4068,6 +4581,8 @@ export interface SkillsSettings {
 	enableClaudeProject?: boolean;
 	enablePiUser?: boolean;
 	enablePiProject?: boolean;
+	enableAgentsUser?: boolean;
+	enableAgentsProject?: boolean;
 	customDirectories?: string[];
 	ignoredSkills?: string[];
 	includeSkills?: string[];
@@ -4123,8 +4638,7 @@ export interface SttSettings {
 	enabled: boolean;
 	language: string | undefined;
 	modelName: string;
-	whisperPath: string | undefined;
-	modelPath: string | undefined;
+	streaming: boolean;
 }
 
 export interface BashInterceptorRule {
@@ -4144,8 +4658,10 @@ export interface ShellMinimizerSettings {
 	sourceOutlineLevel: "default" | "aggressive";
 	legacyFilters: boolean | undefined;
 }
+export type CodexAutoRedeemMode = "unset" | "yes" | "no";
+
 export interface CodexResetsSettings {
-	autoRedeem: boolean;
+	autoRedeem: CodexAutoRedeemMode;
 	minBlockedMinutes: number;
 	keepCredits: number;
 }

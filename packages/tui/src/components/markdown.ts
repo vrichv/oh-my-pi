@@ -1,14 +1,19 @@
 import { LRUCache } from "lru-cache/raw";
-import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
+import { Marked, type Token, Tokenizer, type TokenizerAndRendererExtension, type Tokens } from "marked";
+import { latexToBlock } from "../latex-block";
+import { inlineMathSpanEnd, isBareMathEnvironment, latexToUnicode } from "../latex-to-unicode";
 import type { SymbolTheme } from "../symbols";
 import { TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import {
 	applyBackgroundToLine,
+	Ellipsis,
 	encodeTextSized,
+	getPaddingX,
 	getSegmenter,
 	padding,
 	replaceTabs,
+	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "../utils";
@@ -48,6 +53,126 @@ markdownParser.setOptions({
 	tokenizer: new StrictStrikethroughTokenizer(),
 });
 
+// Math spans (`$$…$$`, `\[…\]`, `$…$`, `\(…\)`) are tokenized as a dedicated
+// `math` inline token before markdown's escape/emphasis/link rules run, so
+// backslash commands (`\frac`, `\alpha`) and intraword underscores (`x_i`)
+// survive intact instead of being mangled or split. The `$…$` form uses
+// pandoc's anti-currency heuristic (`inlineMathSpanEnd`) so "$5 and $10" is
+// never math. Inline extensions run before marked's escape tokenizer, so
+// `\(…\)` becomes math while a genuinely escaped `\$` is left to `escape` and
+// renders as a literal dollar.
+const mathExtension: TokenizerAndRendererExtension = {
+	name: "math",
+	level: "inline",
+	start(src) {
+		const m = /\$|\\\(|\\\[/.exec(src);
+		return m ? m.index : undefined;
+	},
+	tokenizer(src) {
+		if (src.startsWith("$$")) {
+			const end = src.indexOf("$$", 2);
+			if (end !== -1 && src.slice(2, end).trim().length > 0) {
+				return { type: "math", raw: src.slice(0, end + 2), text: src.slice(2, end), display: true };
+			}
+			return undefined;
+		}
+		if (src.startsWith("\\[")) {
+			const end = src.indexOf("\\]", 2);
+			if (end !== -1) return { type: "math", raw: src.slice(0, end + 2), text: src.slice(2, end), display: true };
+			return undefined;
+		}
+		if (src.startsWith("\\(")) {
+			const end = src.indexOf("\\)", 2);
+			if (end !== -1) return { type: "math", raw: src.slice(0, end + 2), text: src.slice(2, end), display: false };
+			return undefined;
+		}
+		if (src.charCodeAt(0) === 0x24 /* $ */) {
+			const end = inlineMathSpanEnd(src, 0);
+			if (end !== -1) return { type: "math", raw: src.slice(0, end + 1), text: src.slice(1, end), display: false };
+		}
+		return undefined;
+	},
+	renderer(token) {
+		return (token as { text?: string }).text ?? "";
+	},
+};
+
+// Display math blocks: opening `$$` / `\[` and closing `$$` / `\]` each alone on
+// their own line (≤3 leading spaces). Matched at the block level — before
+// paragraph/list parsing — so a multi-line equation (e.g. a matrix with `\\`
+// row breaks) renders across several lines instead of being collapsed onto one,
+// and blank lines inside the block don't split it. The own-line requirement
+// keeps inline `$$…$$` inside prose for the inline tokenizer above.
+const MATH_BLOCK_DOLLAR = /^ {0,3}\$\$[ \t]*\n([\s\S]+?)\n {0,3}\$\$[ \t]*(?:\n|$)/;
+const MATH_BLOCK_BRACKET = /^ {0,3}\\\[[ \t]*\n([\s\S]+?)\n {0,3}\\\][ \t]*(?:\n|$)/;
+const MATH_BLOCK_START = /(?:^|\n) {0,3}(?:\$\$|\\\[)[ \t]*\n/;
+const mathBlockExtension: TokenizerAndRendererExtension = {
+	name: "mathBlock",
+	level: "block",
+	start(src) {
+		const m = MATH_BLOCK_START.exec(src);
+		return m ? m.index : undefined;
+	},
+	tokenizer(src) {
+		const m = MATH_BLOCK_DOLLAR.exec(src) ?? MATH_BLOCK_BRACKET.exec(src);
+		if (!m || m[1].trim().length === 0) return undefined;
+		return { type: "math", raw: m[0], text: m[1], display: true };
+	},
+	renderer(token) {
+		return (token as { text?: string }).text ?? "";
+	},
+};
+
+// Bare (delimiter-less) display-math environments: `\begin{<mathenv>}…\end{…}`
+// written without `$$`/`\[` fences (common in raw model output). Captured at the
+// block level as a whole unit — including any immediately preceding `lhs =`
+// line — so marked never splits it on inline `\\` row breaks. Restricted to math
+// environments (isBareMathEnvironment), and the `≤3 leading spaces` + "block
+// starts at offset 0" guards keep fenced/indented `\begin{cases}` code blocks
+// for marked's own code rules.
+const BARE_ENV_BEGIN = /(?:^|\n)[ \t]{0,3}\\begin\{([A-Za-z]+\*?)\}/;
+function bareMathEnvBlock(src: string): readonly [number, number] | null {
+	const bm = BARE_ENV_BEGIN.exec(src);
+	if (!bm || !isBareMathEnvironment(bm[1])) return null;
+	const beginLineStart = bm.index === 0 ? 0 : bm.index + 1; // skip the matched leading `\n`
+	const endToken = `\\end{${bm[1]}}`;
+	const endAt = src.indexOf(endToken, bm.index);
+	if (endAt === -1) return null;
+	// The `\end` must close before any blank line (i.e. within the same block).
+	if (/\n[ \t]*\n/.test(src.slice(beginLineStart, endAt))) return null;
+	let blockEnd = endAt + endToken.length;
+	while (src[blockEnd] === " " || src[blockEnd] === "\t") blockEnd++;
+	if (src[blockEnd] === "\n") blockEnd++;
+	// Pull in one immediately-preceding `lhs =`/open-delimiter line (e.g. `f(x) =`).
+	let start = beginLineStart;
+	if (start > 0 && src[start - 1] === "\n") {
+		const prevStart = src.lastIndexOf("\n", start - 2) + 1;
+		const prevLine = src.slice(prevStart, start - 1);
+		if (/[=([{]\s*$/.test(prevLine)) start = prevStart;
+	}
+	return [start, blockEnd];
+}
+const mathEnvBlockExtension: TokenizerAndRendererExtension = {
+	name: "mathEnvBlock",
+	level: "block",
+	start(src) {
+		const r = bareMathEnvBlock(src);
+		return r ? r[0] : undefined;
+	},
+	tokenizer(src) {
+		const r = bareMathEnvBlock(src);
+		if (r?.[0] !== 0) return undefined; // only consume when the block starts at offset 0
+		const raw = src.slice(0, r[1]);
+		const text = raw.replace(/\n[ \t]*$/, "");
+		if (text.trim().length === 0) return undefined;
+		return { type: "math", raw, text, display: true };
+	},
+	renderer(token) {
+		return (token as { text?: string }).text ?? "";
+	},
+};
+markdownParser.use({ extensions: [mathBlockExtension, mathEnvBlockExtension, mathExtension] });
+
 // ---------------------------------------------------------------------------
 // Module-level LRU render cache
 // ---------------------------------------------------------------------------
@@ -60,6 +185,13 @@ markdownParser.setOptions({
 const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
 const EMPTY_RENDER_LINES: readonly string[] = [];
 const renderCache = new LRUCache<string, readonly string[]>({ max: RENDER_CACHE_MAX });
+
+// A reference-link definition (`[label]: dest`) resolves across the whole
+// document, so a split lex cannot reproduce it — disable the streaming fast path
+// when one is present (rare in streamed output). The label may contain
+// backslash-escaped characters (`[a\]b]: x`), so escapes are matched explicitly;
+// over-matching is safe (it only costs the fast path), under-matching is not.
+const HAS_REF_DEF = /^ {0,3}\[(?:\\.|[^\]\\])+\]:/m;
 
 /** Drop all L2 cache entries. Call on theme change to prevent stale styled output. */
 export function clearRenderCache(): void {
@@ -124,7 +256,7 @@ export interface MarkdownTheme {
 	 * Resolve a mermaid ASCII rendering by fenced block source text.
 	 * Return null to fall back to fenced code rendering.
 	 */
-	resolveMermaidAscii?: (source: string) => string | null;
+	resolveMermaidAscii?: (source: string, maxWidth?: number) => string | null;
 	symbols: SymbolTheme;
 }
 
@@ -179,9 +311,46 @@ function encodeTextSizedHeading(text: string, scale: 1 | 2 | 3): string {
 	return out;
 }
 
+const MATH_NEWLINES = /\n+/g;
+
+/** True for the custom inline `math` token produced by the math extension. */
+function isMathToken(token: Token): token is Token & { text: string; display: boolean } {
+	return (token as { type: string }).type === "math";
+}
+
+/** Convert a `math` token's LaTeX to single-line Unicode for inline rendering. */
+function renderMathToken(text: string): string {
+	return latexToUnicode(text).replace(MATH_NEWLINES, " ");
+}
+
+/**
+ * When a paragraph's only meaningful content is a single display math token
+ * (`$$…$$` / `\[…\]`), return it so the paragraph can be stacked multi-line
+ * instead of flattened inline. Models routinely write display math on one line,
+ * which marked captures as an inline `display:true` math token inside a
+ * paragraph; without this it would flatten through `renderMathToken`.
+ */
+function soleDisplayMath(tokens?: Token[]): (Token & { text: string }) | null {
+	if (!tokens) return null;
+	let math: (Token & { text: string; display: boolean }) | null = null;
+	for (const token of tokens) {
+		if (isMathToken(token) && token.display) {
+			if (math) return null;
+			math = token;
+		} else if (!(token.type === "text" && typeof token.text === "string" && token.text.trim() === "")) {
+			return null;
+		}
+	}
+	return math;
+}
+
 function plainInlineTokens(tokens: Token[]): string {
 	let result = "";
 	for (const token of tokens) {
+		if (isMathToken(token)) {
+			result += renderMathToken(token.text);
+			continue;
+		}
 		switch (token.type) {
 			case "text":
 				result += token.tokens && token.tokens.length > 0 ? plainInlineTokens(token.tokens) : token.text;
@@ -297,6 +466,24 @@ export class Markdown implements Component {
 	#cachedLines?: readonly string[];
 	#transientRenderCache = false;
 
+	// Streaming-lex cache: the largest blank-line-bounded prefix of #text whose
+	// block tokens are frozen, plus those tokens. marked has no resumable lexer,
+	// but block tokenization is local across a "\n\n" boundary with balanced
+	// fences, so lex(prefix) ++ lex(tail) === lex(prefix+tail). On append-only
+	// growth (the streaming path) this re-lexes only the grown tail instead of the
+	// whole buffer, turning O(N^2) reveal cost into O(N). Width/theme do not affect
+	// tokenization, so this cache is independent of the render caches above.
+	#streamPrefixText?: string;
+	#streamPrefixTokens?: Token[];
+
+	#ignoreTight = false;
+
+	setIgnoreTight(ignore: boolean): this {
+		this.#ignoreTight = ignore;
+		this.invalidate();
+		return this;
+	}
+
 	constructor(
 		text: string,
 		paddingX: number,
@@ -315,6 +502,13 @@ export class Markdown implements Component {
 
 	setText(text: string): void {
 		this.#text = text;
+		if (!text.trim()) {
+			// Blank replacement: render() early-returns before #lexTokens can see
+			// the non-append edit, so drop the frozen stream state here or it
+			// outlives the content it indexed.
+			this.#streamPrefixText = undefined;
+			this.#streamPrefixTokens = undefined;
+		}
 		this.invalidate();
 	}
 
@@ -334,6 +528,76 @@ export class Markdown implements Component {
 		this.invalidate();
 	}
 
+	// Lex `text` into block tokens, reusing the frozen stable prefix when the text
+	// only grew (the streaming path). Falls back to a full lex whenever the prefix
+	// is no longer a prefix (non-append edit), the text carries reference-link
+	// definitions, or it contains CR (marked normalizes CRLF, which would desync
+	// raw-span offsets). Every fallback is correctness-preserving — only speed
+	// differs; the render loop sees the identical token list either way.
+	#lexTokens(text: string): Token[] {
+		const canStream = !HAS_REF_DEF.test(text) && !text.includes("\r");
+		const prefix = this.#streamPrefixText;
+		const prefixTokens = this.#streamPrefixTokens;
+		if (
+			canStream &&
+			prefix !== undefined &&
+			prefixTokens !== undefined &&
+			text.length > prefix.length &&
+			text.startsWith(prefix)
+		) {
+			const tailTokens = markdownParser.lexer(text.slice(prefix.length));
+			const tokens = [...prefixTokens, ...tailTokens];
+			this.#freezeStablePrefix(text, tokens);
+			return tokens;
+		}
+		const tokens = markdownParser.lexer(text);
+		if (canStream) {
+			this.#freezeStablePrefix(text, tokens);
+		} else {
+			this.#streamPrefixText = undefined;
+			this.#streamPrefixTokens = undefined;
+		}
+		return tokens;
+	}
+
+	// Freeze the largest run of leading blocks that end on a hard "\n\n" boundary
+	// (complete and immutable under append-only growth) so the next streaming
+	// render re-lexes only the unfrozen tail. Caller guarantees no CR / no
+	// reference definitions, so each token's `raw` is a verbatim slice of `text`
+	// and the summed offsets address `text` exactly.
+	#freezeStablePrefix(text: string, tokens: Token[]): void {
+		let pos = 0;
+		let frozenEnd = 0;
+		let frozenCount = 0;
+		for (let i = 0; i < tokens.length; i++) {
+			const raw = tokens[i].raw;
+			const end = pos + raw.length;
+			// A `space` token ending in "\n\n" closes the preceding block, but a
+			// `list` before it can still be extended by a following same-marker
+			// item across the blank line (CommonMark loose-list continuation),
+			// which marked merges into one renumbered loose list. Freezing across
+			// such a cut would keep the lists separate. Never freeze right after a
+			// list — it stays in the re-lexed tail.
+			if (raw.endsWith("\n\n") && tokens[i - 1]?.type !== "list") {
+				frozenEnd = end;
+				frozenCount = i + 1;
+			}
+			pos = end;
+		}
+		// Freeze only when the tail begins with real block content. If the next
+		// char is whitespace (an extra blank line, or an indented continuation),
+		// the block separator straddles the cut and lex(prefix)++lex(tail) would
+		// desync from a full lex — e.g. a fence followed by "\n\n\n- list". When
+		// frozenEnd is at end-of-text the next char is unknown, so defer.
+		if (frozenCount > 0 && frozenEnd < text.length) {
+			const next = text.charCodeAt(frozenEnd);
+			if (next !== 0x20 /* space */ && next !== 0x0a /* \n */) {
+				this.#streamPrefixText = text.slice(0, frozenEnd);
+				this.#streamPrefixTokens = tokens.slice(0, frozenCount);
+			}
+		}
+	}
+
 	render(width: number): readonly string[] {
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
@@ -344,7 +608,8 @@ export class Markdown implements Component {
 		}
 
 		// Calculate available width for content (subtract horizontal padding)
-		const contentWidth = Math.max(1, width - this.#paddingX * 2);
+		const paddingX = this.#ignoreTight ? this.#paddingX : getPaddingX(this.#paddingX);
+		const contentWidth = Math.max(1, width - paddingX * 2);
 
 		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
@@ -373,7 +638,7 @@ export class Markdown implements Component {
 		if (!this.transientRenderCache) {
 			const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
 			const headingProbe = this.#theme.heading("");
-			cacheKey = `${normalizedText}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${TERMINAL.textSizing ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+			cacheKey = `${normalizedText}\x00${width}\x00${paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${TERMINAL.textSizing ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
 			const cached = renderCache.get(cacheKey);
 			if (cached !== undefined) {
 				// Populate L1 so subsequent calls from this instance are O(1) map lookup.
@@ -385,7 +650,7 @@ export class Markdown implements Component {
 		}
 
 		// Parse markdown to HTML-like tokens
-		const tokens = markdownParser.lexer(normalizedText);
+		const tokens = this.#lexTokens(normalizedText);
 
 		// Convert tokens to styled terminal output
 		const renderedLines: string[] = [];
@@ -410,8 +675,8 @@ export class Markdown implements Component {
 		}
 
 		// Add margins and background to each wrapped line
-		const leftMargin = padding(this.#paddingX);
-		const rightMargin = padding(this.#paddingX);
+		const leftMargin = padding(paddingX);
+		const rightMargin = padding(paddingX);
 		const bgFn = this.#defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
 
@@ -564,6 +829,14 @@ export class Markdown implements Component {
 	#renderToken(token: Token, width: number, nextTokenType?: string, styleContext?: InlineStyleContext): string[] {
 		const lines: string[] = [];
 
+		// Display math block (own-line `$$…$$` / `\[…\]`): stack `\frac` vertically
+		// and keep `\\` row breaks, so fractions and matrices span multiple lines.
+		if (isMathToken(token)) {
+			for (const mathLine of latexToBlock(token.text)) lines.push(this.#applyDefaultStyle(mathLine));
+			if (nextTokenType && nextTokenType !== "space") lines.push("");
+			return lines;
+		}
+
 		switch (token.type) {
 			case "heading": {
 				const headingLevel = token.depth;
@@ -598,6 +871,12 @@ export class Markdown implements Component {
 			}
 
 			case "paragraph": {
+				const displayMath = soleDisplayMath(token.tokens);
+				if (displayMath) {
+					for (const mathLine of latexToBlock(displayMath.text)) lines.push(this.#applyDefaultStyle(mathLine));
+					if (nextTokenType && nextTokenType !== "list" && nextTokenType !== "space") lines.push("");
+					break;
+				}
 				const paragraphText = this.#renderInlineTokens(token.tokens || [], styleContext);
 				lines.push(paragraphText);
 				// Don't add spacing if next token is space or list
@@ -608,13 +887,18 @@ export class Markdown implements Component {
 			}
 
 			case "code": {
-				// Handle mermaid diagrams with ASCII rendering when available
+				// Mermaid diagrams render as ASCII art when the theme supplies a
+				// resolver. The art is preformatted, so clip each row to the content
+				// width: the later wrap pass would otherwise fragment the box-drawing
+				// canvas. truncateToWidth is ANSI- and wide-char-aware, and the
+				// resolver already re-fits over-wide horizontal graphs top-down.
 				if (token.lang === "mermaid" && this.#theme.resolveMermaidAscii) {
-					const ascii = this.#theme.resolveMermaidAscii(token.text);
-
+					const ascii = this.#theme.resolveMermaidAscii(token.text, width);
 					if (ascii) {
-						for (const asciiLine of Bun.stripANSI(ascii).split("\n")) {
-							lines.push(asciiLine);
+						for (const asciiLine of ascii.split("\n")) {
+							lines.push(
+								visibleWidth(asciiLine) > width ? truncateToWidth(asciiLine, width, Ellipsis.Omit) : asciiLine,
+							);
 						}
 						if (nextTokenType && nextTokenType !== "space") {
 							lines.push("");
@@ -745,6 +1029,10 @@ export class Markdown implements Component {
 		const swatchGlyph = this.#theme.symbols.colorSwatch || DEFAULT_COLOR_SWATCH_GLYPH;
 
 		for (const token of tokens) {
+			if (isMathToken(token)) {
+				result += applyTextWithNewlines(renderMathToken(token.text));
+				continue;
+			}
 			switch (token.type) {
 				case "text":
 					// Text tokens in list items can have nested tokens for inline formatting
@@ -902,16 +1190,29 @@ export class Markdown implements Component {
 					lines.push({ text: nestedLine, nested: true });
 				}
 			} else if (token.type === "text") {
-				// Text content (may have inline tokens)
-				const text =
-					token.tokens && token.tokens.length > 0
-						? this.#renderInlineTokens(token.tokens, styleContext)
-						: token.text || "";
-				lines.push({ text, nested: false });
+				// Text content (may have inline tokens, or a sole display-math token)
+				const displayMath = soleDisplayMath(token.tokens);
+				if (displayMath) {
+					const apply = styleContext?.applyText ?? ((t: string) => this.#applyDefaultStyle(t));
+					for (const mathLine of latexToBlock(displayMath.text))
+						lines.push({ text: apply(mathLine), nested: false });
+				} else {
+					const text =
+						token.tokens && token.tokens.length > 0
+							? this.#renderInlineTokens(token.tokens, styleContext)
+							: token.text || "";
+					lines.push({ text, nested: false });
+				}
 			} else if (token.type === "paragraph") {
 				// Paragraph in list item
-				const text = this.#renderInlineTokens(token.tokens || [], styleContext);
-				lines.push({ text, nested: false });
+				const apply = styleContext?.applyText ?? ((t: string) => this.#applyDefaultStyle(t));
+				const displayMath = soleDisplayMath(token.tokens);
+				if (displayMath) {
+					for (const mathLine of latexToBlock(displayMath.text))
+						lines.push({ text: apply(mathLine), nested: false });
+				} else {
+					lines.push({ text: this.#renderInlineTokens(token.tokens || [], styleContext), nested: false });
+				}
 			} else if (token.type === "code") {
 				// Code block in list item
 				const codeIndent = padding(this.#codeBlockIndent);
@@ -928,6 +1229,10 @@ export class Markdown implements Component {
 					}
 				}
 				lines.push({ text: this.#theme.codeBlockBorder("```"), nested: false });
+			} else if (isMathToken(token)) {
+				// Display math block inside a list item: stack fractions / matrix rows.
+				const apply = styleContext?.applyText ?? ((t: string) => this.#applyDefaultStyle(t));
+				for (const mathLine of latexToBlock(token.text)) lines.push({ text: apply(mathLine), nested: false });
 			} else {
 				// Other token types - try to render as inline
 				const text = this.#renderInlineTokens([token], styleContext);
@@ -1155,10 +1460,14 @@ export class Markdown implements Component {
 export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseColor?: (t: string) => string): string {
 	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
 	if (typeof text !== "string") return (baseColor ?? (t => t))(text != null ? String(text) : "");
-	const tokens = marked.lexer(text);
+	const tokens = markdownParser.lexer(text);
 	const applyText = baseColor ?? ((t: string) => t);
 	let result = "";
 	for (const token of tokens) {
+		if (isMathToken(token)) {
+			result += applyText(renderMathToken(token.text));
+			continue;
+		}
 		if (token.type === "paragraph" && token.tokens) {
 			result += renderInlineTokens(token.tokens, mdTheme, applyText);
 		} else if (token.type === "list") {
@@ -1180,6 +1489,10 @@ function renderInlineTokens(tokens: Token[], mdTheme: MarkdownTheme, applyText: 
 	let result = "";
 	const styleReset = applyText("");
 	for (const token of tokens) {
+		if (isMathToken(token)) {
+			result += applyText(renderMathToken(token.text));
+			continue;
+		}
 		switch (token.type) {
 			case "text":
 				if (token.tokens && token.tokens.length > 0) {

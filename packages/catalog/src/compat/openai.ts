@@ -12,10 +12,12 @@ import {
 	isAnthropicNamespacedModelId,
 	isClaudeModelId,
 	isDeepseekModelIdOrName,
+	isGlm52ReasoningEffortModelId,
 	isKimiK26ModelId,
 	isKimiModelId,
 	isMimoModelIdOrName,
 	isQwenModelId,
+	modelFamilyToken,
 } from "../identity/family";
 import type { ModelSpec, OpenAICompat, ResolvedOpenAICompat, ResolvedOpenAIResponsesCompat } from "../types";
 import { applyCompatOverrides } from "./apply";
@@ -25,6 +27,8 @@ const GLM_CODING_PLAN_MODEL_PATTERN = /^glm-5(?:[.-]|$)/i;
 const GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600_000;
 /** Direct DeepSeek reasoning models stall between thinking and answer phases. */
 const DEEPSEEK_REASONING_STREAM_IDLE_TIMEOUT_MS = 300_000;
+/** Kimi K2.6 can spend several minutes reasoning before the first visible token. */
+const KIMI_K26_REASONING_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 /**
  * OpenCode's gateways (https://opencode.ai/zen|go) gate `reasoning_content`
@@ -80,6 +84,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	const isCerebras = modelMatchesHost(hostModel, "cerebras");
 	const isZai = modelMatchesHost(hostModel, "zai");
 	const isZhipu = modelMatchesHost(hostModel, "zhipu");
+	const supportsZaiReasoningEffort = (isZai || isZhipu) && isGlm52ReasoningEffortModelId(spec.id);
 	const isKilo = modelMatchesHost(hostModel, "kilo");
 	const isKimiModel = isKimiModelId(spec.id);
 	const isMoonshotNative = modelMatchesHost(hostModel, "moonshotNative");
@@ -134,6 +139,8 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	const useMaxTokens =
 		isMistral ||
 		isMoonshotNative ||
+		isZai ||
+		isZhipu ||
 		hostMatchesUrl(baseUrl, "chutes") ||
 		hostMatchesUrl(baseUrl, "fireworks") ||
 		isDirectDeepseekApi;
@@ -178,15 +185,17 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 			isCopilotHost ||
 			isZenmuxHost);
 
-	// Stream-watchdog floor: GLM coding-plan SKUs and direct DeepSeek reasoning
-	// models idle for minutes mid-reasoning; widen the idle timeout so warm-ups
-	// stop aborting and retrying.
+	// Stream-watchdog floor: GLM coding-plan SKUs, Kimi K2.6, and direct
+	// DeepSeek reasoning models can idle for minutes while reasoning; widen the
+	// idle timeout so warm-ups stop aborting and retrying.
 	const streamIdleTimeoutMs =
 		GLM_CODING_PLAN_MODEL_PATTERN.test(spec.id) && (isZai || isZhipu)
 			? GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS
-			: spec.reasoning && isDirectDeepseekApi
-				? DEEPSEEK_REASONING_STREAM_IDLE_TIMEOUT_MS
-				: undefined;
+			: spec.reasoning && isKimiK26ModelId(spec.id)
+				? KIMI_K26_REASONING_STREAM_IDLE_TIMEOUT_MS
+				: spec.reasoning && isDirectDeepseekApi
+					? DEEPSEEK_REASONING_STREAM_IDLE_TIMEOUT_MS
+					: undefined;
 
 	const compat: ResolvedOpenAICompat = {
 		supportsStore: !isNonStandard,
@@ -198,11 +207,15 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// OpenAI's reasoning-API surface.
 		supportsDeveloperRole: isOpenAIHost || isAzureHost,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
-		supportsReasoningEffort: !isGrok && !isZai && !isZhipu && !isXiaomiMimo,
+		supportsReasoningEffort: !isGrok && !isXiaomiMimo && (!(isZai || isZhipu) || supportsZaiReasoningEffort),
 		// GitHub Copilot's chat-completions endpoint rejects reasoning params wholesale.
 		supportsReasoningParams: provider !== "github-copilot",
 		reasoningEffortMap: {},
 		supportsUsageInStreaming: !isCerebras,
+		// pi-ai's thinking-loop guard is gemini-only; default the flag from the
+		// family classifier so OpenAI-compat proxies serving Gemini are covered.
+		// An opaque alias can opt in via `compat.enableGeminiThinkingLoopGuard`.
+		enableGeminiThinkingLoopGuard: modelFamilyToken(spec.id) === "gemini",
 		// Kimi (including via OpenRouter and Fireworks router-form IDs such as
 		// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
 		// max_tokens, not actual output. The official Kimi K2 model guidance
@@ -213,6 +226,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(spec.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
+		supportsForcedToolChoice: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: false,
@@ -286,6 +300,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 }
 
 interface OpenAIResponsesSpecLike {
+	id?: string;
 	provider: string;
 	name: string;
 	baseUrl: string;
@@ -296,31 +311,31 @@ interface OpenAIResponsesSpecLike {
  * Build the resolved Responses-API compat record. The Responses flavor
  * deliberately differs from chat-completions: GitHub Copilot's responses
  * endpoint accepts the `developer` role, while strict tool mode is scoped to
- * first-party OpenAI/Azure/Copilot providers. Developer-role and prompt-cache
- * detection are URL-only on purpose — the historical call sites never
- * consulted the provider id for them. The GPT-5 juice-zero hack keys on the
- * model name, matching the historical request-time check.
+ * first-party OpenAI/Azure/Copilot providers. Azure is detected by provider id
+ * as well as URL — bundled `azure` models carry no baseUrl (the deployment host
+ * is per-resource, resolved at runtime) — while OpenAI/Copilot developer-role
+ * and prompt-cache detection stay URL-keyed, as the historical call sites were.
+ * The GPT-5 juice-zero hack keys on the model name, matching the historical
+ * request-time check.
  */
 export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): ResolvedOpenAIResponsesCompat {
 	const baseUrl = spec.baseUrl ?? "";
+	const isAzure = modelMatchesHost({ provider: spec.provider, baseUrl }, "azureOpenAI");
 	const compat: ResolvedOpenAIResponsesCompat = {
-		supportsDeveloperRole:
-			hostMatchesUrl(baseUrl, "openai") ||
-			hostMatchesUrl(baseUrl, "azureOpenAI") ||
-			hostMatchesUrl(baseUrl, "githubCopilot"),
+		supportsDeveloperRole: isAzure || hostMatchesUrl(baseUrl, "openai") || hostMatchesUrl(baseUrl, "githubCopilot"),
 		supportsStrictMode:
 			spec.provider === "openai" ||
-			spec.provider === "azure" ||
+			isAzure ||
 			spec.provider === "github-copilot" ||
-			hostMatchesUrl(baseUrl, "openai") ||
-			hostMatchesUrl(baseUrl, "azureOpenAI"),
+			hostMatchesUrl(baseUrl, "openai"),
 		supportsReasoningEffort: true,
 		supportsLongPromptCacheRetention: hostMatchesUrl(baseUrl, "openai"),
 		// Azure OpenAI and GitHub Copilot Responses paths require tool results
 		// to strictly match prior tool calls when building Responses inputs.
-		strictResponsesPairing: hostMatchesUrl(baseUrl, "azureOpenAI") || spec.provider === "github-copilot",
+		strictResponsesPairing: isAzure || spec.provider === "github-copilot",
 		requiresJuiceZeroHack: spec.name.toLowerCase().startsWith("gpt-5"),
 		reasoningEffortMap: {},
+		enableGeminiThinkingLoopGuard: modelFamilyToken(spec.id ?? "") === "gemini",
 	};
 	applyCompatOverrides(compat, spec.compat);
 	return compat;

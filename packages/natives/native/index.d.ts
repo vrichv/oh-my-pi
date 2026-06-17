@@ -119,6 +119,25 @@ export declare class Shell {
 }
 
 /**
+ * Install the bounded Tokio runtime napi-rs adopts for async exports.
+ *
+ * The JS loader calls this exactly once, synchronously, right *after* `dlopen`
+ * returns and *before* any async native runs — never from `#[module_init]`.
+ * Building a multi-thread runtime eagerly spawns worker threads, and doing
+ * that during module init (while the dynamic-loader lock is held) deadlocks on
+ * some hosts: a fresh worker blocks acquiring the loader lock that the init
+ * thread still owns. napi-rs only materializes its runtime on the first async
+ * call (`RT` is a `LazyLock`) and `create_custom_tokio_runtime` merely records
+ * the runtime in a `OnceLock`, so installing it post-load is still honored.
+ * Without it napi builds its own default (one worker per CPU, spawned eagerly)
+ * which aborts the process (`os error 1455`) on a memory-constrained Windows
+ * host before any JS error can surface; [`create_windows_napi_tokio_runtime`]
+ * pre-flights the spawn instead. If no runtime can be built we leave napi-rs
+ * to its default. Idempotent.
+ */
+export declare function __ompInstallTokioRuntime(): void
+
+/**
  * Version sentinel — exists solely so the JS loader can prove at load time
  * that the `.node` file on disk is from the same package release as the
  * `index.js` ESM wrapper invoking it.
@@ -136,7 +155,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV15_11_6(): void
+export declare function __piNativesV16_0_5(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1285,10 +1304,12 @@ export interface PtyStartOptions {
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
 /**
- * Render one snapcompact frame: print pre-normalized text onto a square
- * bitmap and encode it as PNG.
+ * Render one snapcompact frame: print pre-normalized text onto a
+ * `size`-wide bitmap and encode it as PNG.
  *
- * The glyph grid holds `floor(size/cellWidth) *
+ * The bitmap height hugs the rows the text actually occupies
+ * (`usedRows * lineRepeat * cellHeight`), so a partially filled frame never
+ * pays for blank padding rows. The glyph grid holds `floor(size/cellWidth) *
  * floor(size/cellHeight/lineRepeat)` characters; input beyond that is ignored
  * (the caller chunks text to capacity). Native-cell shapes encode as 4-bit
  * indexed PNG; stretched shapes (target cell != font cell) encode as RGB.
@@ -1433,7 +1454,11 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
 
 /** Shape options for one snapcompact frame. */
 export interface SnapcompactRenderOptions {
-  /** Frame edge in pixels. */
+  /**
+   * Frame width in pixels; also bounds the grid rows
+   * (`floor(size/cellHeight/lineRepeat)`). Output height hugs the rows the
+   * text actually uses instead of padding to a square.
+   */
   size: number
   /**
    * Bundled font: `"5x8"`, `"6x12"`, `"8x13"` (X.org BDF) or `"8x8"`

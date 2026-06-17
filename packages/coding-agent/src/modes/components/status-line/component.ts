@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
@@ -11,13 +11,13 @@ import * as git from "../../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { theme } from "../../theme/theme";
-import { computeNonMessageTokens } from "../../utils/context-usage";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { getPreset } from "./presets";
 import { renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
 import { calculateTokensPerSecond } from "./token-rate";
 import type {
+	CollabStatus,
 	EffectiveStatusLineSettings,
 	StatusLineSegmentId,
 	StatusLineSegmentOptions,
@@ -25,30 +25,15 @@ import type {
 } from "./types";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Per-message token cache
+// Context-usage memo
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Symbol-keyed sidecar tagged onto each `AgentMessage` to memoize its
- * `estimateTokens` result. Keyed by message identity (the object itself);
- * a cheap content fingerprint detects in-place mutations (post-hoc error
- * attachment, retry-truncated branch rebuild, etc.) and forces recompute.
- *
- * Cache lives on the message — multiple `StatusLineComponent` instances
- * share it for free, and entries collect with the message itself when the
- * conversation is replaced or compacted.
- */
-const kTokenCache = Symbol("statusLine.tokenCache");
-interface TaggedMessage {
-	[kTokenCache]?: { fingerprint: string; tokens: number };
-}
-
-/**
- * Cheap structural fingerprint mirroring `estimateTokens`'s content walk.
- * O(blocks) — only reads string `.length` and primitives, never copies or
- * serializes content. Any in-place mutation that alters total tokenized
- * content also alters one of the byte-length sums or block counts captured
- * here, forcing the cached `estimateTokens` value to be recomputed.
+ * Cheap structural fingerprint of a message's tokenizable content. O(blocks) —
+ * only reads string `.length` and primitives, never copies or serializes.
+ * Detects in-place growth of the streaming tail (and other in-place mutations)
+ * so the cached `getContextUsage()` result is recomputed when — and only when —
+ * the numbers it depends on change.
  */
 function messageFingerprint(msg: AgentMessage): string {
 	const role = (msg as { role?: string }).role ?? "";
@@ -71,21 +56,70 @@ function messageFingerprint(msg: AgentMessage): string {
 			}
 		}
 	} else if (role === "assistant") {
+		const assistantMsg = msg as AssistantMessage;
+		const usageExt = assistantMsg.usage as unknown as { promptTokensDetails?: unknown };
+		const usageTotal = assistantMsg.usage?.totalTokens ?? 0;
+		const promptBuckets = usageExt?.promptTokensDetails ? 1 : 0;
+		const stopReason = assistantMsg.stopReason ?? "";
+
+		let signatureLen = 0;
+		let redactedLen = 0;
+		const msgExt = assistantMsg as unknown as {
+			thinkingSignature?: string;
+			textSignature?: string;
+			thoughtSignature?: string;
+			redactedThinking?: { data?: string };
+		};
+		const thinkingSignature = msgExt.thinkingSignature;
+		if (typeof thinkingSignature === "string") {
+			signatureLen += thinkingSignature.length;
+		}
+		const textSignature = msgExt.textSignature;
+		if (typeof textSignature === "string") {
+			signatureLen += textSignature.length;
+		}
+		const thoughtSignature = msgExt.thoughtSignature;
+		if (typeof thoughtSignature === "string") {
+			signatureLen += thoughtSignature.length;
+		}
+		const redactedData = msgExt.redactedThinking?.data;
+		if (typeof redactedData === "string") {
+			redactedLen += redactedData.length;
+		}
+
 		const content = (msg as { content?: unknown }).content;
 		if (Array.isArray(content)) {
 			blocks = content.length;
 			for (const block of content) {
 				if (!block || typeof block !== "object") continue;
-				const b = block as { type?: string; text?: string; thinking?: string; name?: string; arguments?: unknown };
+				const b = block as {
+					type?: string;
+					text?: string;
+					thinking?: string;
+					thinkingSignature?: string;
+					signature?: string;
+					textSignature?: string;
+					thoughtSignature?: string;
+					data?: string;
+					name?: string;
+					arguments?: unknown;
+				};
 				if (b.type === "text" && typeof b.text === "string") textLen += b.text.length;
-				else if (b.type === "thinking" && typeof b.thinking === "string") textLen += b.thinking.length;
-				else if (b.type === "toolCall") {
+				else if (b.type === "thinking") {
+					if (typeof b.thinking === "string") textLen += b.thinking.length;
+					if (typeof b.thinkingSignature === "string") signatureLen += b.thinkingSignature.length;
+					if (typeof b.signature === "string") signatureLen += b.signature.length;
+					if (typeof b.textSignature === "string") signatureLen += b.textSignature.length;
+					if (typeof b.thoughtSignature === "string") signatureLen += b.thoughtSignature.length;
+				} else if (b.type === "redactedThinking" && typeof b.data === "string") {
+					redactedLen += b.data.length;
+				} else if (b.type === "toolCall") {
 					if (typeof b.name === "string") textLen += b.name.length;
-					// Argument bytes vary; a length proxy is enough to detect in-place edits.
 					textLen += b.arguments === undefined ? 0 : JSON.stringify(b.arguments).length;
 				}
 			}
 		}
+		return `${role}:${ts}:${textLen}:${blocks}:${images}:${signatureLen}:${redactedLen}:${usageTotal}:${promptBuckets}:${stopReason}`;
 	} else if (role === "toolResult" || role === "hookMessage") {
 		const content = (msg as { content?: unknown }).content;
 		if (typeof content === "string") {
@@ -106,31 +140,33 @@ function messageFingerprint(msg: AgentMessage): string {
 	return `${role}:${ts}:${textLen}:${blocks}:${images}`;
 }
 
-/**
- * Token count for a single message, using the per-message sidecar cache.
- * The caller MUST skip caching for the last message during streaming —
- * it may still be growing and its tokens belong recomputed each refresh.
- */
-function tokensForMessage(msg: AgentMessage): number {
-	const fp = messageFingerprint(msg);
-	const tagged = msg as TaggedMessage;
-	const cached = tagged[kTokenCache];
-	if (cached && cached.fingerprint === fp) return cached.tokens;
-	const tokens = estimateTokens(msg);
-	tagged[kTokenCache] = { fingerprint: fp, tokens };
-	return tokens;
+interface ContextUsageMemo {
+	messagesRef: readonly AgentMessage[];
+	length: number;
+	lastFingerprint: string | undefined;
+	modelContextWindow: number;
+	contextUsageRevision: number;
+	usedTokens: number;
+	contextWindow: number;
+	systemPromptRef: readonly string[] | undefined;
+	toolsRef: readonly any[] | undefined;
+	skillsRef: readonly any[] | undefined;
 }
 
-interface MessageTokenTotalsCache {
-	messagesRef: readonly AgentMessage[];
-	stableCount: number;
-	stableTokens: number;
-	lastStableMessage: AgentMessage | undefined;
-	lastStableFingerprint: string | undefined;
-}
+const EMPTY_MESSAGES: readonly AgentMessage[] = [];
 
 function hasContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
+}
+function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("git");
+}
+
+function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("pr");
+}
+function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return hasGitSegment(segments) || hasPrSegment(segments);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -152,6 +188,8 @@ export class StatusLineComponent implements Component {
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#collabStatus: CollabStatus | null = null;
+	#focusedAgentId: string | undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -173,21 +211,14 @@ export class StatusLineComponent implements Component {
 	} | null = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
-	// Context breakdown — incremental rolling cache. The status line refreshes
-	// on every agent event, so the hot path must not re-tokenize the full
-	// message list. Stable messages are accumulated once; normal streaming
-	// refreshes only recompute the current tail message and newly appended
-	// entries. History rewrites/compaction replace or shrink the message array
-	// and rebuild this cache. Stable messages are treated as immutable after
-	// promotion, matching the normal append-only session flow.
-	// Cached non-message total (system prompt + tools + skills). Invalidated
-	// when the inputs-identity fingerprint changes (model swap, skill toggle,
-	// tool registration).
-	#nonMessageTokensCache: number | undefined;
-	#nonMessageInputsKey: string | undefined;
-	#messageTokenTotalsCache: MessageTokenTotalsCache | undefined;
+	// Context-usage memo. The status line redraws on every agent event, so the
+	// hot path must not recompute context tokens unless an input changed.
+	// `getContextUsage()` anchors on the last assistant's real prompt-token
+	// count (matching the provider and the `/context` panel), so a stable
+	// message list + model window yields a stable result we can return verbatim.
+	#contextUsageCache: ContextUsageMemo | undefined;
 
-	constructor(private readonly session: AgentSession) {
+	constructor(private session: AgentSession) {
 		this.#settings = {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
@@ -199,10 +230,33 @@ export class StatusLineComponent implements Component {
 			transparent: settings.get("statusLine.transparent"),
 		};
 	}
+	#gitEnabled(): boolean {
+		return settings.get("git.enabled");
+	}
+	#hasGitBackedSegment(): boolean {
+		const effectiveSettings = this.#resolveSettings();
+		return (
+			hasGitBackedSegment(effectiveSettings.leftSegments) || hasGitBackedSegment(effectiveSettings.rightSegments)
+		);
+	}
+
+	/**
+	 * Re-point the status line at another session (focus proxy). Invalidate: model/context/usage all derive
+	 * from it. `focusedAgentId` is the focused subagent id while the view is proxied, undefined for main.
+	 */
+	setSession(session: AgentSession, focusedAgentId?: string): void {
+		const sessionChanged = this.session !== session;
+		if (!sessionChanged && this.#focusedAgentId === focusedAgentId) return;
+		this.session = session;
+		this.#focusedAgentId = focusedAgentId;
+		if (sessionChanged) this.#invalidateSessionCaches();
+		this.invalidate();
+	}
 
 	updateSettings(settings: StatusLineSettings): void {
 		this.#settings = settings;
 		this.#effectiveSettings = undefined;
+		if (this.#onBranchChange) this.#setupGitWatcher();
 	}
 
 	getEffectiveSettingsForTest(): EffectiveStatusLineSettings {
@@ -215,6 +269,11 @@ export class StatusLineComponent implements Component {
 
 	setSubagentCount(count: number): void {
 		this.#subagentCount = count;
+	}
+
+	/** Active subagent count as currently displayed (collab state mirroring). */
+	get subagentCount(): number {
+		return this.#subagentCount;
 	}
 
 	setSessionStartTime(time: number): void {
@@ -231,6 +290,10 @@ export class StatusLineComponent implements Component {
 
 	setGoalModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.#goalModeStatus = status ?? null;
+	}
+
+	setCollabStatus(status: CollabStatus | null): void {
+		this.#collabStatus = status;
 	}
 
 	setHookStatus(key: string, text: string | undefined): void {
@@ -250,6 +313,11 @@ export class StatusLineComponent implements Component {
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
+		}
+
+		if (!this.#gitEnabled() || !this.#hasGitBackedSegment()) {
+			this.#invalidateGitCaches();
+			return;
 		}
 
 		const repository = git.repo.resolveSync(getProjectDir());
@@ -281,6 +349,14 @@ export class StatusLineComponent implements Component {
 	invalidate(): void {
 		this.#invalidateGitCaches();
 	}
+	#invalidateSessionCaches(): void {
+		this.#cachedUsage = null;
+		this.#usageFetchedAt = 0;
+		this.#usageInFlight = false;
+		this.#contextUsageCache = undefined;
+		this.#lastTokensPerSecond = null;
+		this.#lastTokensPerSecondTimestamp = null;
+	}
 
 	#invalidateGitCaches(): void {
 		this.#cachedBranch = undefined;
@@ -289,6 +365,8 @@ export class StatusLineComponent implements Component {
 		this.#cachedPrContext = undefined;
 	}
 	#getCurrentBranch(): string | null {
+		if (!this.#gitEnabled()) return null;
+
 		const cwd = getProjectDir();
 		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === cwd) {
 			return this.#cachedBranch;
@@ -325,6 +403,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getGitStatus(): { staged: number; unstaged: number; untracked: number } | null {
+		if (!this.#gitEnabled()) return null;
 		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < 1000) {
 			return this.#cachedGitStatus;
 		}
@@ -346,6 +425,8 @@ export class StatusLineComponent implements Component {
 	}
 
 	#lookupPr(): { number: number; url: string } | null {
+		if (!this.#gitEnabled()) return null;
+
 		const branch = this.#getCurrentBranch();
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
@@ -441,16 +522,19 @@ export class StatusLineComponent implements Component {
 		const now = Date.now();
 		if (this.#usageInFlight) return;
 		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
-		const fetcher = (this.session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
+		const session = this.session;
+		const fetcher = (session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
 		if (typeof fetcher !== "function") return;
 		this.#usageInFlight = true;
 		void fetcher
-			.call(this.session)
+			.call(session)
 			.then(reports => {
+				if (this.session !== session) return;
 				this.#cachedUsage = this.#normalizeUsageReports(reports);
 				this.#usageFetchedAt = Date.now();
 			})
 			.catch(() => {
+				if (this.session !== session) return;
 				// Backoff on error: stamp the fetch time so the 5-min TTL guard
 				// also acts as an error budget. Without this, every render
 				// kicks off another fetch (gated only by #usageInFlight),
@@ -458,7 +542,7 @@ export class StatusLineComponent implements Component {
 				this.#usageFetchedAt = Date.now();
 			})
 			.finally(() => {
-				this.#usageInFlight = false;
+				if (this.session === session) this.#usageInFlight = false;
 			});
 	}
 
@@ -506,115 +590,68 @@ export class StatusLineComponent implements Component {
 	}
 
 	/**
-	 * Compute the (cached) used-tokens / context-window totals for the
-	 * status-line context% segment. Exposed (non-private) so unit tests can
-	 * verify the incremental-cache invariants; not part of any external
-	 * API.
+	 * Used-tokens / context-window totals for the status-line context% segment,
+	 * memoized so the per-event redraw stays O(1) when nothing changed.
+	 *
+	 * The numerator comes from `session.getContextUsage()`, which anchors on the
+	 * last assistant's real prompt-token count — so the bar matches the provider
+	 * and the `/context` panel — and reports `null` while that count is unknown
+	 * (right after compaction, before the next response). Exposed (non-private)
+	 * for unit tests and the collab host's state broadcast.
 	 */
 	getCachedContextBreakdown(): { usedTokens: number; contextWindow: number } {
-		const messages = this.session.messages ?? [];
-		const contextWindow = this.session.model?.contextWindow ?? 0;
+		const messages = this.session.messages ?? EMPTY_MESSAGES;
+		const modelContextWindow = this.session.model?.contextWindow ?? 0;
+		const length = messages.length;
+		const lastFingerprint = length > 0 ? messageFingerprint(messages[length - 1]!) : undefined;
+		// Bumps when the in-flight pending snapshot is set/cleared. Without it a
+		// value computed mid-turn (estimate of the active tail) would survive after
+		// the turn ends/aborts, since clearing the snapshot touches no message.
+		const contextUsageRevision = this.session.contextUsageRevision ?? 0;
 
-		// 1) Non-message tokens (system prompt + tools + skills). Refresh only
-		//    when the inputs identity fingerprint changes — usually never
-		//    during a streaming turn. ~10-30 ms when it does refresh.
-		const inputsKey = this.#computeNonMessageInputsKey();
-		if (this.#nonMessageTokensCache === undefined || this.#nonMessageInputsKey !== inputsKey) {
-			this.#nonMessageTokensCache = computeNonMessageTokens(this.session);
-			this.#nonMessageInputsKey = inputsKey;
-		}
+		const systemPrompt = this.session.systemPrompt;
+		const tools = this.session.agent?.state?.tools;
+		const skills = this.session.skills;
 
-		// 2) Message tokens — incremental rolling total. The sidecar cache lives
-		//    on each stable message object (all but the current tail). Normal
-		//    streaming turns only recompute the last message and newly appended
-		//    entries. Full rebuild only when the message array is replaced,
-		//    shrinks, or the recently-promoted stable tail mutates in place.
-		const messagesTokens = this.#getCachedMessageTokens(messages);
-
-		const usedTokens = this.#nonMessageTokensCache + messagesTokens;
-		return { usedTokens, contextWindow };
-	}
-
-	#getCachedMessageTokens(messages: readonly AgentMessage[]): number {
-		const cache = this.#messageTokenTotalsCache;
-		if (!cache || cache.messagesRef !== messages || messages.length <= cache.stableCount) {
-			return this.#rebuildMessageTokenTotals(messages);
-		}
-
-		let stableTokens = cache.stableTokens;
-		let stableCount = cache.stableCount;
-		const stableLimit = Math.max(0, messages.length - 1);
-
+		const cache = this.#contextUsageCache;
 		if (
-			cache.lastStableMessage &&
-			stableCount > 0 &&
-			messages[stableCount - 1] === cache.lastStableMessage &&
-			cache.lastStableFingerprint !== undefined &&
-			cache.lastStableFingerprint !== messageFingerprint(cache.lastStableMessage)
+			cache &&
+			cache.messagesRef === messages &&
+			cache.length === length &&
+			cache.lastFingerprint === lastFingerprint &&
+			cache.modelContextWindow === modelContextWindow &&
+			cache.contextUsageRevision === contextUsageRevision &&
+			cache.systemPromptRef === systemPrompt &&
+			cache.toolsRef === tools &&
+			cache.skillsRef === skills
 		) {
-			return this.#rebuildMessageTokenTotals(messages);
+			return { usedTokens: cache.usedTokens, contextWindow: cache.contextWindow };
 		}
 
-		while (stableCount < stableLimit) {
-			const promoted = messages[stableCount]!;
-			stableTokens += tokensForMessage(promoted);
-			stableCount++;
-		}
-
-		const lastStableMessage = stableCount > 0 ? messages[stableCount - 1] : undefined;
-		const lastStableFingerprint = lastStableMessage ? messageFingerprint(lastStableMessage) : undefined;
-		const lastMessage = messages.at(-1);
-		const lastTokens = lastMessage ? estimateTokens(lastMessage) : 0;
-		this.#messageTokenTotalsCache = {
+		const usage = this.session.getContextUsage();
+		const usedTokens = usage?.tokens ?? 0;
+		const contextWindow = usage?.contextWindow ?? modelContextWindow;
+		this.#contextUsageCache = {
 			messagesRef: messages,
-			stableCount,
-			stableTokens,
-			lastStableMessage,
-			lastStableFingerprint,
+			length,
+			lastFingerprint,
+			modelContextWindow,
+			contextUsageRevision,
+			usedTokens,
+			contextWindow,
+			systemPromptRef: systemPrompt,
+			toolsRef: tools,
+			skillsRef: skills,
 		};
-		return stableTokens + lastTokens;
-	}
-
-	#rebuildMessageTokenTotals(messages: readonly AgentMessage[]): number {
-		let stableTokens = 0;
-		const stableLimit = Math.max(0, messages.length - 1);
-		for (let i = 0; i < stableLimit; i++) {
-			stableTokens += tokensForMessage(messages[i]!);
-		}
-
-		const lastStableMessage = stableLimit > 0 ? messages[stableLimit - 1] : undefined;
-		const lastStableFingerprint = lastStableMessage ? messageFingerprint(lastStableMessage) : undefined;
-		const lastMessage = messages.at(-1);
-		const lastTokens = lastMessage ? estimateTokens(lastMessage) : 0;
-
-		this.#messageTokenTotalsCache = {
-			messagesRef: messages,
-			stableCount: stableLimit,
-			stableTokens,
-			lastStableMessage,
-			lastStableFingerprint,
-		};
-		return stableTokens + lastTokens;
-	}
-
-	/**
-	 * Build an identity fingerprint for the non-message inputs (system prompt,
-	 * tools, skills). When this changes, the non-message token cache must be
-	 * recomputed. Cheap: just lengths + first-string-length. Doesn't need to
-	 * be cryptographically unique — only stable for the same inputs.
-	 */
-	#computeNonMessageInputsKey(): string {
-		const sp = this.session.systemPrompt ?? [];
-		const tools = this.session.agent?.state?.tools ?? [];
-		const skills = this.session.skills ?? [];
-		const modelId = this.session.model?.id ?? "";
-		return `${modelId}|${sp.length}:${sp[0]?.length ?? 0}|${tools.length}|${skills.length}`;
+		return { usedTokens, contextWindow };
 	}
 
 	#buildSegmentContext(
 		width: number,
 		segmentOptions: StatusLineSettings["segmentOptions"],
 		includeContext: boolean,
+		includeGit: boolean,
+		includePr: boolean,
 	): SegmentContext {
 		const state = this.session.state;
 
@@ -635,22 +672,35 @@ export class StatusLineComponent implements Component {
 			tokensPerSecond: this.#getTokensPerSecond(),
 		};
 
-		let contextTokens = 0;
 		let contextWindow = state.model?.contextWindow ?? this.session.model?.contextWindow ?? 0;
+		let contextPercent: number | null = 0;
 		if (includeContext) {
 			const breakdown = this.getCachedContextBreakdown();
-			contextTokens = breakdown.usedTokens;
 			contextWindow = breakdown.contextWindow || contextWindow;
+			contextPercent = contextWindow > 0 ? (breakdown.usedTokens / contextWindow) * 100 : 0;
 		}
-		const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+
+		// Collab guest: context comes from the host's state frames — the local
+		// replica does no accounting of its own.
+		const collabState = this.#collabStatus?.stateOverride;
+		if (collabState?.contextUsage) {
+			contextWindow = collabState.contextUsage.contextWindow || contextWindow;
+			contextPercent = collabState.contextUsage.percent ?? contextPercent;
+		}
+
+		const gitBranch = includeGit || includePr ? this.#getCurrentBranch() : null;
+		const gitStatus = includeGit ? this.#getGitStatus() : null;
+		const gitPr = includePr ? this.#lookupPr() : null;
 
 		return {
 			session: this.session,
+			focusedAgentId: this.#focusedAgentId,
 			width,
 			options: segmentOptions ?? {},
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
+			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,
 			contextWindow,
@@ -658,9 +708,9 @@ export class StatusLineComponent implements Component {
 			subagentCount: this.#subagentCount,
 			sessionStartTime: this.#sessionStartTime,
 			git: {
-				branch: this.#getCurrentBranch(),
-				status: this.#getGitStatus(),
-				pr: this.#lookupPr(),
+				branch: gitBranch,
+				status: gitStatus,
+				pr: gitPr,
 			},
 			usage: this.#cachedUsage,
 		};
@@ -711,7 +761,19 @@ export class StatusLineComponent implements Component {
 		const effectiveSettings = this.#resolveSettings();
 		const includeContext =
 			hasContextSegment(effectiveSettings.leftSegments) || hasContextSegment(effectiveSettings.rightSegments);
-		const ctx = this.#buildSegmentContext(width, effectiveSettings.segmentOptions, includeContext);
+		const gitEnabled = this.#gitEnabled();
+		const includeGit =
+			gitEnabled &&
+			(hasGitSegment(effectiveSettings.leftSegments) || hasGitSegment(effectiveSettings.rightSegments));
+		const includePr =
+			gitEnabled && (hasPrSegment(effectiveSettings.leftSegments) || hasPrSegment(effectiveSettings.rightSegments));
+		const ctx = this.#buildSegmentContext(
+			width,
+			effectiveSettings.segmentOptions,
+			includeContext,
+			includeGit,
+			includePr,
+		);
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
 		// `transparent` reuses the empty-string sentinel (`\x1b[49m`) so the bar
@@ -858,7 +920,12 @@ export class StatusLineComponent implements Component {
 	}
 
 	getTopBorder(width: number): { content: string; width: number } {
-		const content = this.#buildStatusLine(width);
+		let content = this.#buildStatusLine(width);
+		if (this.#focusedAgentId && content) {
+			// Dim the whole bar while focus-proxied. Group/cap terminators emit full
+			// `\x1b[0m` resets that would cancel faint mid-bar, so re-open it after each.
+			content = `\x1b[2m${content.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
+		}
 		return {
 			content,
 			width: visibleWidth(content),

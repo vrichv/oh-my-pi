@@ -4,7 +4,7 @@
  * Provides a normalized schema to represent multiple limit windows, model tiers,
  * and shared quotas across providers.
  */
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import type { FetchImpl, Provider } from "./types";
 export type UsageUnit = "percent" | "tokens" | "requests" | "usd" | "minutes" | "bytes" | "unknown";
 
@@ -210,6 +210,7 @@ export interface UsageCredential {
 	email?: string;
 	enterpriseUrl?: string;
 	metadata?: Record<string, unknown>;
+	apiEndpoint?: string;
 }
 
 /** Parameters provided to a usage fetcher. */

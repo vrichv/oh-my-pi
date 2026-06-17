@@ -18,6 +18,7 @@ import {
 	type Usage,
 	withAuth,
 } from "@oh-my-pi/pi-ai";
+import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { countTokens } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -642,7 +643,7 @@ export async function generateSummary(
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = serializeConversation(llmMessages, preferredDialect(model.id));
 
 	// Build the prompt with conversation wrapped in tags
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
@@ -790,7 +791,7 @@ async function generateShortSummary(
 ): Promise<string> {
 	const maxTokens = Math.min(512, Math.floor(0.2 * reserveTokens));
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(recentMessages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = serializeConversation(llmMessages, preferredDialect(model.id));
 
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (historySummary) {
@@ -807,6 +808,7 @@ async function generateShortSummary(
 				prompt: promptText,
 			},
 			signal,
+			{ fetch: options?.fetch },
 		);
 		return remote.summary;
 	}
@@ -1047,6 +1049,10 @@ export async function compact(
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
 			} catch (err) {
+				// A user/session abort is a cancellation, not a remote failure —
+				// swallowing it here would downgrade Esc into "fall back to local
+				// summarization" and keep compaction running on an aborted signal.
+				if (signal?.aborted) throw err;
 				logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
 					error: err instanceof Error ? err.message : String(err),
 					model: model.id,
@@ -1114,6 +1120,7 @@ export async function compact(
 			// Same propagation as summaryOptions above — generateShortSummary
 			// resolves its own reasoning via resolveCompactionEffort.
 			thinkingLevel: options?.thinkingLevel,
+			fetch: summaryOptions.fetch,
 		},
 	);
 
@@ -1149,7 +1156,7 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = serializeConversation(llmMessages, preferredDialect(model.id));
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{

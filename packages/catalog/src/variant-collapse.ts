@@ -58,6 +58,15 @@ export interface EffortVariantFamily {
 	 */
 	members: readonly string[];
 	/**
+	 * Wire ids upstream no longer serves (e.g. a deployment killed while
+	 * discovery still advertises it). Fresh collapsing never routes to them,
+	 * and stale collapsed snapshots (bundled catalog, cache rows,
+	 * previous-generation fallbacks) get routing/`requestModelId` entries that
+	 * target them re-pointed through `routing`. Keep retired ids in `members`
+	 * so the raw upstream spec is still consumed and aliased.
+	 */
+	retiredMembers?: readonly string[];
+	/**
 	 * Per-effort upstream wire id; `"off"` applies when thinking is disabled.
 	 * Entries whose target member is absent from the input are dropped — those
 	 * efforts fall back to `requestModelId ?? id`.
@@ -98,74 +107,132 @@ const GEMINI_3_FLASH_FAMILY_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort
 const GEMINI_3_PRO_FAMILY_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 
 /**
- * Shared by `google-antigravity` and `google-gemini-cli` — both serve the
- * Antigravity discovery list (`fetchAntigravityDiscoveryModels`).
+ * Antigravity Cloud Code Assist sends an explicit `thinkingBudget` per tier
+ * (verified against captured `daily-cloudcode-pa` requests). Flash uses round
+ * budgets; Pro offsets every budget by +1. Minimal mirrors Low (the Antigravity
+ * UI exposes Low/Medium/High only) so the effort stays selectable.
  */
-export const ANTIGRAVITY_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
-	families: [
-		{
-			id: "gemini-3.5-flash",
-			name: "Gemini 3.5 Flash",
-			members: ["gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3-flash-agent"],
-			routing: {
-				off: "gemini-3.5-flash-extra-low",
-				[Effort.Minimal]: "gemini-3-flash-agent",
-				[Effort.Low]: "gemini-3.5-flash-extra-low",
-				[Effort.Medium]: "gemini-3.5-flash-extra-low",
-				[Effort.High]: "gemini-3.5-flash-low",
-			},
-			thinking: { mode: "google-level", efforts: GEMINI_3_FLASH_FAMILY_EFFORTS },
-			suppressWhenOff: true,
-			// Retired bare id; the alias only fires when no live model holds it
-			// (exact match wins in every resolver).
-			extraAliases: ["gemini-3-flash"],
-		},
-		{
-			id: "gemini-3.1-pro",
-			name: "Gemini 3.1 Pro",
-			// `gemini-pro-agent` is consumed as a member but unused in routing.
-			members: ["gemini-3.1-pro-low", "gemini-3.1-pro-high", "gemini-pro-agent"],
-			routing: {
-				off: "gemini-3.1-pro-low",
-				[Effort.Low]: "gemini-3.1-pro-low",
-				[Effort.High]: "gemini-3.1-pro-high",
-			},
-			thinking: { mode: "google-level", efforts: GEMINI_3_PRO_FAMILY_EFFORTS },
-			suppressWhenOff: true,
-		},
-		{
-			// Legacy static family — covers stale snapshots and caches.
-			id: "gemini-3-pro",
-			name: "Gemini 3 Pro",
-			members: ["gemini-3-pro-low", "gemini-3-pro-high"],
-			routing: {
-				off: "gemini-3-pro-low",
-				[Effort.Low]: "gemini-3-pro-low",
-				[Effort.High]: "gemini-3-pro-high",
-			},
-			thinking: { mode: "google-level", efforts: GEMINI_3_PRO_FAMILY_EFFORTS },
-			suppressWhenOff: true,
-		},
-		{
-			// Rename-only collapse: every effort and off fall back to the wire id.
-			id: "gpt-oss-120b",
-			name: "GPT-OSS 120B",
-			members: ["gpt-oss-120b-medium"],
-			routing: {},
-			thinking: { mode: "budget", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
-		},
-		thinkingPair("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-		thinkingPair("claude-opus-4-6", "Claude Opus 4.6"),
-		thinkingPair("claude-sonnet-4-5", "Claude Sonnet 4.5"),
-		thinkingPair("claude-opus-4-5", "Claude Opus 4.5"),
-		thinkingPair("gemini-2.5-flash", "Gemini 2.5 Flash"),
-	],
+const GEMINI_3_FLASH_FAMILY_BUDGETS: Readonly<Partial<Record<Effort, number>>> = {
+	[Effort.Minimal]: 1000,
+	[Effort.Low]: 1000,
+	[Effort.Medium]: 4000,
+	[Effort.High]: 10000,
+};
+const GEMINI_3_PRO_FAMILY_BUDGETS: Readonly<Partial<Record<Effort, number>>> = {
+	[Effort.Low]: 1001,
+	[Effort.High]: 10001,
 };
 
-/** Provider id → hand collapse table. Both CCA providers share one table. */
+/**
+ * The two Cloud Code Assist providers share the same Antigravity discovery list
+ * but disagree on the thinking transport: `google-antigravity` (daily-cloudcode-pa)
+ * sends an explicit `thinkingBudget` (verified against captured requests), while
+ * `google-gemini-cli` (cloudcode-pa) follows the official Gemini CLI and uses
+ * `thinkingLevel`. The Gemini 3.x families therefore differ only in thinking
+ * transport (and, for Flash, the per-tier wire-id routing); everything else is
+ * shared verbatim.
+ */
+function geminiFlashFamily(mode: "budget" | "google-level"): EffortVariantFamily {
+	const budget = mode === "budget";
+	return {
+		id: "gemini-3.5-flash",
+		name: "Gemini 3.5 Flash",
+		members: ["gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3-flash-agent"],
+		routing: budget
+			? {
+					off: "gemini-3.5-flash-extra-low",
+					[Effort.Minimal]: "gemini-3.5-flash-extra-low",
+					[Effort.Low]: "gemini-3.5-flash-extra-low",
+					[Effort.Medium]: "gemini-3.5-flash-low",
+					[Effort.High]: "gemini-3-flash-agent",
+				}
+			: {
+					off: "gemini-3.5-flash-extra-low",
+					[Effort.Minimal]: "gemini-3-flash-agent",
+					[Effort.Low]: "gemini-3.5-flash-extra-low",
+					[Effort.Medium]: "gemini-3.5-flash-extra-low",
+					[Effort.High]: "gemini-3.5-flash-low",
+				},
+		thinking: budget
+			? { mode: "budget", efforts: GEMINI_3_FLASH_FAMILY_EFFORTS, effortBudgets: GEMINI_3_FLASH_FAMILY_BUDGETS }
+			: { mode: "google-level", efforts: GEMINI_3_FLASH_FAMILY_EFFORTS },
+		suppressWhenOff: true,
+		// Retired bare id; the alias only fires when no live model holds it
+		// (exact match wins in every resolver).
+		extraAliases: ["gemini-3-flash"],
+	};
+}
+
+function geminiProFamily(mode: "budget" | "google-level"): EffortVariantFamily {
+	const budget = mode === "budget";
+	return {
+		id: "gemini-3.1-pro",
+		name: "Gemini 3.1 Pro",
+		// High routes to `gemini-pro-agent` — the upstream `gemini-3.1-pro-high`
+		// deployment returns INVALID_ARGUMENT on every streamGenerateContent
+		// request (both CCA endpoints) while discovery still lists it;
+		// `gemini-pro-agent` is the same model ("Gemini 3.1 Pro (High)", same
+		// thinking budget/caps) and accepts the identical request body.
+		// `gemini-3.1-pro-high` stays a member so the dead raw id is consumed.
+		members: ["gemini-3.1-pro-low", "gemini-pro-agent", "gemini-3.1-pro-high"],
+		retiredMembers: ["gemini-3.1-pro-high"],
+		routing: {
+			off: "gemini-3.1-pro-low",
+			[Effort.Low]: "gemini-3.1-pro-low",
+			[Effort.High]: "gemini-pro-agent",
+		},
+		thinking: budget
+			? { mode: "budget", efforts: GEMINI_3_PRO_FAMILY_EFFORTS, effortBudgets: GEMINI_3_PRO_FAMILY_BUDGETS }
+			: { mode: "google-level", efforts: GEMINI_3_PRO_FAMILY_EFFORTS },
+		suppressWhenOff: true,
+	};
+}
+
+/** CCA families shared verbatim by both providers (transport-agnostic). */
+const SHARED_CCA_FAMILIES: readonly EffortVariantFamily[] = [
+	{
+		// Legacy static family — covers stale snapshots and caches. Stale ids are
+		// unverified against the budget-mode CCA contract; keep them on level.
+		id: "gemini-3-pro",
+		name: "Gemini 3 Pro",
+		members: ["gemini-3-pro-low", "gemini-3-pro-high"],
+		routing: {
+			off: "gemini-3-pro-low",
+			[Effort.Low]: "gemini-3-pro-low",
+			[Effort.High]: "gemini-3-pro-high",
+		},
+		thinking: { mode: "google-level", efforts: GEMINI_3_PRO_FAMILY_EFFORTS },
+		suppressWhenOff: true,
+	},
+	{
+		// Rename-only collapse: every effort and off fall back to the wire id.
+		id: "gpt-oss-120b",
+		name: "GPT-OSS 120B",
+		members: ["gpt-oss-120b-medium"],
+		routing: {},
+		thinking: { mode: "budget", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+	},
+	thinkingPair("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+	thinkingPair("claude-opus-4-6", "Claude Opus 4.6"),
+	thinkingPair("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+	thinkingPair("claude-opus-4-5", "Claude Opus 4.5"),
+	thinkingPair("gemini-2.5-flash", "Gemini 2.5 Flash"),
+];
+
+/** `google-antigravity` (daily-cloudcode-pa): Gemini 3.x on the budget transport. */
+export const ANTIGRAVITY_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
+	families: [geminiFlashFamily("budget"), geminiProFamily("budget"), ...SHARED_CCA_FAMILIES],
+};
+
+/** `google-gemini-cli` (cloudcode-pa): Gemini 3.x on the level transport (official CLI parity). */
+export const GEMINI_CLI_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
+	families: [geminiFlashFamily("google-level"), geminiProFamily("google-level"), ...SHARED_CCA_FAMILIES],
+};
+
+/** Provider id → hand collapse table. The CCA providers diverge on thinking transport. */
 export const VARIANT_COLLAPSE_TABLES: Readonly<Record<string, VariantCollapseTable>> = {
 	"google-antigravity": ANTIGRAVITY_VARIANT_COLLAPSE_TABLE,
-	"google-gemini-cli": ANTIGRAVITY_VARIANT_COLLAPSE_TABLE,
+	"google-gemini-cli": GEMINI_CLI_VARIANT_COLLAPSE_TABLE,
 };
 
 /**
@@ -283,6 +350,110 @@ export function isVariantCollapsedSpec(spec: VariantSpecLike): boolean {
 }
 
 /**
+ * Re-point a stale collapsed spec whose `requestModelId` or routing still
+ * targets a retired wire id. Collapsed snapshots (bundled catalog, cache
+ * rows, previous-generation fallbacks) pass through collapsing untouched, so
+ * a hand-table routing fix would otherwise never reach them. Only retired
+ * targets are rewritten — presence-filtered routing decisions from live
+ * discovery stay authoritative for everything else. Per retired entry the
+ * table's route for that effort wins, then the off/first-live-member wire id,
+ * then the route is dropped (falls back to `requestModelId ?? id`). Returns
+ * `spec` by reference when nothing targets a retired id.
+ */
+function reconcileRetiredRouting<TSpec extends VariantSpecLike>(
+	spec: TSpec,
+	family: EffortVariantFamily,
+	retired: ReadonlySet<string>,
+): TSpec {
+	const routing = spec.thinking?.effortRouting;
+	const requestRetired = spec.requestModelId !== undefined && retired.has(spec.requestModelId);
+	let routingRetired = false;
+	if (routing !== undefined) {
+		for (const key in routing) {
+			const target = routing[key as Effort | "off"];
+			if (target !== undefined && retired.has(target)) {
+				routingRetired = true;
+				break;
+			}
+		}
+	}
+	if (!requestRetired && !routingRetired) return spec;
+
+	const offTarget = family.routing.off;
+	const fallbackWireId =
+		offTarget !== undefined && !retired.has(offTarget) ? offTarget : family.members.find(id => !retired.has(id));
+	const next: TSpec = { ...spec };
+	if (routingRetired && routing !== undefined) {
+		const nextRouting: Partial<Record<Effort | "off", string>> = {};
+		for (const key in routing) {
+			const effortKey = key as Effort | "off";
+			const target = routing[effortKey];
+			if (target === undefined) continue;
+			if (!retired.has(target)) {
+				nextRouting[effortKey] = target;
+				continue;
+			}
+			const tableTarget = family.routing[effortKey];
+			if (tableTarget !== undefined && !retired.has(tableTarget)) {
+				nextRouting[effortKey] = tableTarget;
+			} else if (fallbackWireId !== undefined) {
+				nextRouting[effortKey] = fallbackWireId;
+			}
+		}
+		next.thinking = { ...(spec.thinking as ThinkingConfig), effortRouting: nextRouting };
+	}
+	if (requestRetired) {
+		if (fallbackWireId !== undefined && fallbackWireId !== spec.id) {
+			next.requestModelId = fallbackWireId;
+		} else {
+			delete next.requestModelId;
+		}
+	}
+	return next;
+}
+
+/**
+ * Refresh a collapsed snapshot's thinking surface in place. Bundled catalog and
+ * prev-generation snapshots freeze a family's transport, budgets, and routing;
+ * discovery emits the canonical id but the exact-id merge never overwrites a
+ * stale `family.id` row (e.g. `gemini-3.1-pro`) nor a recycled `extraAliases`
+ * row (e.g. `gemini-3-flash`). This re-applies the hand-table family's thinking,
+ * routing, and default wire id while keeping the spec id (load-bearing for exact
+ * selectors and bundled lookups). Returns `spec` by reference when unchanged.
+ */
+function refreshCollapsedThinking<TSpec extends VariantSpecLike>(
+	spec: TSpec,
+	family: EffortVariantFamily,
+	retired: ReadonlySet<string> | undefined,
+): TSpec {
+	// Scope snapshot self-heal to families carrying a curated per-effort budget
+	// contract (Antigravity gemini-3.x). Their routing targets are all verified
+	// live, so rebuilding routing here is safe; families without `effortBudgets`
+	// (derived `X`/`X-thinking` pairs, claude pairs) keep their presence-filtered
+	// snapshot routing untouched.
+	if (!spec.reasoning || family.thinking.effortBudgets === undefined) return spec;
+	const routing: Partial<Record<Effort | "off", string>> = {};
+	let hasRouting = false;
+	for (const effortKey in family.routing) {
+		const target = family.routing[effortKey as Effort | "off"];
+		if (target !== undefined && !retired?.has(target)) {
+			routing[effortKey as Effort | "off"] = target;
+			hasRouting = true;
+		}
+	}
+	const thinking: ThinkingConfig = { ...family.thinking };
+	if (hasRouting) thinking.effortRouting = routing;
+	if (family.suppressWhenOff) thinking.suppressWhenOff = true;
+	const offTarget = family.routing.off;
+	const requestModelId =
+		offTarget !== undefined && !retired?.has(offTarget) && offTarget !== spec.id ? offTarget : spec.requestModelId;
+	if (Bun.deepEquals(thinking, spec.thinking) && requestModelId === spec.requestModelId) {
+		return spec;
+	}
+	return { ...spec, thinking, ...(requestModelId !== undefined ? { requestModelId } : {}) };
+}
+
+/**
  * Collapse every family in `table` found in `specs`. Non-member specs pass
  * through verbatim (by reference), order preserved; the collapsed spec
  * replaces the first occurrence of its family.
@@ -302,13 +473,32 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 	const familyIdBySpecId = new Map<string, string>();
 
 	for (const family of table.families) {
+		const retired =
+			family.retiredMembers !== undefined && family.retiredMembers.length > 0
+				? new Set(family.retiredMembers)
+				: undefined;
 		const existing = byId.get(family.id);
 		const existingCollapsed =
 			existing !== undefined &&
 			(existing.requestModelId !== undefined || existing.thinking?.effortRouting !== undefined);
+		const reconciled =
+			existing !== undefined && existingCollapsed && retired !== undefined
+				? reconcileRetiredRouting(existing, family, retired)
+				: existing;
 		const rawPresent = family.members.filter(id => byId.has(id) && !(id === family.id && existingCollapsed));
 		if (rawPresent.length === 0) {
-			// Inert (no members) or already collapsed (pass-through) — idempotence.
+			// Inert (no members) or already collapsed (pass-through). A stale
+			// family.id-keyed snapshot is refreshed in place from the current
+			// hand-table family (transport/budgets/routing); retired targets drop.
+			// Recycled extraAliases rows are healed in a later pass.
+			const refreshed =
+				existing !== undefined && existingCollapsed
+					? refreshCollapsedThinking(reconciled ?? existing, family, retired)
+					: reconciled;
+			if (refreshed !== undefined && refreshed !== existing) {
+				familyIdBySpecId.set(family.id, family.id);
+				replacement.set(family.id, refreshed);
+			}
 			continue;
 		}
 
@@ -317,8 +507,8 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 
 		if (existingCollapsed) {
 			// Mixed input: the collapsed entry (live truth) wins; stale raw
-			// members are deduped away.
-			replacement.set(family.id, existing);
+			// members are deduped away. Retired targets are re-pointed first.
+			replacement.set(family.id, reconciled as TSpec);
 			continue;
 		}
 
@@ -329,7 +519,7 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 		let hasEffortRoute = false;
 		for (const effortKey in family.routing) {
 			const target = family.routing[effortKey as Effort | "off"];
-			if (target !== undefined && presentSet.has(target)) {
+			if (target !== undefined && presentSet.has(target) && !retired?.has(target)) {
 				routing[effortKey as Effort | "off"] = target;
 				hasRouting = true;
 				if (effortKey !== "off") hasEffortRoute = true;
@@ -353,15 +543,17 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 			name: family.name,
 			reasoning,
 			input,
-			contextWindow: Math.max(...memberSpecs.map(spec => spec.contextWindow)),
-			maxTokens: Math.max(...memberSpecs.map(spec => spec.maxTokens)),
+			contextWindow: maxOrNull(memberSpecs.map(spec => spec.contextWindow)),
+			maxTokens: maxOrNull(memberSpecs.map(spec => spec.maxTokens)),
 		};
-		// The default wire id is the priority member; omit when it equals the
-		// logical id (bare/thinking pairs) — `resolveWireModelId` falls back.
-		if (rawPresent[0] === family.id) {
+		// The default wire id is the highest-priority live member; omit when it
+		// equals the logical id (bare/thinking pairs) — `resolveWireModelId`
+		// falls back. Retired members never become the default.
+		const defaultWireId = rawPresent.find(id => !retired?.has(id)) ?? rawPresent[0];
+		if (defaultWireId === family.id) {
 			delete collapsed.requestModelId;
 		} else {
-			collapsed.requestModelId = rawPresent[0] as string;
+			collapsed.requestModelId = defaultWireId as string;
 		}
 		if (reasoning) {
 			collapsed.thinking = thinking;
@@ -369,6 +561,27 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 			delete collapsed.thinking;
 		}
 		replacement.set(family.id, collapsed);
+	}
+
+	// Refresh stale alias-keyed snapshots in place (recycled bare ids). Runs even
+	// when the canonical family.id row is also present, since the exact-id merge
+	// keeps the stale alias row alongside the discovered canonical one.
+	for (const family of table.families) {
+		if (family.extraAliases === undefined) continue;
+		const retired =
+			family.retiredMembers !== undefined && family.retiredMembers.length > 0
+				? new Set(family.retiredMembers)
+				: undefined;
+		for (const alias of family.extraAliases) {
+			if (alias === family.id || familyIdBySpecId.has(alias)) continue;
+			const aliasSpec = byId.get(alias);
+			if (aliasSpec === undefined) continue;
+			const refreshed = refreshCollapsedThinking(aliasSpec, family, retired);
+			if (refreshed !== aliasSpec) {
+				familyIdBySpecId.set(alias, alias);
+				replacement.set(alias, refreshed);
+			}
+		}
 	}
 
 	if (replacement.size === 0) return [...specs];
@@ -509,7 +722,13 @@ export function resolveBareVariantAlias(modelId: string): BareVariantAliasHit | 
 		if (hit === undefined) continue;
 		const providers: Provider[] = [];
 		for (const candidate in VARIANT_COLLAPSE_TABLES) {
-			if (VARIANT_COLLAPSE_TABLES[candidate] === table) providers.push(candidate);
+			// Match by resolved alias target, not table identity: the CCA providers
+			// now hold distinct table objects that still share these aliases.
+			if (
+				getAliasIndex(VARIANT_COLLAPSE_TABLES[candidate] as VariantCollapseTable).forward.get(normalized) === hit
+			) {
+				providers.push(candidate);
+			}
 		}
 		return { id: hit, providers };
 	}
@@ -526,4 +745,9 @@ export function getVariantAliasSources(provider: Provider, modelId: string): rea
 	const table = VARIANT_COLLAPSE_TABLES[provider] ?? VARIANT_COLLAPSE_TABLES[provider.toLowerCase()];
 	if (!table) return [];
 	return getAliasIndex(table).reverse.get(modelId) ?? [];
+}
+
+function maxOrNull(values: ReadonlyArray<number | null>): number | null {
+	const known = values.filter((v): v is number => v != null);
+	return known.length ? Math.max(...known) : null;
 }

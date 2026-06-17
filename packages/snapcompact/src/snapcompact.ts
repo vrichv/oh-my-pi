@@ -2,26 +2,35 @@
  * Snapcompact compaction: archive conversation history as dense bitmap images.
  *
  * Instead of asking an LLM to summarize discarded history, the serialized
- * conversation is rendered into square PNG frames of pixel-font text that
- * vision models read back directly, like an archivist at a snapcompact frame
- * reader.
+ * conversation is rendered into PNG frames of pixel-font text that vision
+ * models read back directly, like an archivist at a snapcompact frame
+ * reader. Frames are `frameSize` wide; their height hugs the text rows
+ * actually printed, so a partially filled frame never bills blank rows.
  *
- * The frame shape is provider-aware, following the snapcompact SQuAD evals
- * (`packages/snapcompact`, 200k-token monolithic runs):
+ * The frame shape is provider-aware. Original choices came from the SQuAD
+ * prose evals (`packages/snapcompact`, 200k-token monolithic runs); the
+ * spacing choices below come from the tool-result legibility bench
+ * (`research/toolbench.py`, real search/read/find output with structure QA),
+ * which exposed that the prose-tuned dense cells erase the line numbers and
+ * indentation that code/search output depends on:
  *
- * - **Anthropic** (`6x12-dim`): X.org 6x12 glyphs, black ink, stopwords
- *   dimmed gray. Production mono eval on claude-fable: f1 .840 vs .877 for
- *   the repeated `8x8r-bw` grid — within noise at n=25 — at 37% lower cost
- *   (12 frames vs 21 per 400k chars). `8x8r-bw` remains the max-recall
- *   choice via the shape setting; it never refused in any probe.
- * - **Google** (`doc-8on16-sent-dim`): two word-wrapped newspaper columns of
- *   8x13 glyphs on a 16px pitch, sentence-hue ink, stopwords dimmed (0.90 F1
- *   on gemini-3.5-flash vs 0.85 for the repeated grid, at lower cost; same
- *   shape won the chunked round-2 evals).
- * - **OpenAI** (`8on16-bw`): 8x13 glyphs on a patch-aligned 16px pitch, black
- *   ink (gpt-5.5 mono F1 0.851 vs 0.602 for the previous dense `6x6u-sent`).
- *   OpenAI bills a flat ~2.9k tokens per image; frames request
- *   `detail: "original"` since the default `auto` downscale destroys glyphs.
+ * - **Anthropic** (`11on16-bw`): 8x13 glyphs on an 11px advance (extra
+ *   letter-spacing), black ink. On the tool-result bench, tracking the
+ *   readable cell beat plain `8on16-bw` (opus-4.8 f1 .806 vs .755) and far
+ *   beat the prior dense `6x12-dim` (.351, which fell below the OCR ~16px/char
+ *   floor and abstained). Opus 4.7+/Fable/Mythos ingest high-res natively
+ *   (2576px edge, 4,784 visual-token cap), so those lines get 1932px frames:
+ *   same bill, fewer frames. Older Claude lines downscale past 1568px.
+ * - **Google** (`8on22-bw` @2048): 8x13 glyphs on a 22px pitch (extra line
+ *   spacing), black ink. Leading lifted gemini-3.5-flash to f1 .934 vs .807
+ *   for `8on16-bw` and .287 for the prior `doc-8on16-sent-dim`. Gemini 3.x
+ *   bills a fixed `media_resolution` budget per image (default 1,120 tokens)
+ *   regardless of pixels, so the 2048px frame carries more chars at the same
+ *   bill.
+ * - **OpenAI** (`8on22-bw`): same leading win (gpt-5.5/gpt-5.4-mini). Patch
+ *   billing (32px × 1.2, 10k-patch budget at `detail: "original"`) is
+ *   area-proportional, so resolution cannot improve chars/$ — 1568 stays.
+ *   `detail: "high"` would downgrade (2,500-patch cap); `original` is sent.
  * - **Unknown providers** default to the Anthropic shape. Gateways can
  *   defeat any shape silently: OpenRouter enforces a per-model image cap
  *   (measured: 8 images for glm-4.6v — frames past the cap are dropped with
@@ -88,9 +97,11 @@ export type ShapeGeometry = Omit<Shape, "frameTokenEstimate" | "imageDetail">;
  * (redundancy coding), `6x6u` unscii Lanczos-squeezed to 6x6 (densest
  * readable cell), `5x8` the X.org legacy font on its 2576px frame, `6x12`
  * and `8x13` the X.org misc fonts, `8on16` 8x13 glyphs on an 8x16 cell pitch
- * (no stretch, extra leading), `doc-` prefixed shapes a two-column
- * word-wrapped newspaper layout. Ink: `sent` cycles six hues at sentence
- * boundaries, `bw` is plain black, `-dim` suffix prints stopwords in gray.
+ * (no stretch, extra leading), `8on22` the same glyphs on a 22px pitch (more
+ * leading), `11on16` the same glyphs on an 11px advance (more tracking),
+ * `doc-` prefixed shapes a two-column word-wrapped newspaper layout. Ink:
+ * `sent` cycles six hues at sentence boundaries, `bw` is plain black, `-dim`
+ * suffix prints stopwords in gray.
  */
 export const SHAPE_VARIANTS = {
 	"8x8r-bw": { font: "8x8", cellWidth: 8, cellHeight: 8, variant: "bw", lineRepeat: 2, frameSize: 1568 },
@@ -114,6 +125,24 @@ export const SHAPE_VARIANTS = {
 	"8on16-bw": {
 		font: "8x13",
 		cellWidth: 8,
+		cellHeight: 16,
+		stretch: false,
+		variant: "bw",
+		lineRepeat: 1,
+		frameSize: 1568,
+	},
+	"8on22-bw": {
+		font: "8x13",
+		cellWidth: 8,
+		cellHeight: 22,
+		stretch: false,
+		variant: "bw",
+		lineRepeat: 1,
+		frameSize: 1568,
+	},
+	"11on16-bw": {
+		font: "8x13",
+		cellWidth: 11,
 		cellHeight: 16,
 		stretch: false,
 		variant: "bw",
@@ -185,44 +214,53 @@ function billingFamily(api?: Api): BillingFamily {
 	}
 }
 
-/** Eval-measured per-frame billing for a standard 1568px frame, by family. */
-const FAMILY_BILLING: Record<BillingFamily, Pick<Shape, "frameTokenEstimate" | "imageDetail">> = {
-	// Anthropic bills pixel area: 1568*1568/750 ≈ 3,278.
-	anthropic: { frameTokenEstimate: 3300 },
-	google: { frameTokenEstimate: 1100 },
-	// OpenAI bills per image at `original` detail, ~2.9k tokens flat.
-	openai: { frameTokenEstimate: 2900, imageDetail: "original" },
-};
+/**
+ * Per-frame billing for a square frame of edge `frameSize`, by family.
+ * Formulas verified against live bills in the resolution benchmarks:
+ * - Anthropic: 28px patches, capped at 4,784 visual tokens (the API
+ *   downscales past the cap; 1568 → 3,136 measured) + 5% margin.
+ * - Google: Gemini 3.x bills a fixed `media_resolution` budget per image —
+ *   default HIGH = 1,120 tokens — regardless of pixel size.
+ * - OpenAI: 32px patches × 1.2 flagship multiplier, 10,000-patch budget at
+ *   `detail: "original"` (1568 → 2,881 measured).
+ */
+function familyBilling(family: BillingFamily, frameSize: number): Pick<Shape, "frameTokenEstimate" | "imageDetail"> {
+	switch (family) {
+		case "google":
+			return { frameTokenEstimate: 1120 };
+		case "openai": {
+			const patches = Math.min(Math.ceil(frameSize / 32) ** 2, 10_000);
+			return { frameTokenEstimate: Math.ceil(patches * 1.2), imageDetail: "original" };
+		}
+		default: {
+			const patches = Math.min(Math.ceil(frameSize / 28) ** 2, 4784);
+			return { frameTokenEstimate: Math.ceil(patches * 1.05) };
+		}
+	}
+}
 
 /** Attach a provider family's billing to a variant geometry. */
 function priceShape(base: ShapeGeometry, family: BillingFamily): Shape {
-	const billing = FAMILY_BILLING[family];
-	return {
-		...base,
-		// Family estimates are measured at 1568px; the larger legacy frame
-		// keeps the conservative pixel-area ceiling everywhere.
-		frameTokenEstimate:
-			base.frameSize > 1568 ? FAMILY_BILLING.anthropic.frameTokenEstimate : billing.frameTokenEstimate,
-		...(billing.imageDetail ? { imageDetail: billing.imageDetail } : {}),
-	};
+	return { ...base, ...familyBilling(family, base.frameSize) };
 }
 
 /** Eval-validated shapes, keyed by the provider family they won on. */
 export const SHAPES = {
-	/** `6x12-dim`: X.org 6x12 glyphs, black ink with stopwords dimmed gray.
-	 *  Production mono eval on claude-fable: f1 .840 vs .877 for the repeated
-	 *  `8x8r-bw` grid (within noise at n=25) at 37% lower cost — 12 frames
-	 *  instead of 21 per 400k chars. Never refused in any run. */
-	anthropic: priceShape(SHAPE_VARIANTS["6x12-dim"], "anthropic"),
-	/** `doc-8on16-sent-dim`: two word-wrapped columns, sentence hues, dimmed
-	 *  stopwords. Production mono eval on gemini-3.5-flash: f1 .900 vs .853
-	 *  for the repeated grid, at lower cost; also the chunked round-2 winner. */
-	google: priceShape(SHAPE_VARIANTS["doc-8on16-sent-dim"], "google"),
-	/** `8on16-bw`: 8x13 X.org glyphs on a 16px pitch, black ink. Mono eval on
-	 *  gpt-5.5 (200k-token single request, n=50): f1 .851 vs .602 for the
-	 *  previous `6x6u-sent` default at near-equal total cost; chunked exp14
-	 *  scored it .906. */
-	openai: priceShape(SHAPE_VARIANTS["8on16-bw"], "openai"),
+	/** `11on16-bw`: 8x13 glyphs on an 11px advance (extra tracking), black ink.
+	 *  Tool-result legibility bench (real search/read/find output, structure QA)
+	 *  on opus-4.8: f1 .806 vs .755 for plain `8on16-bw` and .351 for the prior
+	 *  `6x12-dim` default — letter-spacing the readable cell wins; the dense
+	 *  6x12 was below the OCR ~16px/char floor and abstained. */
+	anthropic: priceShape(SHAPE_VARIANTS["11on16-bw"], "anthropic"),
+	/** `8on22-bw`: 8x13 glyphs on a 22px pitch (extra leading), black ink.
+	 *  Tool-result legibility bench on gemini-3.5-flash: f1 .934 vs .807 for
+	 *  plain `8on16-bw` and .287 for the prior `doc-8on16-sent-dim`; the
+	 *  line-spacing reduces row crowding so line numbers stay legible. */
+	google: priceShape(SHAPE_VARIANTS["8on22-bw"], "google"),
+	/** `8on22-bw`: 8x13 glyphs on a 22px pitch (extra leading), black ink.
+	 *  Same line-spacing win for OpenAI; bench on gpt-5.5/gpt-5.4-mini showed
+	 *  leading lifts recall on the readable cell over plain `8on16-bw`. */
+	openai: priceShape(SHAPE_VARIANTS["8on22-bw"], "openai"),
 	/** Original 5x8 X.org shape (pre-shape-table sessions rendered this). */
 	legacy: priceShape(SHAPE_VARIANTS["5x8-sent"], "anthropic"),
 } satisfies Record<string, Shape>;
@@ -257,9 +295,9 @@ export function isShape(value: unknown): value is Shape {
 /** Eval-winning variant per provider family (billing fallback when the
  *  model id matches no known reader line). */
 const FAMILY_VARIANT: Record<BillingFamily, ShapeVariantName> = {
-	anthropic: "6x12-dim",
-	google: "doc-8on16-sent-dim",
-	openai: "8on16-bw",
+	anthropic: "11on16-bw",
+	google: "8on22-bw",
+	openai: "8on22-bw",
 };
 
 const FAMILY_SHAPE: Record<BillingFamily, Shape> = {
@@ -268,26 +306,40 @@ const FAMILY_SHAPE: Record<BillingFamily, Shape> = {
 	openai: SHAPES.openai,
 };
 
-/** Eval-winning variant per model line, matched against the model id. The
+/** One model line's ideal format: variant plus an optional frame-size
+ *  override when the line reads larger frames at no extra cost. */
+export interface IdealShape {
+	variant: ShapeVariantName;
+	frameSize?: number;
+}
+
+/** Eval-winning format per model line, matched against the model id. The
  *  wire API only identifies the gateway — a Claude served through Vertex or
  *  OpenRouter still reads best with its own shape. Patterns cover the model
  *  lines the mono evals measured; everything else falls back to the API
- *  family's winner. */
-const MODEL_VARIANTS: readonly (readonly [RegExp, ShapeVariantName])[] = [
-	// claude-fable .840 / opus .800 mono; within noise of 8x8r-bw at ~40% lower cost.
-	[/claude/i, "6x12-dim"],
-	// gemini-3.5-flash .900 mono; also the chunked round-2 winner.
-	[/gemini/i, "doc-8on16-sent-dim"],
-	// gpt-5.5 .851 mono / .906 chunked.
-	[/gpt|codex/i, "8on16-bw"],
-	// kimi-k2.6 .973 mono at <=8 frames per request.
-	[/kimi/i, "8on16-bw"],
+ *  family's winner at the standard 1568px frame. First match wins. */
+const MODEL_VARIANTS: readonly (readonly [RegExp, IdealShape])[] = [
+	// Opus 4.7+ and Fable/Mythos read high-res natively (2576px edge under a
+	// 4,784 visual-token cap → 1932px square sweet spot): same recall and
+	// cost as 1568, a third fewer frames.
+	[/claude.*(fable|mythos)/i, { variant: "11on16-bw", frameSize: 1932 }],
+	[/claude-?opus-?4[.-][7-9]/i, { variant: "11on16-bw", frameSize: 1932 }],
+	// Older Claude lines downscale past 1568px — keep the safe size.
+	[/claude/i, { variant: "11on16-bw" }],
+	// Gemini 3.x bills a fixed 1,120-token budget per image regardless of
+	// pixels: 2048px packs more chars per frame at the same bill.
+	[/gemini/i, { variant: "8on22-bw", frameSize: 2048 }],
+	// gpt-5.5 patch billing is area-proportional; 1568 is already optimal.
+	[/gpt|codex/i, { variant: "8on22-bw" }],
+	// kimi's image processor downscales past 1792px (64×64 28px patches);
+	// 1568 wins on chars/$ and reads at f1 .973 (≤8 frames per request).
+	[/kimi/i, { variant: "8on16-bw" }],
 	// glm-4.6v .780 mono via direct vendor routing.
-	[/glm/i, "8on16-bw"],
+	[/glm/i, { variant: "8on16-bw" }],
 ];
 
-/** Eval-ideal variant for a model id, or undefined when unmeasured. */
-export function idealShapeVariant(modelId: string): ShapeVariantName | undefined {
+/** Eval-ideal format for a model id, or undefined when unmeasured. */
+export function idealShapeVariant(modelId: string): IdealShape | undefined {
 	return MODEL_VARIANTS.find(([pattern]) => pattern.test(modelId))?.[1];
 }
 
@@ -300,16 +352,20 @@ export interface ShapeTarget {
 /**
  * Pick the frame shape for a reader. An explicit `variant` (anything but
  * `"auto"`) forces that geometry; otherwise the model id selects the
- * eval-winning shape for its model line, falling back to the API family's
- * winner when the model is unmeasured. Billing (token estimate, detail
- * hint) always follows the API family actually carrying the request.
- * Accepts a full pi-ai `Model` or any `{ api, id }` subset.
+ * eval-winning shape — and frame size — for its model line, falling back to
+ * the API family's winner when the model is unmeasured. Billing (token
+ * estimate, detail hint) always follows the API family actually carrying
+ * the request, computed for the resolved frame size. Accepts a full pi-ai
+ * `Model` or any `{ api, id }` subset.
  */
 export function resolveShape(model?: ShapeTarget, variant?: ShapeVariantName | "auto"): Shape {
 	const family = billingFamily(model?.api);
-	const name =
-		variant && variant !== "auto" ? variant : (model?.id && idealShapeVariant(model.id)) || FAMILY_VARIANT[family];
-	return name === FAMILY_VARIANT[family] ? FAMILY_SHAPE[family] : priceShape(SHAPE_VARIANTS[name], family);
+	if (variant && variant !== "auto") return priceShape(SHAPE_VARIANTS[variant], family);
+	const ideal = model?.id ? idealShapeVariant(model.id) : undefined;
+	const name = ideal?.variant ?? FAMILY_VARIANT[family];
+	if (name === FAMILY_VARIANT[family] && ideal?.frameSize === undefined) return FAMILY_SHAPE[family];
+	const base = SHAPE_VARIANTS[name];
+	return priceShape(ideal?.frameSize ? { ...base, frameSize: ideal.frameSize } : base, family);
 }
 
 // ============================================================================
@@ -341,6 +397,7 @@ export const PROVIDER_IMAGE_BUDGETS: Record<string, number> = {
 	anthropic: 90,
 	"amazon-bedrock": 90,
 	openai: 200,
+	"openai-codex": 200,
 	google: 200,
 	"google-vertex": 200,
 	"google-gemini-cli": 200,
@@ -622,6 +679,15 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 	const dimToolResults = options?.dimToolResults !== false;
 	const parts: string[] = [];
 
+	// Tool results flagged contextually useless (and their paired calls) carry
+	// no information worth archiving — skip the whole pair.
+	const uselessCallIds = new Set<string>();
+	for (const msg of messages) {
+		if (msg.role === "toolResult" && msg.useless === true && msg.isError !== true) {
+			uselessCallIds.add(msg.toolCallId);
+		}
+	}
+
 	for (const msg of messages) {
 		if (msg.role === "user") {
 			const content =
@@ -643,6 +709,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 				} else if (block.type === "thinking") {
 					thinkingParts.push(stripDimMarkers(block.thinking));
 				} else if (block.type === "toolCall") {
+					if (uselessCallIds.has(block.id)) continue;
 					const args = block.arguments as Record<string, unknown>;
 					const argsStr = truncateForSummary(
 						Object.entries(args)
@@ -659,15 +726,16 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 			}
 
 			if (thinkingParts.length > 0) {
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
+				parts.push(`[Think]: ${thinkingParts.join("\n")}`);
 			}
 			if (textParts.length > 0) {
 				parts.push(`[Assistant]: ${textParts.join("\n")}`);
 			}
 			if (toolCalls.length > 0) {
-				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+				parts.push(`[Tool Call]: ${toolCalls.join("; ")}`);
 			}
 		} else if (msg.role === "toolResult") {
+			if (uselessCallIds.has(msg.toolCallId)) continue;
 			const content = msg.content
 				.filter((block): block is { type: "text"; text: string } => block.type === "text")
 				.map(block => block.text)
@@ -675,7 +743,7 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 			if (content) {
 				// Args above are JSON-escaped, so only raw result text can carry toggles.
 				const body = truncateForSummary(stripDimMarkers(content), toolResultMaxChars, headRatio);
-				parts.push(dimToolResults ? `[Tool result]: ${DIM_ON}${body}${DIM_OFF}` : `[Tool result]: ${body}`);
+				parts.push(dimToolResults ? `[Tool Result]: ${DIM_ON}${body}${DIM_OFF}` : `[Tool Result]: ${body}`);
 			}
 		}
 	}

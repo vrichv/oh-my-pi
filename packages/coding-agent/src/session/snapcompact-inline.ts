@@ -32,6 +32,17 @@ export interface SnapcompactInlineOptions {
 	shape?: snapcompact.ShapeVariantName | "auto";
 }
 
+/**
+ * Reports the per-tool-result tokens kept off the wire when a swap is applied.
+ * `savedTokens` is `textTokens - frames * shape.frameTokenEstimate` for each
+ * imaged tool result (always > 0; the savings gate guarantees it). Wired to the
+ * append-only savings journal; never throws into the request path.
+ */
+export type SnapcompactSavingsSink = (
+	savings: ReadonlyArray<{ toolCallId: string; savedTokens: number }>,
+	model: Model,
+) => void;
+
 // Per-provider image-count budgets live in @oh-my-pi/snapcompact
 // (`providerImageBudget`): snapcompact frames are 1568px (<2000px) so
 // dimension/size limits never bind; only COUNT does. Once the budget is
@@ -123,14 +134,16 @@ function selectSystemPromptImageTarget(
 
 /** Tool-result swap candidate, in context order. */
 export interface InlineToolResultCandidate {
-	/** toolCallId — stable identity for render caching and application. */
+	/** Stable identifier for rendering cache key and applying the swap. */
 	id: string;
-	/** Token count of the joined text blocks (0 when empty or image-carrying). */
+	/** Token count of the joined text blocks (0 for empty or image-carrying). */
 	textTokens: number;
-	/** Frames needed to render the text (0 = empty or below the token floor). */
+	/** Frames needed to render the text (0 = empty, below floor, image-carrying, or error). */
 	frames: number;
 	/** Already carries an image (screenshot etc.) — never re-imaged. */
 	hasImage: boolean;
+	/** Error tool results must stay text-only for provider API validation. */
+	isError?: boolean;
 }
 
 export interface InlineSystemPromptCandidate {
@@ -173,6 +186,7 @@ export function planInlineSwaps(input: InlinePlanInput): InlineSwapPlan {
 		for (let k = 0; k < input.toolResults.length - 1 && budget > 0; k++) {
 			const candidate = input.toolResults[k];
 			if (candidate.hasImage) continue;
+			if (candidate.isError) continue;
 			if (candidate.textTokens < MIN_TOOL_RESULT_TOKENS) continue;
 			if (candidate.frames === 0 || candidate.frames > budget) continue;
 			if (!passesSavingsGate(candidate.frames, input.shape, candidate.textTokens)) continue;
@@ -211,6 +225,7 @@ export interface InlineMessageView {
 	role: string;
 	toolCallId?: string;
 	content?: unknown;
+	isError?: boolean;
 }
 
 export interface SnapcompactSavingsEstimate {
@@ -280,6 +295,7 @@ export function estimateInlineSavings(input: {
 	if (options.renderToolResults) {
 		for (const message of input.messages) {
 			if (message.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
+			if (message.isError) continue;
 			const blocks: BlockViews = Array.isArray(message.content) ? (message.content as BlockViews) : [];
 			const hasImage = blocks.some(block => block.type === "image");
 			const text = hasImage
@@ -393,7 +409,10 @@ export class SnapcompactInlineTransformer {
 	#toolCache = new Map<string, FrameCacheEntry>();
 	#systemCache?: FrameCacheEntry;
 
-	constructor(private readonly options: SnapcompactInlineOptions) {}
+	constructor(
+		private readonly options: SnapcompactInlineOptions,
+		private readonly onToolResultSavings?: SnapcompactSavingsSink,
+	) {}
 
 	transform(context: Context, model: Model): Context {
 		// Vision gate: providers silently DROP images on text-only models —
@@ -418,6 +437,7 @@ export class SnapcompactInlineTransformer {
 				liveToolCallIds.add(message.toolCallId);
 				// Don't re-image results that already carry images (screenshots etc.).
 				const hasImage = message.content.some(block => block.type === "image");
+				if (message.isError) continue;
 				const text = hasImage
 					? ""
 					: message.content
@@ -458,13 +478,19 @@ export class SnapcompactInlineTransformer {
 		});
 
 		let changed = false;
+		const savings: Array<{ toolCallId: string; savedTokens: number }> = [];
 		for (const swap of plan.toolResults) {
 			const target = targets.get(swap.id);
 			if (!target) continue;
 			const frames = this.#framesFor(this.#toolCache, swap.id, target.text, shape);
 			messages[target.index] = { ...target.message, content: [{ type: "text", text: toolResultNote }, ...frames] };
 			changed = true;
+			savings.push({
+				toolCallId: swap.id,
+				savedTokens: Math.max(0, swap.textTokens - swap.frames * shape.frameTokenEstimate),
+			});
 		}
+		if (savings.length > 0) this.onToolResultSavings?.(savings, model);
 		if (this.options.renderToolResults) {
 			// Drop cache entries for tool calls no longer in the context
 			// (compacted away) so the cache stays bounded by live history.

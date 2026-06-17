@@ -5,11 +5,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { MCPManager } from "../mcp/manager";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import * as taskDiscovery from "../task/discovery";
 import * as taskExecutor from "../task/executor";
 import { AgentOutputManager } from "../task/output-manager";
@@ -288,6 +289,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			parentHindsightSessionState: options.session.getHindsightSessionState?.(),
 			parentMnemopiSessionState: options.session.getMnemopiSessionState?.(),
 			parentTelemetry: options.session.getTelemetry?.(),
+			parentAgentId: options.session.getAgentId?.() ?? MAIN_AGENT_ID,
 			// Deliberately omit parentEvalSessionId: the parent's Python kernel is
 			// blocked on this bridge call, so sharing the eval session would deadlock
 			// (subagent queues behind the parent's in-flight execution, parent waits

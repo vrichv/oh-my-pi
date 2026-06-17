@@ -191,6 +191,7 @@ export type CompletionProbeCredential =
 			projectId?: string;
 			email?: string;
 			enterpriseUrl?: string;
+			apiEndpoint?: string;
 	  };
 
 /**
@@ -377,6 +378,11 @@ export interface AuthCredentialStore {
 	 */
 	replaceAuthCredentialsRemote?(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]>;
 	/**
+	 * Optional async write hook for disabling one stored credential. Remote stores
+	 * use it to await broker persistence before AuthStorage updates its snapshot.
+	 */
+	deleteAuthCredentialRemote?(id: number, disabledCause: string): Promise<boolean>;
+	/**
 	 * Optional async write hook for clearing every credential for a provider
 	 * (logout). When present, `AuthStorage.remove` routes through this instead
 	 * of the sync `deleteAuthCredentialsForProvider`.
@@ -445,7 +451,7 @@ export type AuthStorageOptions = {
 	 *
 	 * Examples:
 	 * - `"local ~/.omp/agent/agent.db"`
-	 * - `"broker http://can.internal:8765"`
+	 * - `"broker http://omp.internal:8765"`
 	 */
 	sourceLabel?: string;
 	/**
@@ -633,6 +639,7 @@ export interface OAuthAccess {
 	email?: string;
 	projectId?: string;
 	enterpriseUrl?: string;
+	apiEndpoint?: string;
 }
 
 export interface OAuthAccessFailure {
@@ -641,6 +648,7 @@ export interface OAuthAccessFailure {
 	email?: string;
 	projectId?: string;
 	enterpriseUrl?: string;
+	apiEndpoint?: string;
 	error: string;
 }
 
@@ -1507,15 +1515,30 @@ export class AuthStorage {
 		this.#resetProviderAssignments(provider);
 	}
 
-	async #upsertOAuthCredential(provider: string, credential: OAuthCredential): Promise<void> {
-		const stored = this.#store.upsertAuthCredentialRemote
-			? await this.#store.upsertAuthCredentialRemote(provider, credential)
-			: this.#store.upsertAuthCredentialForProvider(provider, credential);
-		this.#setStoredCredentials(
-			provider,
-			stored.map(record => ({ id: record.id, credential: record.credential })),
-		);
-		this.#resetProviderAssignments(provider);
+	/**
+	 * List stored credential rows, optionally filtered by provider.
+	 */
+	listStoredCredentials(provider?: string): StoredAuthCredential[] {
+		if (provider !== undefined) {
+			return this.#getStoredCredentials(provider).map(entry => ({
+				id: entry.id,
+				provider,
+				credential: entry.credential,
+				disabledCause: null,
+			}));
+		}
+		const rows: StoredAuthCredential[] = [];
+		for (const [storedProvider, entries] of this.#data) {
+			for (const entry of entries) {
+				rows.push({
+					id: entry.id,
+					provider: storedProvider,
+					credential: entry.credential,
+					disabledCause: null,
+				});
+			}
+		}
+		return rows;
 	}
 
 	/**
@@ -1529,6 +1552,28 @@ export class AuthStorage {
 		}
 		this.#setStoredCredentials(provider, []);
 		this.#resetProviderAssignments(provider);
+	}
+
+	/**
+	 * Remove one stored credential for a provider.
+	 */
+	async removeCredential(provider: string, credentialId: number): Promise<boolean> {
+		const entries = this.#getStoredCredentials(provider);
+		const index = entries.findIndex(entry => entry.id === credentialId);
+		if (index === -1) return false;
+
+		if (this.#store.deleteAuthCredentialRemote) {
+			const deleted = await this.#store.deleteAuthCredentialRemote(credentialId, "deleted by user");
+			if (!deleted) return false;
+		} else {
+			this.#store.deleteAuthCredential(credentialId, "deleted by user");
+		}
+		this.#setStoredCredentials(
+			provider,
+			entries.filter((_entry, entryIndex) => entryIndex !== index),
+		);
+		this.#resetProviderAssignments(provider);
+		return true;
 	}
 
 	/**
@@ -1733,7 +1778,10 @@ export class AuthStorage {
 			return;
 		}
 		const newCredential: OAuthCredential = { type: "oauth", ...result };
-		await this.#upsertOAuthCredential(def.storeCredentialsAs ?? provider, newCredential);
+		// Use set() instead of #upsertOAuthCredential to replace ALL existing credentials
+		// (including legacy api_key rows from older versions) with the new OAuth credential.
+		// This ensures getApiKey() doesn't match an old api_key row before the new OAuth row.
+		await this.set(def.storeCredentialsAs ?? provider, newCredential);
 	}
 
 	/**
@@ -1758,6 +1806,7 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			apiEndpoint: credential.apiEndpoint,
 		};
 	}
 
@@ -1836,6 +1885,7 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			apiEndpoint: credential.apiEndpoint,
 		};
 	}
 
@@ -1859,6 +1909,7 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			apiEndpoint: credential.apiEndpoint,
 		};
 	}
 
@@ -1872,6 +1923,7 @@ export class AuthStorage {
 			projectId: refreshed.projectId ?? credential.projectId,
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+			apiEndpoint: refreshed.apiEndpoint ?? credential.apiEndpoint,
 		};
 	}
 
@@ -1919,6 +1971,7 @@ export class AuthStorage {
 			projectId: next.projectId,
 			email: next.email,
 			enterpriseUrl: next.enterpriseUrl,
+			apiEndpoint: next.apiEndpoint,
 		});
 	}
 
@@ -3339,6 +3392,7 @@ export class AuthStorage {
 				email: result.newCredentials.email ?? selection.credential.email,
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
+				apiEndpoint: result.newCredentials.apiEndpoint ?? selection.credential.apiEndpoint,
 			};
 			this.#replaceCredentialAt(provider, selection.index, updated);
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
@@ -3465,6 +3519,7 @@ export class AuthStorage {
 					return JSON.stringify({
 						token: oauthSelection.credential.access,
 						enterpriseUrl: oauthSelection.credential.enterpriseUrl,
+						apiEndpoint: oauthSelection.credential.apiEndpoint,
 					});
 				}
 				return oauthSelection.credential.access;
@@ -3562,6 +3617,7 @@ export class AuthStorage {
 			email: credential.email,
 			projectId: credential.projectId,
 			enterpriseUrl: credential.enterpriseUrl,
+			apiEndpoint: credential.apiEndpoint,
 		};
 	}
 
@@ -4022,6 +4078,7 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
+				apiEndpoint: refreshed.apiEndpoint ?? target.credential.apiEndpoint,
 			};
 			this.#replaceCredentialAt(provider, index, updated);
 			return {
@@ -4153,6 +4210,17 @@ type SerializedCredentialRecord = {
 
 const AUTH_SCHEMA_VERSION = 4;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
+
+/**
+ * SQLite's busy result code family — base `SQLITE_BUSY` plus the extended
+ * variants `SQLITE_BUSY_RECOVERY` (concurrent WAL recovery), `SQLITE_BUSY_SNAPSHOT`,
+ * and `SQLITE_BUSY_TIMEOUT`. All warrant the same backoff-and-retry treatment.
+ */
+export function isSqliteBusyError(err: unknown): boolean {
+	if (err === null || typeof err !== "object") return false;
+	const code = (err as { code?: unknown }).code;
+	return typeof code === "string" && code.startsWith("SQLITE_BUSY");
+}
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
 	const normalized = accountId?.trim();
@@ -4407,21 +4475,49 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 		}
 
-		const db = new Database(dbPath);
-		try {
-			await fs.chmod(dbPath, 0o600);
-		} catch {
-			// Ignore chmod failures (e.g., Windows)
+		// Concurrent omp startups can race against WAL recovery and the schema
+		// init's first lock-taking statement. Bun's default `busy_timeout` is 0,
+		// so retry the open on `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY` with bounded
+		// exponential backoff before surfacing the failure. See issue #2421.
+		const maxAttempts = 4;
+		const baseDelayMs = 100;
+		let lastBusyError: Error | undefined;
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			let db: Database | undefined;
+			try {
+				db = new Database(dbPath);
+				try {
+					await fs.chmod(dbPath, 0o600);
+				} catch {
+					// Ignore chmod failures (e.g., Windows)
+				}
+				return new SqliteAuthCredentialStore(db);
+			} catch (err) {
+				db?.close();
+				if (!isSqliteBusyError(err)) {
+					throw err;
+				}
+				lastBusyError = err instanceof Error ? err : new Error(String(err));
+				if (attempt < maxAttempts - 1) {
+					await Bun.sleep(baseDelayMs * 2 ** attempt);
+				}
+			}
 		}
-
-		return new SqliteAuthCredentialStore(db);
+		throw new Error(
+			`Failed to open auth database at '${dbPath}' after ${maxAttempts} attempts: ${lastBusyError?.message}`,
+			{ cause: lastBusyError },
+		);
 	}
 
 	#initializeSchema(): void {
+		// Install the busy handler BEFORE any lock-taking statement (incl.
+		// `PRAGMA journal_mode=WAL`, which acquires an exclusive lock during WAL
+		// recovery). Without this, concurrent omp startups can crash here with
+		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. See issue #2421.
+		this.#db.run("PRAGMA busy_timeout = 5000");
 		this.#db.run(`
 			PRAGMA journal_mode=WAL;
 			PRAGMA synchronous=NORMAL;
-			PRAGMA busy_timeout=5000;
 			CREATE TABLE IF NOT EXISTS auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL

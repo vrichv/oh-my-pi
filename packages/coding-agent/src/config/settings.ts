@@ -752,6 +752,16 @@ export class Settings {
 			delete taskObj.simple;
 		}
 
+		// task.eager / todo.eager: boolean -> enum (default | preferred | always).
+		// `true` reproduced the previous "on" behavior, which is now `always`.
+		if (taskObj && typeof taskObj.eager === "boolean") {
+			taskObj.eager = taskObj.eager ? "always" : "default";
+		}
+		const todoObj = raw.todo as Record<string, unknown> | undefined;
+		if (todoObj && typeof todoObj.eager === "boolean") {
+			todoObj.eager = todoObj.eager ? "always" : "default";
+		}
+
 		// task.isolation.mode: legacy values from before the pi-iso PAL refactor.
 		// `worktree` was git worktree → now lives under `rcopy`. `fuse-overlay`
 		// and `fuse-projfs` are now the platform-named `overlayfs` / `projfs`
@@ -833,6 +843,18 @@ export class Settings {
 			delete providersObj.parallelFetch;
 		}
 		delete raw["providers.parallelFetch"];
+
+		// codexResets.autoRedeem: boolean -> tri-state enum.
+		// Existing explicit false keeps the old "do not run" behavior; missing
+		// config now falls through to the new "unset" default, which asks before
+		// the first eligible spend.
+		const codexResetsObj = raw.codexResets as Record<string, unknown> | undefined;
+		if (codexResetsObj && typeof codexResetsObj.autoRedeem === "boolean") {
+			codexResetsObj.autoRedeem = codexResetsObj.autoRedeem ? "yes" : "no";
+		}
+		if (typeof raw["codexResets.autoRedeem"] === "boolean") {
+			raw["codexResets.autoRedeem"] = raw["codexResets.autoRedeem"] ? "yes" : "no";
+		}
 
 		// Map legacy `memories.enabled` boolean to the explicit `memory.backend`
 		// enum if the latter hasn't been set yet. Idempotent: subsequent

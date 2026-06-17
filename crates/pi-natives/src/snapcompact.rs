@@ -1,7 +1,8 @@
 //! Snapcompact frame rendering.
 //!
-//! Rasterizes pre-normalized conversation text onto a square bitmap using one
-//! of the bundled public-domain pixel fonts, then encodes it as PNG:
+//! Rasterizes pre-normalized conversation text onto a `size`-wide bitmap
+//! (height hugs the rows the text actually needs) using one of the bundled
+//! public-domain pixel fonts, then encodes it as PNG:
 //!
 //! - `5x8`  — X.org BDF font (legacy shape).
 //! - `8x8`  — unscii-8 hex font (Latin-1 subset), the square cell that won the
@@ -186,6 +187,25 @@ struct Grid {
 	cell_w: usize,
 	/// Cell pitch (y) in pixels.
 	cell_h: usize,
+}
+
+/// Grid rows the text actually occupies, so the canvas height hugs the
+/// content instead of padding the frame to a full square. Mirrors the
+/// renderers' cell accounting: dim toggles are zero-width, every other code
+/// point (including `U+2588` and glyphs missing from the font) consumes one
+/// cell; doc layout fills one row per `\n`-separated line down the first
+/// column before spilling into the second.
+fn used_rows(text: &str, grid: &Grid, doc: bool) -> usize {
+	let rows = if doc {
+		text.split('\n').count()
+	} else {
+		let cells = text
+			.chars()
+			.filter(|&ch| !matches!(ch as u32, DIM_ON | DIM_OFF))
+			.count();
+		cells.div_ceil(grid.cols)
+	};
+	rows.clamp(1, grid.rows)
 }
 
 /// Paint the pale highlight bands behind line copies after the first.
@@ -514,48 +534,76 @@ fn resize_rgb(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f3
 // PNG encoding
 // ============================================================================
 
-/// Pack one-byte-per-pixel palette indices into 4-bit PNG scanline data
-/// (two pixels per byte, high nibble first). With only 9 palette entries,
-/// 4-bit depth halves the pre-deflate stream vs 8-bit.
-fn pack_nibbles(pixels: &[u8], size: usize) -> Vec<u8> {
-	let row_bytes = size.div_ceil(2);
-	let mut packed = vec![0u8; row_bytes * size];
-	for y in 0..size {
-		let src = &pixels[y * size..(y + 1) * size];
+/// Pack one-byte-per-pixel palette indices into `bits`-per-pixel PNG
+/// scanline data (big-endian within each byte), remapping each global
+/// palette index through `remap` to its per-frame slot on the way.
+fn pack_bits(
+	pixels: &[u8],
+	width: usize,
+	height: usize,
+	bits: usize,
+	remap: &[u8; PALETTE.len()],
+) -> Vec<u8> {
+	let per = 8 / bits;
+	let row_bytes = width.div_ceil(per);
+	let mut packed = vec![0u8; row_bytes * height];
+	for y in 0..height {
+		let src = &pixels[y * width..(y + 1) * width];
 		let dst = &mut packed[y * row_bytes..(y + 1) * row_bytes];
 		for (x, &px) in src.iter().enumerate() {
-			dst[x / 2] |= px << (4 * (1 - x % 2));
+			dst[x / per] |= remap[px as usize] << (bits * (per - 1 - x % per));
 		}
 	}
 	packed
 }
 
-/// Encode a palette-indexed bitmap as a 4-bit indexed PNG with `None` row
+/// Encode a palette-indexed bitmap as an indexed PNG with `None` row
 /// filtering (the glyph bitmap is already minimal-entropy; filtering costs
 /// encode time without helping deflate).
+///
+/// The palette is narrowed to the colors the frame actually uses and the bit
+/// depth follows: a plain `bw` frame (background + ink) packs 1-bit rows, a
+/// dim/banded frame 2-bit, sentence-hue frames 4-bit — bw frames shed
+/// another ~half of the pre-deflate stream vs the fixed 4-bit layout.
 fn encode_indexed_png(
 	pixels: &[u8],
-	size: usize,
+	width: usize,
+	height: usize,
 	compression: png::Compression,
 ) -> Result<Vec<u8>> {
-	let mut palette = Vec::with_capacity(PALETTE.len() * 3);
-	for rgb in PALETTE {
-		palette.extend_from_slice(&rgb);
+	let mut used = [false; PALETTE.len()];
+	for &px in pixels {
+		used[px as usize] = true;
 	}
+	let mut remap = [0u8; PALETTE.len()];
+	let mut palette = Vec::with_capacity(PALETTE.len() * 3);
+	let mut count = 0u8;
+	for (global, &is_used) in used.iter().enumerate() {
+		if is_used {
+			remap[global] = count;
+			count += 1;
+			palette.extend_from_slice(&PALETTE[global]);
+		}
+	}
+	let (depth, bits) = match count {
+		0..=2 => (png::BitDepth::One, 1),
+		3..=4 => (png::BitDepth::Two, 2),
+		_ => (png::BitDepth::Four, 4),
+	};
 	let mut out = Vec::new();
-	let mut encoder = png::Encoder::new(&mut out, size as u32, size as u32);
+	let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
 	encoder.set_color(png::ColorType::Indexed);
-	encoder.set_depth(png::BitDepth::Four);
+	encoder.set_depth(depth);
 	encoder.set_palette(Cow::Owned(palette));
 	encoder.set_compression(compression);
 	// MUST come after `set_compression`, which resets the filter to the
-	// compression level's default (`Adaptive` for `Balanced`).
+	// compression level's default (`Adaptive` for `Balanced`/`High`).
 	encoder.set_filter(png::Filter::NoFilter);
 	let mut writer = encoder
 		.write_header()
 		.map_err(|err| Error::from_reason(format!("Failed to write PNG header: {err}")))?;
 	writer
-		.write_image_data(&pack_nibbles(pixels, size))
+		.write_image_data(&pack_bits(pixels, width, height, bits, &remap))
 		.map_err(|err| Error::from_reason(format!("Failed to write PNG data: {err}")))?;
 	writer
 		.finish()
@@ -565,9 +613,14 @@ fn encode_indexed_png(
 
 /// Encode an interleaved RGB8 buffer as PNG. Stretched frames are
 /// continuous-tone, so adaptive filtering (the `Balanced` default) helps.
-fn encode_rgb_png(pixels: &[u8], size: usize, compression: png::Compression) -> Result<Vec<u8>> {
+fn encode_rgb_png(
+	pixels: &[u8],
+	width: usize,
+	height: usize,
+	compression: png::Compression,
+) -> Result<Vec<u8>> {
 	let mut out = Vec::new();
-	let mut encoder = png::Encoder::new(&mut out, size as u32, size as u32);
+	let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
 	encoder.set_color(png::ColorType::Rgb);
 	encoder.set_depth(png::BitDepth::Eight);
 	encoder.set_compression(compression);
@@ -591,7 +644,9 @@ fn encode_rgb_png(pixels: &[u8], size: usize, compression: png::Compression) -> 
 #[napi(object)]
 #[derive(Default)]
 pub struct SnapcompactRenderOptions {
-	/// Frame edge in pixels.
+	/// Frame width in pixels; also bounds the grid rows
+	/// (`floor(size/cellHeight/lineRepeat)`). Output height hugs the rows the
+	/// text actually uses instead of padding to a square.
 	pub size:        u32,
 	/// Bundled font: `"5x8"`, `"6x12"`, `"8x13"` (X.org BDF) or `"8x8"`
 	/// (unscii-8). Default `"5x8"`.
@@ -618,10 +673,12 @@ pub struct SnapcompactRenderOptions {
 	pub columns:     Option<u32>,
 }
 
-/// Render one snapcompact frame: print pre-normalized text onto a square
-/// bitmap and encode it as PNG.
+/// Render one snapcompact frame: print pre-normalized text onto a
+/// `size`-wide bitmap and encode it as PNG.
 ///
-/// The glyph grid holds `floor(size/cellWidth) *
+/// The bitmap height hugs the rows the text actually occupies
+/// (`usedRows * lineRepeat * cellHeight`), so a partially filled frame never
+/// pays for blank padding rows. The glyph grid holds `floor(size/cellWidth) *
 /// floor(size/cellHeight/lineRepeat)` characters; input beyond that is ignored
 /// (the caller chunks text to capacity). Native-cell shapes encode as 4-bit
 /// indexed PNG; stretched shapes (target cell != font cell) encode as RGB.
@@ -681,6 +738,10 @@ pub fn render_snapcompact_png(
 			"Frame size {size} cannot fit a {target_w}x{target_h} cell grid (repeat {repeat})"
 		)));
 	}
+	// Tight canvas: width stays the frame edge (the reading geometry the
+	// caller derives cols from), height hugs the rows the text needs.
+	let used = used_rows(&text, &grid, doc);
+	let height = used * grid.repeat * grid.cell_h;
 
 	let stretch =
 		options.stretch != Some(false) && (target_w, target_h) != (font.cell_w, font.cell_h);
@@ -689,12 +750,12 @@ pub fn render_snapcompact_png(
 		// cell box (the natural cell, or natural glyphs on a padded pitch
 		// when `stretch: false`).
 		let pixels = if doc {
-			render_doc_bitmap(&text, size, size, font, &grid, black_ink)
+			render_doc_bitmap(&text, size, height, font, &grid, black_ink)
 		} else {
-			render_bitmap(&text, size, size, font, &grid, black_ink)
+			render_bitmap(&text, size, height, font, &grid, black_ink)
 		};
 		return Ok(STANDARD
-			.encode(encode_indexed_png(&pixels, size, png::Compression::Balanced)?)
+			.encode(encode_indexed_png(&pixels, size, height, png::Compression::High)?)
 			.into());
 	}
 
@@ -703,9 +764,9 @@ pub fn render_snapcompact_png(
 	// resample to the target cell, paste onto the white frame.
 	let native = Grid { cell_w: font.cell_w, cell_h: font.cell_h, ..grid };
 	let src_w = grid.cols * font.cell_w;
-	let src_h = grid.rows * grid.repeat * font.cell_h;
+	let src_h = used * grid.repeat * font.cell_h;
 	let dst_w = grid.cols * target_w;
-	let dst_h = grid.rows * grid.repeat * target_h;
+	let dst_h = used * grid.repeat * target_h;
 	let indexed = if doc {
 		render_doc_bitmap(&text, src_w, src_h, font, &native, black_ink)
 	} else {
@@ -719,8 +780,8 @@ pub fn render_snapcompact_png(
 		dst[2] = f32::from(b);
 	}
 	let resized = resize_rgb(&rgb, src_w, src_h, dst_w, dst_h);
-	let mut frame = vec![255u8; size * size * 3];
-	for y in 0..dst_h.min(size) {
+	let mut frame = vec![255u8; size * dst_h * 3];
+	for y in 0..dst_h {
 		let src_row = &resized[y * dst_w * 3..(y + 1) * dst_w * 3];
 		let dst_row = &mut frame[y * size * 3..];
 		for (d, &s) in dst_row[..dst_w.min(size) * 3].iter_mut().zip(src_row) {
@@ -728,7 +789,7 @@ pub fn render_snapcompact_png(
 		}
 	}
 	Ok(STANDARD
-		.encode(encode_rgb_png(&frame, size, png::Compression::Balanced)?)
+		.encode(encode_rgb_png(&frame, size, dst_h, png::Compression::High)?)
 		.into())
 }
 
@@ -875,6 +936,63 @@ mod tests {
 	}
 
 	#[test]
+	fn indexed_png_narrows_palette_and_bit_depth() {
+		// IHDR bit depth lives at byte 24; PLTE length is the chunk length
+		// word 8 bytes after the "PLTE" tag position.
+		fn depth_and_palette(png: &[u8]) -> (u8, usize) {
+			let tag = png
+				.windows(4)
+				.position(|w| w == b"PLTE")
+				.expect("PLTE chunk");
+			let len = u32::from_be_bytes(png[tag - 4..tag].try_into().unwrap()) as usize;
+			(png[24], len / 3)
+		}
+
+		// Plain bw, no dim/band/repeat: background + black ink = 1-bit.
+		let bw = png_bytes(
+			render_snapcompact_png("Hello world. Again.".into(), SnapcompactRenderOptions {
+				size: 128,
+				font: Some("8x8".into()),
+				variant: Some("bw".into()),
+				..Default::default()
+			})
+			.unwrap(),
+		);
+		assert_eq!(depth_and_palette(&bw), (1, 2));
+
+		// bw with a dim span and repeat bands: 4 colors = 2-bit.
+		let dim = png_bytes(
+			render_snapcompact_png(
+				"Read \u{e}the dim part\u{f} now.".into(),
+				SnapcompactRenderOptions {
+					size: 128,
+					font: Some("8x8".into()),
+					variant: Some("bw".into()),
+					line_repeat: Some(2),
+					..Default::default()
+				},
+			)
+			.unwrap(),
+		);
+		assert_eq!(depth_and_palette(&dim), (2, 4));
+
+		// Sentence hues exceed 4 colors: stays 4-bit, palette still narrowed
+		// to the inks actually printed (bg + 2 hues here).
+		let sent = png_bytes(
+			render_snapcompact_png("Hi. Ok.".into(), SnapcompactRenderOptions {
+				size: 128,
+				font: Some("8x8".into()),
+				variant: Some("sent".into()),
+				..Default::default()
+			})
+			.unwrap(),
+		);
+		let (sent_depth, sent_colors) = depth_and_palette(&sent);
+		assert_eq!(sent_depth, 2, "two hues + bg fit 2-bit");
+		assert_eq!(sent_colors, 3);
+	}
+
+	#[test]
 	fn rejects_bad_shapes() {
 		assert!(render_snapcompact_png("x".into(), opts(0)).is_err());
 		assert!(
@@ -940,7 +1058,9 @@ mod tests {
 		assert_eq!(png[25], 3, "8on16 must stay indexed");
 		// IHDR width/height live at bytes 16..24, big-endian.
 		let dim = |off: usize| u32::from_be_bytes(png[off..off + 4].try_into().unwrap());
-		assert_eq!((dim(16), dim(20)), (128, 128), "declared geometry must match");
+		// "Hello there. General Kenobi!" is 28 chars on a 16-col grid: 2 rows
+		// of the 16px pitch — the height hugs them instead of padding to 128.
+		assert_eq!((dim(16), dim(20)), (128, 32), "declared geometry must match");
 
 		// Glyph ink must sit in the top 13px of every 16px pitch row.
 		let grid = Grid { cols: 16, rows: 8, repeat: 1, cell_w: 8, cell_h: 16 };
@@ -988,6 +1108,49 @@ mod tests {
 		let inks: Vec<u8> = gridmode.iter().copied().filter(|&p| p != 0).collect();
 		assert!(inks.contains(&1));
 		assert!(!inks.contains(&2), "grid mode must not advance hue across newline");
+	}
+
+	#[test]
+	fn frame_height_hugs_used_rows() {
+		let dims = |png: &[u8]| {
+			let dim = |off: usize| u32::from_be_bytes(png[off..off + 4].try_into().unwrap());
+			(dim(16), dim(20))
+		};
+		let render = |text: &str, opts: SnapcompactRenderOptions| {
+			png_bytes(render_snapcompact_png(text.into(), opts).unwrap())
+		};
+		let opts_8x8 =
+			|| SnapcompactRenderOptions { size: 64, font: Some("8x8".into()), ..Default::default() };
+		// 8 cols of 8x8 cells: 10 chars span 2 rows -> 16px tall.
+		assert_eq!(dims(&render("0123456789", opts_8x8())), (64, 16));
+		// Dim toggles are zero-width and must not add a row.
+		assert_eq!(dims(&render("\u{e}01234567\u{f}", opts_8x8())), (64, 8));
+		// Capacity-filling text keeps the full grid height.
+		assert_eq!(dims(&render(&"x".repeat(64), opts_8x8())), (64, 64));
+		// Repeat shapes hug `usedRows * repeat` copy bands.
+		let repeated =
+			render("0123456789", SnapcompactRenderOptions { line_repeat: Some(2), ..opts_8x8() });
+		assert_eq!(dims(&repeated), (64, 32));
+		// Doc layout counts `\n` lines down the first column.
+		let doc = render("Hello there.\nSecond line", SnapcompactRenderOptions {
+			size: 256,
+			font: Some("8x13".into()),
+			cell_width: Some(8),
+			cell_height: Some(16),
+			stretch: Some(false),
+			columns: Some(2),
+			..Default::default()
+		});
+		assert_eq!(dims(&doc), (256, 32));
+		// The stretch path hugs too (RGB output, 6x6 target cells).
+		let stretched = render("0123456789ab", SnapcompactRenderOptions {
+			size: 60,
+			font: Some("8x8".into()),
+			cell_width: Some(6),
+			cell_height: Some(6),
+			..Default::default()
+		});
+		assert_eq!(dims(&stretched), (60, 12));
 	}
 
 	#[test]

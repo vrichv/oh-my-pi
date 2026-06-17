@@ -15,6 +15,7 @@ import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import {
 	formatBadge,
 	formatDuration,
+	formatExpandHint,
 	formatMoreItems,
 	formatStatusIcon,
 	replaceTabs,
@@ -45,6 +46,12 @@ interface TaskRenderContext {
 	frozen?: boolean;
 }
 type TaskRenderOptions = RenderResultOptions & { renderContext?: TaskRenderContext };
+
+const MAX_NESTED_TASK_RENDER_DEPTH = 8;
+
+function renderNestedCycleLine(theme: Theme): string {
+	return theme.fg("dim", "… nested task progress already shown");
+}
 
 /**
  * Get status icon for agent state.
@@ -543,6 +550,12 @@ function renderTaskCallLines(args: Partial<TaskParams> | undefined, theme: Theme
 }
 
 /**
+ * Agent rows shown per collapsed task list; the rest fold into a single
+ * `… N more agents` summary line (expand uncaps).
+ */
+const COLLAPSED_AGENT_LIMIT = 4;
+
+/**
  * Render the per-item list (`id` + ui `description`) for a batch call's
  * streaming preview. The args stream in token by token, so the array grows
  * over time and trailing entries may be partially parsed — every field access
@@ -552,7 +565,7 @@ function renderTaskItemLines(tasks: TaskItem[] | undefined, theme: Theme): strin
 	if (!Array.isArray(tasks) || tasks.length === 0) return [];
 
 	const bullet = theme.fg("dim", "•");
-	const cap = Math.min(tasks.length, 12);
+	const cap = Math.min(tasks.length, COLLAPSED_AGENT_LIMIT);
 	const lines: string[] = [];
 	for (let i = 0; i < cap; i++) {
 		const task = tasks[i] as Partial<TaskItem> | undefined;
@@ -680,6 +693,8 @@ function renderAgentProgress(
 	theme: Theme,
 	spinnerFrame?: number,
 	frozen = false,
+	seenNestedTasks?: WeakSet<object>,
+	nestedDepth = 0,
 ): string[] {
 	const lines: string[] = [];
 
@@ -852,7 +867,15 @@ function renderAgentProgress(
 	const inflight = progress.inflightTaskDetails;
 	if (completedTaskCalls.length > 0 || inflight) {
 		const snapshots = inflight ? [...completedTaskCalls, inflight] : completedTaskCalls;
-		const nestedLines = renderNestedTaskTree(snapshots, expanded, theme, spinnerFrame, frozen);
+		const nestedLines = renderNestedTaskTree(
+			snapshots,
+			expanded,
+			theme,
+			spinnerFrame,
+			frozen,
+			seenNestedTasks,
+			nestedDepth,
+		);
 		for (const line of nestedLines) {
 			lines.push(`${continuePrefix}${line}`);
 		}
@@ -977,6 +1000,8 @@ function renderAgentResult(
 	continuePrefix: string,
 	expanded: boolean,
 	theme: Theme,
+	seenNestedTasks?: WeakSet<object>,
+	nestedDepth = 0,
 ): string[] {
 	const lines: string[] = [];
 
@@ -1081,11 +1106,24 @@ function renderAgentResult(
 			// Skip review tools - handled above
 			if (toolName === "yield" || toolName === "report_finding") continue;
 
+			const isTaskTool = toolName === "task";
+			if (isTaskTool && (dataArray as unknown[]).length > 0) {
+				for (const line of renderNestedTaskResults(
+					dataArray as TaskToolDetails[],
+					expanded,
+					theme,
+					seenNestedTasks,
+					nestedDepth,
+				)) {
+					deferredToolLines.push(`${continuePrefix}${line}`);
+				}
+				continue;
+			}
+
 			const handler = subprocessToolRegistry.getHandler(toolName);
 			if (handler?.renderFinal && (dataArray as unknown[]).length > 0) {
-				const isTaskTool = toolName === "task";
 				const component = handler.renderFinal(dataArray as unknown[], theme, expanded);
-				const target = isTaskTool ? deferredToolLines : lines;
+				const target = lines;
 				if (!isTaskTool) {
 					hasCustomRendering = true;
 					target.push(`${continuePrefix}${theme.fg("dim", `Tool: ${toolName}`)}`);
@@ -1171,6 +1209,53 @@ function orderResultsForDisplay(results: readonly SingleResult[]): SingleResult[
 }
 
 /**
+ * Summary line for progress rows folded away by the collapsed cap: per-status
+ * counts plus the expand hint, e.g. `… 21 more agents (18 pending · 3 done)`.
+ */
+function formatHiddenProgressLine(hidden: readonly AgentProgress[], theme: Theme): string {
+	const counts: Record<AgentProgress["status"], number> = {
+		pending: 0,
+		running: 0,
+		completed: 0,
+		failed: 0,
+		aborted: 0,
+	};
+	for (const p of hidden) counts[p.status]++;
+	const parts: string[] = [];
+	if (counts.completed > 0) parts.push(theme.fg("dim", `${counts.completed} done`));
+	if (counts.running > 0) parts.push(theme.fg("dim", `${counts.running} running`));
+	if (counts.pending > 0) parts.push(theme.fg("dim", `${counts.pending} pending`));
+	if (counts.failed > 0) parts.push(theme.fg("error", `${counts.failed} failed`));
+	if (counts.aborted > 0) parts.push(theme.fg("error", `${counts.aborted} aborted`));
+	const breakdown =
+		parts.length > 0
+			? `${theme.fg("dim", " (")}${parts.join(theme.fg("dim", theme.sep.dot))}${theme.fg("dim", ")")}`
+			: "";
+	const hint = formatExpandHint(theme, false, true);
+	return `${theme.fg("dim", formatMoreItems(hidden.length, "agent"))}${breakdown}${hint ? ` ${hint}` : ""}`;
+}
+
+/**
+ * Pick the agent rows that stay visible when a finalized batch is collapsed:
+ * problem rows (aborted/failed/merge-failed) claim slots first so they are
+ * never folded away, then fastest finishers fill the remainder. The pick is
+ * filtered out of the display order, so visible rows keep the expanded layout.
+ */
+function selectCollapsedResults(ordered: readonly SingleResult[]): readonly SingleResult[] {
+	if (ordered.length <= COLLAPSED_AGENT_LIMIT) return ordered;
+	const picked = new Set<SingleResult>();
+	for (const result of ordered) {
+		if (picked.size >= COLLAPSED_AGENT_LIMIT) break;
+		if (result.aborted || result.exitCode !== 0 || result.error) picked.add(result);
+	}
+	for (const result of ordered) {
+		if (picked.size >= COLLAPSED_AGENT_LIMIT) break;
+		picked.add(result);
+	}
+	return ordered.filter(result => picked.has(result));
+}
+
+/**
  * Render the tool result.
  */
 export function renderResult(
@@ -1248,13 +1333,30 @@ export function renderResult(
 		const shouldRenderProgress =
 			Boolean(details.progress && details.progress.length > 0) && (isPartial || details.results.length === 0);
 		if (shouldRenderProgress && details.progress) {
-			orderProgressForDisplay(details.progress).forEach(progress => {
+			const ordered = orderProgressForDisplay(details.progress);
+			// Collapsed view keeps the live edge: finished rows sort to the top of
+			// the display order, so folding from the top keeps running/pending
+			// agents (and their current-tool lines) visible while one summary line
+			// stands in for everything above it.
+			const visible = expanded ? ordered : ordered.slice(Math.max(0, ordered.length - COLLAPSED_AGENT_LIMIT));
+			if (visible.length < ordered.length) {
+				lines.push(formatHiddenProgressLine(ordered.slice(0, ordered.length - visible.length), theme));
+			}
+			for (const progress of visible) {
 				lines.push(...renderAgentProgress(progress, "", "  ", expanded, theme, spinnerFrame, frozen));
-			});
+			}
 		} else if (details.results && details.results.length > 0) {
-			orderResultsForDisplay(details.results).forEach(res => {
+			const ordered = orderResultsForDisplay(details.results);
+			const visible = expanded ? ordered : selectCollapsedResults(ordered);
+			for (const res of visible) {
 				lines.push(...renderAgentResult(res, "", "  ", expanded, theme));
-			});
+			}
+			if (visible.length < ordered.length) {
+				const hint = formatExpandHint(theme, false, true);
+				lines.push(
+					`${theme.fg("dim", formatMoreItems(ordered.length - visible.length, "agent"))}${hint ? ` ${hint}` : ""}`,
+				);
+			}
 
 			const abortedCount = details.results.filter(r => r.aborted).length;
 			const mergeFailedCount = details.results.filter(r => !r.aborted && r.exitCode === 0 && r.error).length;
@@ -1346,15 +1448,34 @@ function nestedMarkers(isLast: boolean, theme: Theme): { prefix: string; continu
 	};
 }
 
-function renderNestedTaskResults(detailsList: TaskToolDetails[], expanded: boolean, theme: Theme): string[] {
+function renderNestedTaskResults(
+	detailsList: TaskToolDetails[],
+	expanded: boolean,
+	theme: Theme,
+	seen: WeakSet<object> = new WeakSet<object>(),
+	depth = 0,
+): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
-		if (!details.results || details.results.length === 0) continue;
+		if (seen.has(details)) {
+			lines.push(renderNestedCycleLine(theme));
+			continue;
+		}
+		if (depth >= MAX_NESTED_TASK_RENDER_DEPTH) {
+			lines.push(theme.fg("dim", "… nested task depth limit reached"));
+			continue;
+		}
+		seen.add(details);
+		if (!details.results || details.results.length === 0) {
+			seen.delete(details);
+			continue;
+		}
 		const ordered = orderResultsForDisplay(details.results);
 		ordered.forEach((result, index) => {
 			const { prefix, continuePrefix } = nestedMarkers(index === ordered.length - 1, theme);
-			lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme));
+			lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme, seen, depth + 1));
 		});
+		seen.delete(details);
 	}
 	return lines;
 }
@@ -1370,16 +1491,28 @@ function renderNestedTaskTree(
 	theme: Theme,
 	spinnerFrame?: number,
 	frozen = false,
+	seen: WeakSet<object> = new WeakSet<object>(),
+	depth = 0,
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
+		if (seen.has(details)) {
+			lines.push(renderNestedCycleLine(theme));
+			continue;
+		}
+		if (depth >= MAX_NESTED_TASK_RENDER_DEPTH) {
+			lines.push(theme.fg("dim", "… nested task depth limit reached"));
+			continue;
+		}
+		seen.add(details);
 		const hasResults = Boolean(details.results && details.results.length > 0);
 		if (hasResults) {
 			const ordered = orderResultsForDisplay(details.results);
 			ordered.forEach((result, index) => {
 				const { prefix, continuePrefix } = nestedMarkers(index === ordered.length - 1, theme);
-				lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme));
+				lines.push(...renderAgentResult(result, prefix, continuePrefix, expanded, theme, seen, depth + 1));
 			});
+			seen.delete(details);
 			continue;
 		}
 		const inflight = details.progress;
@@ -1387,9 +1520,22 @@ function renderNestedTaskTree(
 			const ordered = orderProgressForDisplay(inflight);
 			ordered.forEach((prog, index) => {
 				const { prefix, continuePrefix } = nestedMarkers(index === ordered.length - 1, theme);
-				lines.push(...renderAgentProgress(prog, prefix, continuePrefix, expanded, theme, spinnerFrame, frozen));
+				lines.push(
+					...renderAgentProgress(
+						prog,
+						prefix,
+						continuePrefix,
+						expanded,
+						theme,
+						spinnerFrame,
+						frozen,
+						seen,
+						depth + 1,
+					),
+				);
 			});
 		}
+		seen.delete(details);
 	}
 	return lines;
 }
