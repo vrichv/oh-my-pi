@@ -6,6 +6,7 @@
 
 - Added asynchronous, size-bounded SVG-to-PNG rasterization for terminal media previews.
 - Added `DiffStream` for incremental text/byte ingestion, direct asynchronous file opening, stable-prefix progress, off-thread exact Myers runs/unified hunks, and asynchronous syntax-grammar warmup.
+- Added `win32-arm64` to the published native leaf target list and restored napi `CROSS_TARGET` cargo-xwin builds for that addon.
 
 ## [18.0.3] - 2026-08-23
 

@@ -3,7 +3,11 @@
  * and the runtime enum exports, then installs the host addon. This is the
  * default backend for the `host` target (`bun run build` →
  * scripts/bazel-natives.ts); release addons build through Bazel with explicit
- * //:natives-* targets. Host target only — no cross-compilation.
+ * //:natives-* targets.
+ *
+ * Cross-compilation is limited to the cargo-xwin path used by the standalone
+ * win32-arm64 workflow (`CROSS_TARGET` + `TARGET_PLATFORM`/`TARGET_ARCH`).
+ * Bazel still owns every other shipped addon.
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
@@ -64,10 +68,15 @@ const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
+const crossTarget = Bun.env.CROSS_TARGET?.trim() || undefined;
+const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
+const targetArch = Bun.env.TARGET_ARCH || process.arch;
+const isCrossCompile = Boolean(crossTarget) || targetPlatform !== process.platform || targetArch !== process.arch;
+
 const localAddon = resolveLocalHostAddon({
-	platform: process.platform,
-	arch: process.arch,
-	avx2: detectHostAvx2Support(),
+	platform: targetPlatform,
+	arch: targetArch,
+	avx2: isCrossCompile ? false : detectHostAvx2Support(),
 });
 const effectiveVariant = localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
@@ -76,8 +85,9 @@ const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 // instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
 // the target's default CPU features: `-C target-cpu=native` would bake the build
 // host's CPU features into the addon and trips ring 0.17's aarch64-apple
-// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES).
-if (!Bun.env.RUSTFLAGS) {
+// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES). Cross builds inherit
+// the target triple's default CPU.
+if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
 	} else if (effectiveVariant === "baseline") {
@@ -141,7 +151,7 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 	}
 
 	const generatedCandidates = entries.filter(
-		entry => entry.startsWith(`pi_natives.${process.platform}-${process.arch}`) && entry.endsWith(".node"),
+		entry => entry.startsWith(`pi_natives.${targetPlatform}-${targetArch}`) && entry.endsWith(".node"),
 	);
 
 	if (generatedCandidates.length === 1) {
@@ -150,13 +160,13 @@ async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: strin
 
 	if (generatedCandidates.length === 0) {
 		throw new Error(
-			`napi build succeeded but did not emit a native addon for ${process.platform}-${process.arch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
+			`napi build succeeded but did not emit a native addon for ${targetPlatform}-${targetArch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
 		);
 	}
 
 	const formattedCandidates = generatedCandidates.map(candidate => `  - ${candidate}`).join("\n");
 	throw new Error(
-		`napi build emitted multiple unrecognized native addons for ${process.platform}-${process.arch}:\n${formattedCandidates}`,
+		`napi build emitted multiple unrecognized native addons for ${targetPlatform}-${targetArch}:\n${formattedCandidates}`,
 	);
 }
 
@@ -173,14 +183,15 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 
 const canonicalAddonFilename = localAddon.filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
+const buildKind = isCrossCompile ? "cross" : "local";
 
-console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
+console.log(`Building pi-natives bindings for ${targetPlatform}-${targetArch}${variantSuffix} (${buildKind})…`);
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
 await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
 const buildOutputDir = await fs.mkdtemp(
-	path.join(nativeDir, ".build", `${process.platform}-${process.arch}-${effectiveVariant ?? "default"}-local-`),
+	path.join(nativeDir, ".build", `${targetPlatform}-${targetArch}-${effectiveVariant ?? "default"}-${buildKind}-`),
 );
 
 // Resolve the CLI's JS entry from the package manifest rather than the
@@ -208,7 +219,7 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
-const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
+const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || (isCrossCompile ? "ci" : "local");
 
 const napiArgs = [
 	"build",
@@ -225,6 +236,9 @@ const napiArgs = [
 	"--profile",
 	cargoProfile,
 ];
+if (crossTarget) {
+	napiArgs.push("--target", crossTarget, "--cross-compile");
+}
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

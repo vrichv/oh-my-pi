@@ -36,4 +36,33 @@ describe("Windows release binary target", () => {
 			target: "bun-windows-x64-baseline",
 		});
 	});
+
+	it("builds the Windows arm64 release asset", async () => {
+		const result = await $`bun scripts/ci-release-build-binaries.ts --dry-run --targets win32-arm64`
+			.cwd(repoRoot)
+			.quiet()
+			.nothrow();
+		expect(result.exitCode).toBe(0);
+		const output = result.text();
+
+		expect(output).toContain("Building packages/coding-agent/binaries/omp-windows-arm64.exe...");
+		expect(output).toContain(
+			"DRY RUN Bun.build target=bun-windows-arm64 outfile=packages/coding-agent/binaries/omp-windows-arm64.exe",
+		);
+	});
+
+	it("resolves Windows arm64 local cross-build aliases", () => {
+		expect(resolveCrossBuild("win32-arm64")).toEqual({
+			id: "win32-arm64",
+			platform: "win32",
+			arch: "arm64",
+			target: "bun-windows-arm64",
+		});
+		expect(resolveCrossBuild("windows-arm64")).toEqual({
+			id: "windows-arm64",
+			platform: "win32",
+			arch: "arm64",
+			target: "bun-windows-arm64",
+		});
+	});
 });
