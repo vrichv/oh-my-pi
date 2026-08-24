@@ -1,6 +1,11 @@
 /**
  * Resolve auth-broker connection configuration for the local omp client.
  *
+ * This is a thin coding-agent wrapper around the shared resolver in
+ * `@oh-my-pi/pi-ai/auth-broker/discover` that preserves the process-lifetime
+ * memoization expected by the CLI and injects the full `resolveConfigValue`
+ * (including `!command` config indirection) from coding-agent's config layer.
+ *
  * Precedence (highest first):
  *   1. `OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN` env vars.
  *   2. `auth.broker.url` / `auth.broker.token` in `~/.omp/agent/config.yml`
@@ -15,55 +20,21 @@
  * `runRootCommand`, and we want hand-edited config entries to be honoured at
  * boot without forcing a startup reorder.
  */
-import * as path from "node:path";
-import { getAgentDir, getConfigRootDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { YAML } from "bun";
+
+import { AuthBrokerError } from "@oh-my-pi/pi-ai/auth-broker";
+import {
+	type AuthBrokerClientConfig,
+	type DiscoverAuthStorageOptions,
+	discoverAuthStorage as discoverAuthStorageShared,
+	getAuthBrokerTokenFilePath,
+	resolveAuthBrokerConfig as resolveAuthBrokerConfigShared,
+} from "@oh-my-pi/pi-ai/auth-broker/discover";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { resolveConfigValue } from "../config/resolve-config-value";
+import type { AuthStorage } from "./auth-storage";
 
-export interface AuthBrokerClientConfig {
-	url: string;
-	token: string;
-}
-
-/** Path to the local bearer token file. Created on the broker host by `omp auth-broker token`. */
-export function getAuthBrokerTokenFilePath(): string {
-	return path.join(getConfigRootDir(), "auth-broker.token");
-}
-
-async function readTokenFile(): Promise<string | null> {
-	try {
-		const raw = await Bun.file(getAuthBrokerTokenFilePath()).text();
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : null;
-	} catch (err) {
-		if (isEnoent(err)) return null;
-		logger.warn("auth-broker token file unreadable", { error: String(err) });
-		return null;
-	}
-}
-
-interface ConfigSnapshot {
-	url?: string;
-	token?: string;
-}
-
-async function readConfigYaml(): Promise<ConfigSnapshot> {
-	const configPath = path.join(getAgentDir(), "config.yml");
-	try {
-		const raw = await Bun.file(configPath).text();
-		const parsed = YAML.parse(raw);
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-		const record = parsed as Record<string, unknown>;
-		const url = typeof record["auth.broker.url"] === "string" ? (record["auth.broker.url"] as string) : undefined;
-		const token =
-			typeof record["auth.broker.token"] === "string" ? (record["auth.broker.token"] as string) : undefined;
-		return { url, token };
-	} catch (err) {
-		if (isEnoent(err)) return {};
-		logger.warn("auth-broker config.yml unreadable", { error: String(err) });
-		return {};
-	}
-}
+export { type AuthBrokerClientConfig, getAuthBrokerTokenFilePath };
 
 /**
  * Process-lifetime memo for {@link resolveAuthBrokerConfig}. Keyed on the env
@@ -88,7 +59,10 @@ let cachedConfigPromise: Promise<AuthBrokerClientConfig | null> | null = null;
 export function resolveAuthBrokerConfig(): Promise<AuthBrokerClientConfig | null> {
 	const key = `${process.env.OMP_AUTH_BROKER_URL ?? ""}\u0000${process.env.OMP_AUTH_BROKER_TOKEN ?? ""}\u0000${getAgentDir()}`;
 	if (cachedConfigPromise && cachedConfigKey === key) return cachedConfigPromise;
-	const promise = resolveAuthBrokerConfigUncached();
+	const promise = resolveAuthBrokerConfigShared({
+		agentDir: getAgentDir(),
+		configValueResolver: resolveConfigValue,
+	});
 	cachedConfigKey = key;
 	cachedConfigPromise = promise;
 	promise.catch(() => {
@@ -100,32 +74,57 @@ export function resolveAuthBrokerConfig(): Promise<AuthBrokerClientConfig | null
 	return promise;
 }
 
-async function resolveAuthBrokerConfigUncached(): Promise<AuthBrokerClientConfig | null> {
-	const envUrl = process.env.OMP_AUTH_BROKER_URL;
-	const envToken = process.env.OMP_AUTH_BROKER_TOKEN;
+/**
+ * Create an AuthStorage instance, using the broker when configured and falling
+ * back to the local SQLite store otherwise. Delegates to the shared resolver in
+ * pi-ai so the CLI, subagents, and the catalog generator all see the same
+ * credentials.
+ *
+ * Default `agentDir` is the current configured agent directory.
+ */
+export function discoverAuthStorage(
+	agentDir: string = getAgentDir(),
+	options?: Omit<DiscoverAuthStorageOptions, "agentDir" | "configValueResolver">,
+): Promise<AuthStorage> {
+	return discoverAuthStorageShared({
+		...options,
+		agentDir,
+		configValueResolver: resolveConfigValue,
+	});
+}
 
-	let url = envUrl && envUrl.length > 0 ? envUrl : undefined;
-	let configToken: string | undefined;
-	if (!url || !envToken) {
-		const fromConfig = await readConfigYaml();
-		if (!url && fromConfig.url) {
-			const resolved = await resolveConfigValue(fromConfig.url);
-			if (resolved && resolved.length > 0) url = resolved;
-		}
-		if (fromConfig.token) {
-			const resolved = await resolveConfigValue(fromConfig.token);
-			if (resolved && resolved.length > 0) configToken = resolved;
-		}
+/**
+ * Turn an auth-storage discovery failure raised at CLI startup into a clean,
+ * actionable message, or return `null` when the error is unrelated to the
+ * broker (so the caller rethrows it unchanged).
+ *
+ * A configured broker deliberately *replaces* the local credential store —
+ * {@link discoverAuthStorage} never silently falls back to local SQLite once
+ * `auth.broker.url` is set — so an unreachable broker is fatal. Without this,
+ * the underlying `AuthBrokerError` (or missing-token `MissingApiKeyError`)
+ * propagates as a raw uncaught exception and the CLI dies with a stack dump
+ * instead of recovery guidance (issue #8096).
+ */
+export async function describeAuthBrokerStartupError(error: unknown): Promise<string | null> {
+	if (error instanceof MissingApiKeyError) {
+		// resolveAuthBrokerConfig already built an actionable message naming the
+		// env var / config key / token-file path to set.
+		return error.message;
 	}
-	if (!url) return null;
-
-	const token =
-		(envToken && envToken.length > 0 ? envToken : undefined) ?? configToken ?? (await readTokenFile()) ?? undefined;
-	if (!token) {
-		throw new Error(
-			`OMP_AUTH_BROKER_URL is set (${url}) but no bearer token is available. ` +
-				`Set OMP_AUTH_BROKER_TOKEN, the \`auth.broker.token\` config entry, or place one at ${getAuthBrokerTokenFilePath()}.`,
-		);
+	if (!(error instanceof AuthBrokerError)) return null;
+	let url: string | undefined;
+	try {
+		url = (await resolveAuthBrokerConfig())?.url;
+	} catch {
+		// Config resolution itself failed (e.g. token vanished); fall back to a
+		// URL-less message rather than masking the original broker failure.
 	}
-	return { url, token };
+	const target = url ? ` at ${url}` : "";
+	return (
+		`Auth broker${target} is unreachable (${error.message}). ` +
+		"omp is configured to use this broker for credentials and will not fall back to local credentials automatically.\n" +
+		"Start the broker with `omp auth-broker serve`, or disable it with " +
+		"`omp config reset auth.broker.url` and `omp config reset auth.broker.token` " +
+		"(or unset OMP_AUTH_BROKER_URL / OMP_AUTH_BROKER_TOKEN)."
+	);
 }

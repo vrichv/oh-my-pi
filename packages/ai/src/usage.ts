@@ -4,7 +4,7 @@
  * Provides a normalized schema to represent multiple limit windows, model tiers,
  * and shared quotas across providers.
  */
-import { z } from "zod/v4";
+import { type } from "@oh-my-pi/omptype";
 import type { FetchImpl, Provider } from "./types";
 export type UsageUnit = "percent" | "tokens" | "requests" | "usd" | "minutes" | "bytes" | "unknown";
 
@@ -20,6 +20,12 @@ export interface UsageWindow {
 	durationMs?: number;
 	/** Absolute reset timestamp in milliseconds since epoch. */
 	resetsAt?: number;
+	/**
+	 * Verb rendered before the {@link resetsAt} countdown (e.g. "tick", "regen").
+	 * Defaults to "resets" — override for rolling windows where the timestamp is
+	 * an incremental regeneration step rather than a full window reset.
+	 */
+	resetLabel?: string;
 }
 
 /** Quantitative usage data. */
@@ -64,6 +70,23 @@ export interface UsageLimit {
 }
 
 /**
+ * Per-credit detail for a saved/banked rate-limit reset.
+ *
+ * Populated when the provider's listing endpoint returns individual credit
+ * metadata (e.g. OpenAI Codex `wham/rate-limit-reset-credits`). Callers that
+ * only need the count can ignore this; display layers use `expiresAt` to show
+ * when banked resets expire ([#3339](https://github.com/can1357/oh-my-pi/issues/3339)).
+ */
+export interface UsageResetCreditDetail {
+	/** ISO timestamp when the credit was granted. */
+	grantedAt?: string;
+	/** ISO timestamp when the credit expires and can no longer be redeemed. */
+	expiresAt?: string;
+	/** Backend status, e.g. `available`, `redeemed`. */
+	status?: string;
+}
+
+/**
  * Saved/banked rate-limit resets an account can redeem on demand.
  *
  * Surfaced by providers that let users defer a usage-window reset and spend it
@@ -73,6 +96,8 @@ export interface UsageLimit {
 export interface UsageResetCredits {
 	/** Number of resets available to redeem right now. */
 	availableCount: number;
+	/** Individual credit details (expiry dates, etc.) when the provider exposes them. */
+	credits?: UsageResetCreditDetail[];
 }
 
 /** Aggregated usage report for a provider. */
@@ -82,6 +107,13 @@ export interface UsageReport {
 	limits: UsageLimit[];
 	/** Saved rate-limit resets the account can redeem, when the provider reports them. */
 	resetCredits?: UsageResetCredits;
+	/**
+	 * Provider-wide disclaimers shown once above per-account sections.
+	 * Use this for caveats that apply to every limit (e.g. "OMP-observed
+	 * spend only"). Per-limit notes that differ per window (e.g. "Overage
+	 * requests: N") stay on {@link UsageLimit.notes}.
+	 */
+	notes?: string[];
 	metadata?: Record<string, unknown>;
 	raw?: unknown;
 }
@@ -135,61 +167,125 @@ export interface UsageHistoryQuery {
 	sinceMs?: number;
 }
 
+/**
+ * Aggregated request usage a client observed for one (provider, model) pair.
+ * Clients fold every completed request into per-pair buckets and flush them to
+ * the auth broker on a short cadence, so the broker can attribute token burn
+ * to the install that produced it.
+ */
+export interface ObservedUsageEntry {
+	/** Epoch ms of the newest request folded into this bucket. */
+	at: number;
+	provider: Provider;
+	model: string;
+	/** Completed requests folded into this bucket. */
+	requests: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	/** Estimated USD cost of the folded requests (0 when unknown). */
+	costUsd: number;
+}
+
+/** One client's observed-usage report, keyed by its stable install id. */
+export interface ClientUsageReport {
+	/** Stable per-machine install id — the client primary key. */
+	installId: string;
+	/** Human-readable machine name for display surfaces. */
+	hostname?: string;
+	entries: ObservedUsageEntry[];
+}
+
+/** Per-provider aggregate of one client's recorded usage. */
+export interface ClientProviderUsage {
+	provider: string;
+	requests: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	costUsd: number;
+}
+
+/** One known client with its usage aggregates over the queried window. */
+export interface ClientUsageClientSummary {
+	installId: string;
+	hostname?: string;
+	firstSeen: number;
+	lastSeen: number;
+	providers: ClientProviderUsage[];
+}
+
+/** Aggregated per-client usage recorded by the broker host. */
+export interface ClientUsageSummary {
+	clients: ClientUsageClientSummary[];
+}
+
 // ─── Zod schemas (wire-shape validation for the broker `/v1/usage` endpoint) ─
 
-export const usageUnitSchema = z.enum(["percent", "tokens", "requests", "usd", "minutes", "bytes", "unknown"]);
-export const usageStatusSchema = z.enum(["ok", "warning", "exhausted", "unknown"]);
+export const usageUnitSchema = type("'percent' | 'tokens' | 'requests' | 'usd' | 'minutes' | 'bytes' | 'unknown'");
+export const usageStatusSchema = type("'ok' | 'warning' | 'exhausted' | 'unknown'");
 
-export const usageWindowSchema = z.object({
-	id: z.string(),
-	label: z.string(),
-	durationMs: z.number().optional(),
-	resetsAt: z.number().optional(),
+export const usageWindowSchema = type({
+	id: "string",
+	label: "string",
+	"durationMs?": "number",
+	"resetsAt?": "number",
+	"resetLabel?": "string",
 });
 
-export const usageAmountSchema = z.object({
-	used: z.number().optional(),
-	limit: z.number().optional(),
-	remaining: z.number().optional(),
-	usedFraction: z.number().optional(),
-	remainingFraction: z.number().optional(),
+export const usageAmountSchema = type({
+	"used?": "number",
+	"limit?": "number",
+	"remaining?": "number",
+	"usedFraction?": "number",
+	"remainingFraction?": "number",
 	unit: usageUnitSchema,
 });
 
-export const usageScopeSchema = z.object({
-	provider: z.string(),
-	accountId: z.string().optional(),
-	projectId: z.string().optional(),
-	orgId: z.string().optional(),
-	modelId: z.string().optional(),
-	tier: z.string().optional(),
-	windowId: z.string().optional(),
-	shared: z.boolean().optional(),
+export const usageScopeSchema = type({
+	provider: "string",
+	"accountId?": "string",
+	"projectId?": "string",
+	"orgId?": "string",
+	"modelId?": "string",
+	"tier?": "string",
+	"windowId?": "string",
+	"shared?": "boolean",
 });
 
-export const usageLimitSchema = z.object({
-	id: z.string(),
-	label: z.string(),
+export const usageLimitSchema = type({
+	id: "string",
+	label: "string",
 	scope: usageScopeSchema,
-	window: usageWindowSchema.optional(),
+	"window?": usageWindowSchema,
 	amount: usageAmountSchema,
-	status: usageStatusSchema.optional(),
-	notes: z.array(z.string()).optional(),
+	"status?": usageStatusSchema,
+	"notes?": "string[]",
 });
 
-export const usageResetCreditsSchema = z.object({
-	availableCount: z.number(),
+export const usageResetCreditDetailSchema = type({
+	"grantedAt?": "string",
+	"expiresAt?": "string",
+	"status?": "string",
 });
 
-export const usageReportSchema = z.object({
-	provider: z.string(),
-	fetchedAt: z.number(),
-	limits: z.array(usageLimitSchema),
-	resetCredits: usageResetCreditsSchema.optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
+export const usageResetCreditsSchema = type({
+	availableCount: "number",
+	"credits?": usageResetCreditDetailSchema.array(),
+});
+
+export const usageReportSchema = type({
+	provider: "string",
+	fetchedAt: "number",
+	limits: usageLimitSchema.array(),
+	"resetCredits?": usageResetCreditsSchema,
+	"notes?": "string[]",
+	"metadata?": { "[string]": "unknown" },
 	// `raw` is provider-specific and may be anything; the broker strips it before
 	// sending the report over the wire, so accept-but-ignore here.
-	raw: z.unknown().optional(),
+	"raw?": "unknown",
 });
 
 /** Optional logger for usage fetchers. */
@@ -208,6 +304,10 @@ export interface UsageCredential {
 	accountId?: string;
 	projectId?: string;
 	email?: string;
+	/** Organization/workspace the credential is scoped to (see OAuthCredentials.orgId). */
+	orgId?: string;
+	/** Human-readable organization name for display. */
+	orgName?: string;
 	enterpriseUrl?: string;
 	metadata?: Record<string, unknown>;
 	apiEndpoint?: string;
@@ -217,6 +317,8 @@ export interface UsageCredential {
 export interface UsageFetchParams {
 	provider: Provider;
 	credential: UsageCredential;
+	/** Stable credential identity key derived by the auth storage layer. */
+	accountKey?: string;
 	baseUrl?: string;
 	signal?: AbortSignal;
 }
@@ -235,6 +337,10 @@ export interface UsageProvider {
 	/** Parse provider rate-limit response headers (lowercased keys) into a usage report, if supported. */
 	parseRateLimitHeaders?(headers: Record<string, string>, now?: number): UsageReport | null;
 	supports?(params: UsageFetchParams): boolean;
+	/** True when fetchUsage contacts upstream and can authenticate the credential for health checks. */
+	validatesCredentials?: boolean;
+	/** Whether a failed refresh may serve the previous successful report. Defaults to true. */
+	retainLastGoodOnFailure?: boolean;
 }
 
 /** Request context used when ranking usage for a specific model. */
@@ -260,11 +366,31 @@ export interface CredentialRankingStrategy {
 	 */
 	scopeLimits?(report: UsageReport, context?: CredentialRankingContext): UsageLimit[];
 	/**
+	 * Restrict limits for the opt-in, non-destructive usage-reserve health
+	 * check ({@link AuthStorage.getModelUsageHealth}). Distinct from
+	 * {@link scopeLimits}, which gates credential-wide hard blocks: a provider
+	 * whose model/tier counters are trusted only at confirmed exhaustion for
+	 * hard-blocking can still expose them here so the reserve margin protects
+	 * the mapped quota before it hits the cap. Falls back to {@link scopeLimits}
+	 * when omitted.
+	 */
+	scopeLimitsForReserve?(report: UsageReport, context?: CredentialRankingContext): UsageLimit[];
+	/**
 	 * Return a provider-local backoff scope for the requested model. Providers
 	 * with backend-specific quotas use this so one exhausted model family does
 	 * not block unrelated families on the same OAuth credential.
 	 */
 	blockScope?(context?: CredentialRankingContext): string | undefined;
+	/**
+	 * Scopes that apply to a request, most specific first. With a context, the
+	 * request's own scope plus any legacy catch-all scope whose blocks still
+	 * apply to everything. Without one — reconciliation runs with no request —
+	 * every scope whose blocks must be healed.
+	 *
+	 * A provider that scopes backoff by model family must implement this, or a
+	 * block written under one scope is invisible to requests and to healing.
+	 */
+	blockScopes?(context?: CredentialRankingContext): string[];
 	/** Fallback window durations (ms) when limits don't specify durationMs. */
 	windowDefaults: {
 		primaryMs: number;

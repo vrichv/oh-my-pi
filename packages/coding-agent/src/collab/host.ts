@@ -11,18 +11,25 @@
 
 import { timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { BusChannel, AgentEvent as WireAgentEvent, SessionEntry as WireSessionEntry } from "@oh-my-pi/pi-wire";
+import type {
+	BusChannel,
+	CollabUiRequest,
+	CollabUiRequestDraft,
+	CollabUiResponseValue,
+	AgentEvent as WireAgentEvent,
+	SessionEntry as WireSessionEntry,
+} from "@oh-my-pi/pi-wire";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
-import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task";
+import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
+import { collabDisplayName } from "./display-name";
 import {
 	type AgentSnapshot,
 	COLLAB_PROMPT_MESSAGE_TYPE,
@@ -37,6 +44,7 @@ import {
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
+import { shrinkForReplication } from "./replication-shrink";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -45,6 +53,7 @@ const STATE_TRIGGER_EVENTS: Record<string, true> = {
 	message_end: true,
 	tool_execution_end: true,
 	thinking_level_changed: true,
+	model_changed: true,
 	auto_compaction_end: true,
 };
 
@@ -93,18 +102,22 @@ function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEn
 }
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max bytes served per fetch-transcript reply (guest re-requests from `newSize`). */
-const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
-
-/** Display name for this process's user in collab sessions. */
-export function collabDisplayName(ctx: InteractiveModeContext): string {
-	const configured = (ctx.settings.get("collab.displayName") ?? "").trim();
-	if (configured) return configured;
-	try {
-		return os.userInfo().username;
-	} catch {
-		return "anonymous";
-	}
-}
+export const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
+const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fetch cap (${TRANSCRIPT_READ_CAP} bytes)`;
+/**
+ * Soft byte cap per `snapshot-chunk` frame. The first MB of a snapshot takes
+ * ~3s through the default relay, so a 512 KB chunk lands well under the
+ * guest's 30 s per-chunk progress timeout; oversized single entries still
+ * ship in a chunk of their own.
+ */
+const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
+/**
+ * Outcome of {@link CollabHost.requestGuestUi}. `answered` carries the guest's
+ * response (an `undefined` value is a genuine guest cancel); `unavailable`
+ * means the collab channel went away (teardown, relay drop) or the request was
+ * aborted before any guest answered — callers MUST NOT treat it as a cancel.
+ */
+export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseValue } | { kind: "unavailable" };
 
 export class CollabHost {
 	#ctx: InteractiveModeContext;
@@ -117,6 +130,8 @@ export class CollabHost {
 	#sessionId = "";
 	#unsubscribe?: () => void;
 	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#uiReqSeq = 0;
+	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
 	#streamingInterval: Timer | null = null;
@@ -133,7 +148,7 @@ export class CollabHost {
 		return this.#link;
 	}
 
-	/** Browser deep link (`https://<relay>/#<link>`) — the relay serves the web client at `/`. */
+	/** Browser deep link for the configured collab web UI. */
 	get webLink(): string {
 		return this.#webLink;
 	}
@@ -156,15 +171,52 @@ export class CollabHost {
 		return list;
 	}
 
-	async start(relayUrl: string): Promise<void> {
+	requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
+		if (!this.#socket || !this.#hasWritablePeers()) return null;
+		const reqId = ++this.#uiReqSeq;
+		const fullRequest: CollabUiRequest = { ...request, reqId };
+		const { promise, resolve } = Promise.withResolvers<CollabGuestUiResult>();
+		let settled = false;
+		const settle = (result: CollabGuestUiResult): void => {
+			if (settled) return;
+			settled = true;
+			signal?.removeEventListener("abort", onAbort);
+			this.#pendingUi.delete(reqId);
+			this.#sendWritablePeers({ t: "ui-request-end", reqId });
+			resolve(result);
+		};
+		const onAbort = (): void => settle({ kind: "unavailable" });
+		if (signal?.aborted) return Promise.resolve({ kind: "unavailable" });
+		signal?.addEventListener("abort", onAbort, { once: true });
+		this.#pendingUi.set(reqId, { request: fullRequest, settle });
+		this.#sendWritablePeers({ t: "ui-request", request: fullRequest });
+		return promise;
+	}
+
+	#hasWritablePeers(): boolean {
+		for (const peer of this.#peers.values()) {
+			if (peer.canWrite) return true;
+		}
+		return false;
+	}
+
+	#sendWritablePeers(frame: CollabFrame): void {
+		const socket = this.#socket;
+		if (!socket) return;
+		for (const [peerId, peer] of this.#peers) {
+			if (peer.canWrite) socket.send(frame, peerId);
+		}
+	}
+
+	async start(relayUrl: string, webUrl = ""): Promise<void> {
 		const rawKey = generateRoomKey();
 		const writeToken = generateWriteToken();
 		const roomId = generateRoomId();
 		this.#writeToken = writeToken;
 		this.#link = formatCollabLink(relayUrl, roomId, rawKey, writeToken);
-		this.#webLink = formatCollabWebLink(relayUrl, roomId, rawKey, writeToken);
+		this.#webLink = formatCollabWebLink(relayUrl, roomId, rawKey, writeToken, webUrl);
 		this.#viewLink = formatCollabLink(relayUrl, roomId, rawKey);
-		this.#webViewLink = formatCollabWebLink(relayUrl, roomId, rawKey);
+		this.#webViewLink = formatCollabWebLink(relayUrl, roomId, rawKey, undefined, webUrl);
 		const parsed = parseCollabLink(this.#link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		const key = await importRoomKey(rawKey);
@@ -216,7 +268,7 @@ export class CollabHost {
 		}
 
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
-			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event });
+			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
 			this.#onEventForState(event);
 		});
 		const bus = this.#ctx.eventBus;
@@ -227,7 +279,7 @@ export class CollabHost {
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
-			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry });
+			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
 			// Model/thinking/title changes land as entries while idle; refresh
 			// guest state promptly (debounce + JSON diff dedupe).
 			this.#scheduleStateBroadcast();
@@ -258,6 +310,8 @@ export class CollabHost {
 		this.#agentsDebounce = null;
 		clearInterval(this.#streamingInterval ?? undefined);
 		this.#streamingInterval = null;
+		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
+		this.#pendingUi.clear();
 		this.#peers.clear();
 		this.#socket?.close();
 		this.#socket = null;
@@ -289,6 +343,9 @@ export class CollabHost {
 				break;
 			case "agent-cmd":
 				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
+				break;
+			case "ui-response":
+				this.#handleUiResponse(frame.reqId, frame.value, fromPeer);
 				break;
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
@@ -323,9 +380,10 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
 
-		// Snapshot and send synchronously: no awaits between snapshot and send, so
-		// later entries/events queue behind the welcome on the same socket and the
-		// guest never sees a gap.
+		// Snapshot and send synchronously: no awaits between snapshot, welcome,
+		// and chunk sends, so subsequent broadcast frames (entry/event/state/bus)
+		// queue behind the snapshot on the same socket and the guest can't
+		// observe a gap between the snapshot fragment and live traffic.
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
 		if (JSON.stringify(snapshot).length > WELCOME_IMAGE_STRIP_THRESHOLD) {
 			let stripped = 0;
@@ -335,18 +393,26 @@ export class CollabHost {
 			logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
 		}
 		const entries = snapshot.entries.filter(isWireSessionEntry);
-		this.#socket?.send(
+		const socket = this.#socket;
+		if (!socket) return;
+		socket.send(
 			{
 				t: "welcome",
 				proto: COLLAB_PROTO,
 				header: snapshot.header,
-				entries,
 				state: this.#buildState(),
 				agents: this.#snapshotAgents(),
+				entryCount: entries.length,
 				readOnly: canWrite ? undefined : true,
 			},
 			fromPeer,
 		);
+		this.#sendSnapshotChunks(entries, fromPeer);
+		if (canWrite) {
+			for (const pending of this.#pendingUi.values()) {
+				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
+			}
+		}
 		this.#ctx.session.emitNotice(
 			"info",
 			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
@@ -354,6 +420,50 @@ export class CollabHost {
 		);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
+	}
+
+	/**
+	 * Slice {@link entries} into byte-bounded `snapshot-chunk` frames targeted
+	 * at {@link fromPeer}. Each entry is first run through
+	 * {@link shrinkForReplication} so a single oversized tool-result entry
+	 * cannot ship as an oversized chunk that trips the relay's per-frame
+	 * `maxPayloadLength` (issue #3739). Every batch carries at least one
+	 * entry, and the last batch is tagged `final: true` so the guest can
+	 * finalize the replica. An empty snapshot still emits one `final` chunk
+	 * so the guest never blocks on a missing terminator.
+	 */
+	#sendSnapshotChunks(entries: (StoredSessionEntry & WireSessionEntry)[], fromPeer: number): void {
+		const socket = this.#socket;
+		if (!socket) return;
+		if (entries.length === 0) {
+			socket.send({ t: "snapshot-chunk", entries: [], final: true }, fromPeer);
+			return;
+		}
+		let i = 0;
+		while (i < entries.length) {
+			const batch: (StoredSessionEntry & WireSessionEntry)[] = [];
+			let batchBytes = 0;
+			while (i < entries.length) {
+				const entry = entries[i];
+				if (!entry) break;
+				const shrunk = shrinkForReplication(entry);
+				const entryBytes = JSON.stringify(shrunk).length;
+				if (batch.length > 0 && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
+				batch.push(shrunk);
+				batchBytes += entryBytes;
+				i++;
+			}
+			socket.send({ t: "snapshot-chunk", entries: batch, final: i >= entries.length }, fromPeer);
+		}
+	}
+
+	#handleUiResponse(reqId: number, value: CollabUiResponseValue, fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) {
+			this.#rejectReadOnly("responding to ask", fromPeer);
+			return;
+		}
+		this.#pendingUi.get(reqId)?.settle({ kind: "answered", value });
 	}
 
 	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number): void {
@@ -445,18 +555,24 @@ export class CollabHost {
 	}
 
 	#snapshotAgents(): AgentSnapshot[] {
-		return AgentRegistry.global()
-			.list()
-			.map(ref => ({
-				id: ref.id,
-				displayName: ref.displayName,
-				kind: ref.kind,
-				parentId: ref.parentId,
-				status: ref.status,
-				hasSessionFile: !!ref.sessionFile,
-				createdAt: ref.createdAt,
-				lastActivity: ref.lastActivity,
-			}));
+		return (
+			AgentRegistry.global()
+				.list()
+				// Advisor transcripts are local observability only; never mirror them to
+				// guests (the wire AgentSnapshot kind has no `advisor`, and guests must not
+				// be able to chat/kill/revive them).
+				.filter((ref): ref is AgentRef & { kind: "main" | "sub" } => ref.kind !== "advisor")
+				.map(ref => ({
+					id: ref.id,
+					displayName: ref.displayName,
+					kind: ref.kind,
+					parentId: ref.parentId,
+					status: ref.status,
+					hasSessionFile: !!ref.sessionFile,
+					createdAt: ref.createdAt,
+					lastActivity: ref.lastActivity,
+				}))
+		);
 	}
 
 	#scheduleAgentsBroadcast(): void {
@@ -470,6 +586,12 @@ export class CollabHost {
 	#handleAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text: string | undefined, fromPeer: number): void {
 		if (!this.#peers.get(fromPeer)?.canWrite) {
 			this.#rejectReadOnly("agent control", fromPeer);
+			return;
+		}
+		// Advisor refs are excluded from snapshots, but reject control by id defensively:
+		// a stale/malicious client must never chat/kill/revive a read-only advisor transcript.
+		if (AgentRegistry.global().get(agentId)?.kind === "advisor") {
+			this.#socket?.send({ t: "error", message: `agent ${agentId}: advisor transcripts are read-only` }, fromPeer);
 			return;
 		}
 		const fail = (err: unknown) => {
@@ -493,10 +615,11 @@ export class CollabHost {
 			case "kill": {
 				const kill = async () => {
 					const ref = AgentRegistry.global().get(agentId);
-					if (ref && ref.status === "running" && ref.session) {
+					if (!ref) return;
+					if (ref.status === "running" && ref.session) {
 						await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 					}
-					await AgentLifecycleManager.global().release(agentId);
+					await AgentLifecycleManager.global().release(agentId, ref, { tombstone: true });
 				};
 				kill().catch(fail);
 				break;
@@ -536,7 +659,11 @@ export class CollabHost {
 			if (!reachedEof) {
 				// Trim to the last complete JSONL line so no line or UTF-8 char is split.
 				const lastNewline = slice.lastIndexOf(0x0a);
-				slice = slice.subarray(0, lastNewline >= 0 ? lastNewline + 1 : 0);
+				if (lastNewline < 0) {
+					reply("", fromByte, TRANSCRIPT_ENTRY_TOO_LARGE_ERROR);
+					return;
+				}
+				slice = slice.subarray(0, lastNewline + 1);
 			}
 			reply(slice.toString("utf-8"), reachedEof ? stat.size : fromByte + slice.byteLength);
 		} catch (err) {

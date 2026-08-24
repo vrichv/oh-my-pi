@@ -5,15 +5,15 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
+import { type } from "@oh-my-pi/omptype";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
-	ANTIGRAVITY_SYSTEM_INSTRUCTION,
 	getAntigravityModelWireProfile,
 	getAntigravityUserAgent,
 	getGeminiCliHeaders,
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
-import { ProviderHttpError } from "../errors";
+import * as AIError from "../error";
 import type {
 	Api,
 	AssistantMessage,
@@ -29,11 +29,13 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { extractGoogleValidationUrl, formatGoogleValidationRequiredMessage } from "../utils/google-validation";
-import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump } from "../utils/http-inspector";
-import { getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
+import type { RawHttpRequestDump } from "../utils/http-inspector";
+import { armPreResponseTimeout, getStreamFirstEventTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
+import { StreamMarkupHealing, type StreamMarkupHealingEvent } from "../utils/stream-markup-healing";
+import forcedToolDirective from "./google-antigravity-forced-tool.md" with { type: "text" };
 import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "./google-shared";
 import {
 	convertMessages,
@@ -58,9 +60,179 @@ import {
  */
 export type { GoogleThinkingLevel };
 
-/** Non-2xx response (or in-stream error chunk) from the Cloud Code Assist API. */
-export class GeminiCliApiError extends ProviderHttpError {
-	override readonly name = "GeminiCliApiError";
+function isPlanningLeakPrefix(text: string): boolean {
+	const trimmed = text.trimStart();
+	if (!trimmed.startsWith("{")) {
+		return false;
+	}
+	const afterBrace = trimmed.slice(1).trimStart();
+	if (afterBrace === "") {
+		return trimmed.length <= 100;
+	}
+	if (afterBrace[0] !== '"') {
+		return false;
+	}
+	const nextQuoteIndex = afterBrace.indexOf('"', 1);
+	if (nextQuoteIndex === -1) {
+		const keyPrefix = afterBrace.slice(1);
+		return "thought".startsWith(keyPrefix) && trimmed.length <= 100;
+	}
+	const key = afterBrace.slice(1, nextQuoteIndex);
+	if (key !== "thought") {
+		return false;
+	}
+	const afterKey = afterBrace.slice(nextQuoteIndex + 1).trimStart();
+	if (afterKey === "") {
+		return trimmed.length <= 100;
+	}
+	if (afterKey[0] !== ":") {
+		return false;
+	}
+	return true;
+}
+
+type BufferedPlanningResult =
+	| { kind: "incomplete" }
+	| { kind: "plain"; visibleText: string }
+	| { kind: "leak"; visibleText: string };
+
+function isPlanningLeakObject(parsed: unknown, toolNames: Set<string>): boolean {
+	if (!parsed || typeof parsed !== "object") return false;
+	const record = parsed as Record<string, unknown>;
+	const hasThought = typeof record.thought === "string";
+	const isOmpTool = typeof record.call === "string" && toolNames.has(record.call);
+	const hasToolSignature =
+		"_i" in record || "paths" in record || "command" in record || ("path" in record && "content" in record);
+	return hasThought || isOmpTool || hasToolSignature;
+}
+
+function splitLeadingJsonObject(text: string): { prefixLength: number; jsonText: string; rest: string } | undefined {
+	const prefixLength = text.length - text.trimStart().length;
+	const trimmed = text.slice(prefixLength);
+	if (!trimmed.startsWith("{")) return undefined;
+
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+
+	for (let index = 0; index < trimmed.length; index += 1) {
+		const ch = trimmed[index];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (ch === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{") {
+			depth += 1;
+			continue;
+		}
+		if (ch !== "}") continue;
+		depth -= 1;
+		if (depth !== 0) continue;
+
+		const jsonText = trimmed.slice(0, index + 1);
+		return {
+			prefixLength: prefixLength + index + 1,
+			jsonText,
+			rest: trimmed.slice(index + 1),
+		};
+	}
+
+	return undefined;
+}
+
+function splitLeadingJsonObjectIgnoringQuotes(
+	text: string,
+): { prefixLength: number; jsonText: string; rest: string } | undefined {
+	const prefixLength = text.length - text.trimStart().length;
+	const trimmed = text.slice(prefixLength);
+	if (!trimmed.startsWith("{")) return undefined;
+
+	let depth = 0;
+	for (let index = 0; index < trimmed.length; index += 1) {
+		const ch = trimmed[index];
+		if (ch === "{") {
+			depth += 1;
+		} else if (ch === "}") {
+			depth -= 1;
+			if (depth === 0) {
+				return {
+					prefixLength: prefixLength + index + 1,
+					jsonText: trimmed.slice(0, index + 1),
+					rest: trimmed.slice(index + 1),
+				};
+			}
+		}
+	}
+	return undefined;
+}
+
+function consumePlanningBuffer(text: string, toolNames: Set<string>, isFinal = false): BufferedPlanningResult {
+	if (!isPlanningLeakPrefix(text)) {
+		return { kind: "plain", visibleText: text };
+	}
+
+	// Try standard brace-balanced slicing first (respecting quotes and escapes)
+	let leading = splitLeadingJsonObject(text);
+
+	// If standard parsing fails (e.g. due to unescaped quotes), fall back to quote-ignoring brace-balanced slicing
+	if (!leading) {
+		leading = splitLeadingJsonObjectIgnoringQuotes(text);
+	}
+
+	if (!leading) {
+		if (isFinal) {
+			// At EOF, if the buffer has a leak signature but no closing brace at all, discard the whole buffer.
+			const trimmed = text.trim();
+			const hasThoughtKey = trimmed.includes('"thought"');
+			const hasToolKey = Array.from(toolNames).some(name => trimmed.includes(`"${name}"`));
+			const hasToolSignature =
+				trimmed.includes('"_i"') ||
+				trimmed.includes('"paths"') ||
+				trimmed.includes('"command"') ||
+				(trimmed.includes('"path"') && trimmed.includes('"content"'));
+			if (hasThoughtKey || hasToolKey || hasToolSignature) {
+				return { kind: "leak", visibleText: "" };
+			}
+			return { kind: "plain", visibleText: text };
+		}
+		return { kind: "incomplete" };
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(leading.jsonText);
+	} catch {
+		// Fallback to substring matching if JSON parsing fails due to unescaped quotes
+		const hasThoughtKey = leading.jsonText.includes('"thought"');
+		const hasToolKey = Array.from(toolNames).some(name => leading.jsonText.includes(`"${name}"`));
+		const hasToolSignature =
+			leading.jsonText.includes('"_i"') ||
+			leading.jsonText.includes('"paths"') ||
+			leading.jsonText.includes('"command"') ||
+			(leading.jsonText.includes('"path"') && leading.jsonText.includes('"content"'));
+		const isLeak = hasThoughtKey || hasToolKey || hasToolSignature;
+		if (isLeak) {
+			return { kind: "leak", visibleText: leading.rest };
+		}
+		// Unparseable leading object is not safe to strip; release it as normal text.
+		return { kind: "plain", visibleText: text };
+	}
+
+	return isPlanningLeakObject(parsed, toolNames)
+		? { kind: "leak", visibleText: leading.rest }
+		: { kind: "plain", visibleText: text };
 }
 
 export interface GoogleGeminiCliOptions extends StreamOptions {
@@ -91,6 +263,8 @@ export interface GoogleGeminiCliOptions extends StreamOptions {
 		 */
 		suppress?: { level: GoogleThinkingLevel } | { budget: number };
 	};
+	/** Request that Cloud Code Assist omit human-readable thought summaries while still allowing internal reasoning. */
+	hideThinkingSummary?: boolean;
 	/**
 	 * Upstream wire model id override for collapsed effort-tier variants.
 	 * Serialized as `requestModelId ?? model.requestModelId ?? model.id`.
@@ -141,16 +315,12 @@ const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const ANTIGRAVITY_ENDPOINT_FALLBACKS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT] as const;
 
-export {
-	ANTIGRAVITY_SYSTEM_INSTRUCTION,
-	getAntigravityUserAgent,
-	getGeminiCliHeaders,
-	getGeminiCliUserAgent,
-} from "@oh-my-pi/pi-catalog/wire/gemini-headers";
-
 // Retry configuration
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
+const FLASH_FIRST_EVENT_TIMEOUT_MS = 60_000;
+const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 300_000;
+const FIRST_EVENT_TIMEOUT_ERROR = "Cloud Code Assist stream timed out while waiting for the first event";
 const RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 const CLAUDE_THINKING_BETA_HEADER = "interleaved-thinking-2025-05-14";
 const GOOGLE_GEMINI_REFRESH_SKEW_MS = 60_000;
@@ -164,37 +334,27 @@ function needsClaudeThinkingBetaHeader(model: Model<"google-gemini-cli">): boole
 	return model.provider === "google-antigravity" && model.id.startsWith("claude-") && model.reasoning;
 }
 
-function shouldInjectAntigravitySystemInstruction(modelId: string): boolean {
-	const normalized = modelId.toLowerCase();
-	return normalized.includes("claude") || normalized.includes("gemini-3");
-}
+const optionalCredentialString = type("unknown").pipe(raw => {
+	const out = type("string")(raw);
+	return out instanceof type.errors ? undefined : out;
+});
 
-/**
- * Extract a clean, user-friendly error message from Google API error response.
- * Parses JSON error responses and returns just the message field.
- */
-function extractErrorMessage(errorText: string): string {
-	try {
-		const parsed = JSON.parse(errorText) as { error?: { message?: string } };
-		if (parsed.error?.message) {
-			return parsed.error.message;
-		}
-	} catch {
-		// Not JSON, return as-is
-	}
-	return errorText;
-}
+const innerCredentialsSchema = type({
+	"token?": optionalCredentialString,
+	"projectId?": optionalCredentialString,
+	"project_id?": optionalCredentialString,
+	"refreshToken?": optionalCredentialString,
+	"refresh?": optionalCredentialString,
+	"email?": optionalCredentialString,
+	"expiresAt?": "unknown",
+	"expires?": "unknown",
+});
 
-interface GeminiCliApiKeyPayload {
-	token?: unknown;
-	projectId?: unknown;
-	project_id?: unknown;
-	refreshToken?: unknown;
-	expiresAt?: unknown;
-	email?: unknown;
-	refresh?: unknown;
-	expires?: unknown;
-}
+const geminiCliCredentialsSchema = type("unknown").pipe(raw => {
+	const out = innerCredentialsSchema(raw);
+	return out instanceof type.errors ? {} : out;
+});
+
 interface ParsedGeminiCliCredentials {
 	accessToken: string;
 	projectId: string;
@@ -215,32 +375,25 @@ export function parseGeminiCliCredentials(apiKeyRaw: string): ParsedGeminiCliCre
 	const missingCredentialsMessage =
 		"Missing token or projectId in Google Cloud credentials. Use /login to re-authenticate.";
 
-	let parsed: GeminiCliApiKeyPayload;
+	let rawCredentials: unknown;
 	try {
-		parsed = JSON.parse(apiKeyRaw) as GeminiCliApiKeyPayload;
+		rawCredentials = JSON.parse(apiKeyRaw);
 	} catch {
-		throw new Error(invalidCredentialsMessage);
+		throw new AIError.ValidationError(invalidCredentialsMessage);
+	}
+	const parsed = geminiCliCredentialsSchema(rawCredentials);
+	if (parsed instanceof type.errors) {
+		throw new AIError.ValidationError(invalidCredentialsMessage);
 	}
 
-	const projectId =
-		typeof parsed.projectId === "string"
-			? parsed.projectId
-			: typeof parsed.project_id === "string"
-				? parsed.project_id
-				: undefined;
-
-	if (typeof parsed.token !== "string" || typeof projectId !== "string") {
-		throw new Error(missingCredentialsMessage);
+	const projectId = parsed.projectId ?? parsed.project_id;
+	if (parsed.token === undefined || projectId === undefined) {
+		throw new AIError.ValidationError(missingCredentialsMessage);
 	}
 
-	const refreshToken =
-		typeof parsed.refreshToken === "string"
-			? parsed.refreshToken
-			: typeof parsed.refresh === "string"
-				? parsed.refresh
-				: undefined;
+	const refreshToken = parsed.refreshToken ?? parsed.refresh;
 	const expiresAt = normalizeExpiryMs(parsed.expiresAt ?? parsed.expires);
-	const email = typeof parsed.email === "string" && parsed.email.length > 0 ? parsed.email : undefined;
+	const email = parsed.email && parsed.email.length > 0 ? parsed.email : undefined;
 
 	return {
 		accessToken: parsed.token,
@@ -337,7 +490,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -362,7 +515,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 		try {
 			const apiKeyRaw = options?.apiKey;
 			if (!apiKeyRaw) {
-				throw new Error("Google Cloud Code Assist requires OAuth authentication. Use /login to authenticate.");
+				throw new AIError.ConfigurationError(
+					"Google Cloud Code Assist requires OAuth authentication. Use /login to authenticate.",
+				);
 			}
 
 			const isAntigravity = model.provider === "google-antigravity";
@@ -378,8 +533,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				parsedCredentials.expiresAt !== undefined &&
 				Date.now() >= parsedCredentials.expiresAt
 			) {
-				throw new Error(
+				throw new AIError.OAuthError(
 					"OAuth token expired before request — please retry; AuthStorage will refresh on the next attempt.",
+					{ kind: "token-refresh", provider: model.provider },
 				);
 			}
 			const baseUrl = model.baseUrl?.trim();
@@ -451,29 +607,28 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				headers: requestHeaders,
 			};
 
-			// Direct callers that skip `register-builtins` (which installs the
-			// iterator-level watchdog) need a pre-response timer alongside
-			// `timeout: false`; otherwise a stalled Cloud Code Assist proxy
-			// would hang forever. Floor matches the lazy wrapper's 5min default.
+			// The provider owns the first-event watchdog so a silent successful
+			// response can fail over to the alternate Antigravity endpoint before
+			// anything user-visible has streamed. Flash should not inherit the
+			// five-minute allowance reserved for cold Pro reasoning starts.
 			const firstEventTimeoutMs =
-				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(undefined, 300_000);
-			const preResponseWatchdog =
-				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
-					? AbortSignal.timeout(firstEventTimeoutMs)
-					: undefined;
+				options?.streamFirstEventTimeoutMs ??
+				getStreamFirstEventTimeoutMs(
+					undefined,
+					model.id.includes("flash") ? FLASH_FIRST_EVENT_TIMEOUT_MS : DEFAULT_FIRST_EVENT_TIMEOUT_MS,
+				);
 			const callerSignal = options?.signal;
-			const fetchSignal = preResponseWatchdog
-				? callerSignal
-					? AbortSignal.any([callerSignal, preResponseWatchdog])
-					: preResponseWatchdog
-				: callerSignal;
+			const toolNames = new Set(context.tools?.map(t => t.name) ?? []);
+			const isFlashLeakModel = model.id.includes("flash");
 
 			let started = false;
+			// Once any stream event starts, the endpoint is committed downstream.
+			// Failover remains safe only while `started` is false.
 			let sawFinishReason = false;
 			let lastResponseId: string | undefined;
 			const ensureStarted = () => {
 				if (!started) {
-					if (!firstTokenTime) firstTokenTime = Date.now();
+					if (!firstTokenTime) firstTokenTime = performance.now();
 					stream.push({ type: "start", partial: output });
 					started = true;
 				}
@@ -495,9 +650,14 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				sawFinishReason = false;
 			};
 
-			const streamResponse = async (activeResponse: Response): Promise<boolean> => {
+			const streamResponse = async (
+				activeResponse: Response,
+			): Promise<{ meaningful: boolean; strippedPlanningLeak: boolean }> => {
 				if (!activeResponse.body) {
-					throw new Error("No response body");
+					throw new AIError.ProviderResponseError("No response body", {
+						provider: model.provider,
+						kind: "empty-body",
+					});
 				}
 
 				// Scoped per attempt so a failed/empty retry cannot leak its
@@ -507,26 +667,127 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				let currentBlock: TextContent | ThinkingContent | null = null;
 				const blocks = output.content;
 				const blockIndex = () => blocks.length - 1;
+				const visibleTextHealing = new StreamMarkupHealing({ pattern: "thinking" });
 
-				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
-					activeResponse.body!,
-					options?.signal,
-					event => options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
-				)) {
+				let isBuffering = false;
+				let textBuffer = "";
+				let bufferedTextSignature: string | undefined;
+				let strippedPlanningLeak = false;
+
+				const endCurrentBlock = (): void => {
+					if (!currentBlock) return;
+					pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
+					currentBlock = null;
+				};
+
+				const startTextBlock = (): TextContent => {
+					let block = currentBlock;
+					if (block?.type !== "text") {
+						endCurrentBlock();
+						block = startTextOrThinkingBlock(false, output, stream, ensureStarted);
+						currentBlock = block;
+					}
+					return block;
+				};
+
+				const startThinkingBlock = (): ThinkingContent => {
+					let block = currentBlock;
+					if (block?.type !== "thinking") {
+						endCurrentBlock();
+						block = startTextOrThinkingBlock(true, output, stream, ensureStarted);
+						currentBlock = block;
+					}
+					return block;
+				};
+
+				const emitVisibleText = (delta: string, thoughtSignature?: string): void => {
+					if (!delta) return;
+					const block = startTextBlock();
+					block.text += delta;
+					block.textSignature = retainThoughtSignature(block.textSignature, thoughtSignature);
+					stream.push({
+						type: "text_delta",
+						contentIndex: blockIndex(),
+						delta,
+						partial: output,
+					});
+				};
+
+				const emitVisibleThinking = (delta: string): void => {
+					if (!delta) return;
+					const block = startThinkingBlock();
+					block.thinking += delta;
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: blockIndex(),
+						delta,
+						partial: output,
+					});
+				};
+
+				const emitHealingEvent = (event: StreamMarkupHealingEvent, thoughtSignature?: string): void => {
+					if (event.type === "text") {
+						emitVisibleText(event.text, thoughtSignature);
+					} else if (event.type === "thinking") {
+						emitVisibleThinking(event.thinking);
+					}
+				};
+
+				const feedVisibleText = (delta: string, thoughtSignature?: string): void => {
+					for (const event of visibleTextHealing.feedEvents(delta)) {
+						emitHealingEvent(event, thoughtSignature);
+					}
+				};
+
+				const flushVisibleText = (thoughtSignature?: string): void => {
+					for (const event of visibleTextHealing.flushEvents()) {
+						emitHealingEvent(event, thoughtSignature);
+					}
+				};
+
+				const retainCurrentBlockThoughtSignature = (thoughtSignature: string): void => {
+					const block = currentBlock;
+					if (!block) return;
+					if (block.type === "thinking") {
+						block.thinkingSignature = retainThoughtSignature(block.thinkingSignature, thoughtSignature);
+					} else {
+						block.textSignature = retainThoughtSignature(block.textSignature, thoughtSignature);
+					}
+				};
+
+				const responseAbortController = new AbortController();
+				const responseSignal = options?.signal
+					? AbortSignal.any([options.signal, responseAbortController.signal])
+					: responseAbortController.signal;
+				const chunks = iterateWithIdleTimeout(
+					readSseJson<CloudCodeAssistResponseChunk>(activeResponse.body, responseSignal, event =>
+						options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
+					),
+					{
+						firstItemTimeoutMs: firstEventTimeoutMs,
+						errorMessage: FIRST_EVENT_TIMEOUT_ERROR,
+						firstItemErrorMessage: FIRST_EVENT_TIMEOUT_ERROR,
+						onFirstItemTimeout: () =>
+							responseAbortController.abort(new AIError.StreamTimeoutError(FIRST_EVENT_TIMEOUT_ERROR)),
+						abortSignal: options?.signal,
+					},
+				);
+				for await (const chunk of chunks) {
 					if (chunk.error) {
 						const detail = chunk.error.message || chunk.error.status || "unknown error";
 						const message = `Cloud Code Assist stream error: ${detail}`;
 						throw typeof chunk.error.code === "number" && chunk.error.code >= 400
-							? new GeminiCliApiError(message, chunk.error.code)
-							: new Error(message);
+							? new AIError.GeminiCliApiError(message, chunk.error.code)
+							: new AIError.ProviderResponseError(message, { provider: model.provider, kind: "runtime" });
 					}
 					const responseData = chunk.response;
 					if (!responseData) continue;
 					if (responseData.responseId) lastResponseId = responseData.responseId;
 					if (!responseData.candidates?.length && responseData.promptFeedback?.blockReason) {
 						const detail = responseData.promptFeedback.blockReasonMessage;
-						throw new Error(
+						throw new AIError.ProviderResponseError(
 							`Request blocked by Google (${responseData.promptFeedback.blockReason})${detail ? `: ${detail}` : ""}`,
+							{ provider: model.provider, kind: "content-blocked" },
 						);
 					}
 
@@ -535,20 +796,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						for (const part of candidate.content.parts) {
 							if (part.text !== undefined && part.text !== "") {
 								const isThinking = isThinkingPart(part);
-								if (
-									!currentBlock ||
-									(isThinking && currentBlock.type !== "thinking") ||
-									(!isThinking && currentBlock.type !== "text")
-								) {
-									if (currentBlock) {
-										pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
-									}
-									currentBlock = startTextOrThinkingBlock(isThinking, output, stream, ensureStarted);
-								}
-								if (currentBlock.type === "thinking") {
-									currentBlock.thinking += part.text;
-									currentBlock.thinkingSignature = retainThoughtSignature(
-										currentBlock.thinkingSignature,
+								if (isThinking) {
+									flushVisibleText();
+									const block = startThinkingBlock();
+									block.thinking += part.text;
+									block.thinkingSignature = retainThoughtSignature(
+										block.thinkingSignature,
 										part.thoughtSignature,
 									);
 									stream.push({
@@ -558,38 +811,41 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 										partial: output,
 									});
 								} else {
-									currentBlock.text += part.text;
-									currentBlock.textSignature = retainThoughtSignature(
-										currentBlock.textSignature,
-										part.thoughtSignature,
-									);
-									stream.push({
-										type: "text_delta",
-										contentIndex: blockIndex(),
-										delta: part.text,
-										partial: output,
-									});
+									if (isBuffering) {
+										textBuffer += part.text;
+										bufferedTextSignature = retainThoughtSignature(
+											bufferedTextSignature,
+											part.thoughtSignature,
+										);
+									} else if (isFlashLeakModel && part.text.trimStart().startsWith("{")) {
+										isBuffering = true;
+										textBuffer = part.text;
+										bufferedTextSignature = part.thoughtSignature;
+									} else {
+										feedVisibleText(part.text, part.thoughtSignature);
+									}
+
+									if (isBuffering) {
+										const buffered = consumePlanningBuffer(textBuffer, toolNames);
+										if (buffered.kind !== "incomplete") {
+											if (buffered.kind === "leak") strippedPlanningLeak = true;
+											const visibleSignature = bufferedTextSignature;
+											isBuffering = false;
+											textBuffer = "";
+											bufferedTextSignature = undefined;
+											feedVisibleText(buffered.visibleText, visibleSignature);
+										}
+									}
 								}
-							} else if (part.text === "" && part.thoughtSignature && currentBlock && !part.functionCall) {
-								if (currentBlock.type === "thinking") {
-									currentBlock.thinkingSignature = retainThoughtSignature(
-										currentBlock.thinkingSignature,
-										part.thoughtSignature,
-									);
-								} else {
-									currentBlock.textSignature = retainThoughtSignature(
-										currentBlock.textSignature,
-										part.thoughtSignature,
-									);
-								}
+							} else if (part.text === "" && part.thoughtSignature && !part.functionCall) {
+								retainCurrentBlockThoughtSignature(part.thoughtSignature);
 							}
 
 							if (part.functionCall) {
-								if (currentBlock) {
-									pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
-									currentBlock = null;
-								}
-
+								flushVisibleText();
+								endCurrentBlock();
+								isBuffering = false;
+								textBuffer = "";
 								const providedId = part.functionCall.id;
 								const needsNewId =
 									!providedId || output.content.some(b => b.type === "toolCall" && b.id === providedId);
@@ -649,14 +905,33 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 				}
 
-				if (currentBlock) {
-					pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
+				if (isBuffering && textBuffer !== "") {
+					const buffered = consumePlanningBuffer(textBuffer, toolNames, true);
+
+					if (buffered.kind !== "incomplete") {
+						if (buffered.kind === "leak") strippedPlanningLeak = true;
+						feedVisibleText(buffered.visibleText, bufferedTextSignature);
+					}
+					bufferedTextSignature = undefined;
+					isBuffering = false;
+					textBuffer = "";
 				}
 
-				return hasMeaningfulGoogleContent(output);
+				flushVisibleText(bufferedTextSignature);
+				endCurrentBlock();
+
+				return {
+					meaningful: hasMeaningfulGoogleContent(output),
+					strippedPlanningLeak,
+				};
 			};
 
 			let receivedContent = false;
+			const hasThinkingOutput = () =>
+				output.content.some(
+					block =>
+						block.type === "thinking" && (block.thinking.trim().length > 0 || Boolean(block.thinkingSignature)),
+				);
 
 			for (let i = 0; i < endpoints.length; i++) {
 				const endpoint = endpoints[i];
@@ -665,20 +940,29 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					started = false;
 					resetOutput();
 
-					const response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
-						method: "POST",
-						headers: requestHeaders,
-						body: requestBodyJson,
-						signal: fetchSignal,
-						maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
-						defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
-						maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
-						fetch: options?.fetch,
-						timeout: false,
-					});
+					// Per attempt: arm a pre-response (TTFT) timer, cleared the instant
+					// headers arrive so it never aborts the actively streaming body —
+					// an absolute `AbortSignal.timeout` would (issue #2422).
+					const watchdog = armPreResponseTimeout(callerSignal, firstEventTimeoutMs);
+					let response: Response;
+					try {
+						response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
+							method: "POST",
+							headers: requestHeaders,
+							body: requestBodyJson,
+							signal: watchdog.signal,
+							maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
+							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+							fetch: options?.fetch,
+							timeout: false,
+						});
+					} finally {
+						watchdog.clear();
+					}
 
 					if (!response.ok) {
-						if (response.status === 429 || (response.status >= 500 && response.status < 600)) {
+						if (AIError.isTransientStatus(response.status)) {
 							if (!isLastEndpoint) {
 								continue;
 							}
@@ -691,8 +975,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 									"retry your request",
 									parsedCredentials.email,
 								)
-							: extractErrorMessage(errorText);
-						throw new GeminiCliApiError(
+							: errorText;
+						throw new AIError.GeminiCliApiError(
 							`Cloud Code Assist API error (${response.status}): ${errorMessage}`,
 							response.status,
 							{ headers: response.headers },
@@ -704,7 +988,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 					for (let emptyAttempt = 0; emptyAttempt <= MAX_EMPTY_STREAM_RETRIES; emptyAttempt++) {
 						if (options?.signal?.aborted) {
-							throw new Error("Request was aborted");
+							throw new AIError.AbortError("Request was aborted");
 						}
 
 						if (emptyAttempt > 0) {
@@ -712,11 +996,11 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							try {
 								await scheduler.wait(backoffMs, { signal: options?.signal });
 							} catch {
-								throw new Error("Request was aborted");
+								throw new AIError.AbortError("Request was aborted");
 							}
 
 							if (!requestUrl) {
-								throw new Error("Missing request URL");
+								throw new AIError.ConfigurationError("Missing request URL");
 							}
 
 							currentResponse = await (options?.fetch ?? fetch)(requestUrl, {
@@ -728,7 +1012,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 							if (!currentResponse.ok) {
 								const retryErrorText = await currentResponse.text();
-								throw new GeminiCliApiError(
+								throw new AIError.GeminiCliApiError(
 									`Cloud Code Assist API error (${currentResponse.status}): ${retryErrorText}`,
 									currentResponse.status,
 									{ headers: currentResponse.headers },
@@ -737,27 +1021,59 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						}
 
 						const streamed = await streamResponse(currentResponse);
-						if (streamed) {
-							receivedContent = true;
+						// Eventless silence may fail over to the alternate Antigravity
+						// endpoint. Once thinking has streamed, the endpoint is already
+						// committed downstream; Advisor mode may accept that silence,
+						// while normal sessions surface it to final-output recovery.
+						const thoughtOnly = hasThinkingOutput();
+						const acceptedSilence =
+							options?.acceptEmptyResponse === true &&
+							!streamed.strippedPlanningLeak &&
+							(isLastEndpoint || thoughtOnly);
+						if (output.stopReason !== "stop" || streamed.meaningful || acceptedSilence) {
+							receivedContent = streamed.meaningful || acceptedSilence;
 							break;
 						}
+
+						// A thought-only STOP is a complete provider response, not a
+						// transiently empty transport. Replaying the identical request
+						// burns another full reasoning pass; let session recovery add
+						// an explicit final-output reminder instead.
+						if (thoughtOnly) break;
 
 						if (emptyAttempt < MAX_EMPTY_STREAM_RETRIES) {
 							resetOutput();
 						}
 					}
 
+					if (output.stopReason === "aborted" || output.stopReason === "error") {
+						throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
+							provider: model.provider,
+							kind: "output",
+						});
+					}
+
 					if (!receivedContent) {
-						throw new Error("Cloud Code Assist API returned an empty response");
+						const thoughtOnly = hasThinkingOutput();
+						throw new AIError.ProviderResponseError(
+							thoughtOnly
+								? "Cloud Code Assist API returned a thought-only response without final output"
+								: "Cloud Code Assist API returned an empty response",
+							{
+								provider: model.provider,
+								kind: thoughtOnly ? "empty-output" : "empty-body",
+							},
+						);
 					}
 
 					if (options?.signal?.aborted) {
-						throw new Error("Request was aborted");
+						throw new AIError.AbortError("Request was aborted");
 					}
 
 					if (!sawFinishReason) {
-						throw new Error(
+						throw new AIError.ProviderResponseError(
 							"Cloud Code Assist stream ended without a finish reason (connection dropped or response truncated)",
+							{ provider: model.provider, kind: "incomplete-stream" },
 						);
 					}
 
@@ -777,37 +1093,38 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					break;
 				} catch (error) {
 					const status = extractHttpStatusFromError(error);
-					if (status === 429 || (status !== undefined && status >= 500 && status < 600)) {
-						if (!isLastEndpoint && !started) {
-							continue;
-						}
+					if (
+						!isLastEndpoint &&
+						!started &&
+						(AIError.isTransientStatus(status) ||
+							(status === undefined &&
+								!(error instanceof AIError.ProviderResponseError && error.kind === "output") &&
+								AIError.retriable(AIError.classify(error))))
+					) {
+						continue;
 					}
 					throw error;
 				}
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error(output.errorMessage ?? "An unknown error occurred");
+				throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
+					provider: model.provider,
+					kind: "output",
+				});
 			}
 
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) {
-				if ("index" in block) {
-					delete (block as { index?: number }).index;
-				}
-			}
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = await appendRawHttpRequestDumpFor400(
-				error instanceof Error ? error.message : JSON.stringify(error),
-				error,
-				rawRequestDump,
-			);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal, rawRequestDump });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -935,7 +1252,7 @@ function buildAntigravityRequestEnvelope(
 	const labels: Record<string, string> = {};
 	if (state?.lastExecutionId) labels.last_execution_id = state.lastExecutionId;
 	labels.last_step_index = String(step - 1);
-	if (profile) labels.model_enum = profile.modelEnum;
+	if (profile?.modelEnum !== undefined) labels.model_enum = profile.modelEnum;
 	labels.trajectory_id = trajectoryId;
 	labels.used_claude = String(isClaude);
 	labels.used_claude_conservative = String(isClaude);
@@ -977,7 +1294,7 @@ export function buildRequest(
 	// Thinking config
 	if (options.thinking?.enabled && model.reasoning) {
 		generationConfig.thinkingConfig = {
-			includeThoughts: true,
+			includeThoughts: !options.hideThinkingSummary,
 		};
 		// Gemini 3 models use thinkingLevel, older models use thinkingBudget
 		if (options.thinking.level !== undefined) {
@@ -1012,14 +1329,6 @@ export function buildRequest(
 		};
 	}
 
-	if (isAntigravity && shouldInjectAntigravitySystemInstruction(model.id)) {
-		const existingParts = request.systemInstruction?.parts ?? [];
-		request.systemInstruction = {
-			role: "user",
-			parts: [{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION }, ...existingParts],
-		};
-	}
-
 	if (context.tools && context.tools.length > 0) {
 		const convertedTools = convertTools(context.tools, model);
 		request.tools = isAntigravity ? normalizeAntigravityTools(convertedTools) : convertedTools;
@@ -1039,6 +1348,13 @@ export function buildRequest(
 						allowedFunctionNames: [...choice.allowedFunctionNames],
 					},
 				};
+			}
+			// Cloud Code Assist drops `toolConfig` on Antigravity's Gemini routes:
+			// the backend answers in text under `mode: "ANY"` and still emits calls
+			// under `"NONE"`. Claude routes implement it, so only Gemini needs the
+			// forced choice restated in the transcript.
+			if (isAntigravity && !isClaudeModel(model.id) && request.toolConfig?.functionCallingConfig.mode === "ANY") {
+				contents.push({ role: "user", parts: [{ text: forcedToolDirective }] });
 			}
 		}
 		// Antigravity's default tool mode is VALIDATED (verified for Gemini and

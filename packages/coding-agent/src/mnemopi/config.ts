@@ -26,6 +26,7 @@ export interface MnemopiBackendConfig {
 	autoRetain: boolean;
 	polyphonicRecall: boolean;
 	enhancedRecall: boolean;
+	proactiveLinking: boolean;
 	retainEveryNTurns: number;
 	recallLimit: number;
 	recallContextTurns: number;
@@ -43,7 +44,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const configuredDbPath = settings.get("mnemopi.dbPath");
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemopi.scoping");
-	const dbPath = configuredDbPath ?? path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
+	const dbPath = configuredDbPath?.trim()
+		? configuredDbPath
+		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
 	const scope = computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping);
 	const recallBanks =
 		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
@@ -71,6 +74,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		autoRetain: settings.get("mnemopi.autoRetain"),
 		polyphonicRecall: settings.get("mnemopi.polyphonicRecall"),
 		enhancedRecall: settings.get("mnemopi.enhancedRecall"),
+		proactiveLinking: settings.get("mnemopi.proactiveLinking"),
 		retainEveryNTurns: Math.max(1, Math.floor(settings.get("mnemopi.retainEveryNTurns"))),
 		recallLimit: Math.max(1, Math.floor(settings.get("mnemopi.recallLimit"))),
 		recallContextTurns: Math.max(1, Math.floor(settings.get("mnemopi.recallContextTurns"))),

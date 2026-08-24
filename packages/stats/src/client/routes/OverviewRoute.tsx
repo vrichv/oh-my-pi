@@ -1,9 +1,10 @@
-import { format } from "date-fns";
+import { format } from "@oh-my-pi/pi-utils/dates";
 import { useMemo } from "react";
 import { Line } from "react-chartjs-2";
 import { getOverviewStats, getRecentRequests } from "../api";
+import { AgentTokenShare } from "../components/AgentTokenShare";
 import { CHART_THEMES } from "../components/chart-shared";
-import { formatCost, formatDurationMs, formatInteger, formatRelativeTime } from "../data/formatters";
+import { formatDurationMs, formatInteger, formatMessageCost, formatRelativeTime } from "../data/formatters";
 import { useResource } from "../data/useResource";
 import type { MessageStats, TimeRange } from "../types";
 import { AsyncBoundary, DataTable, MetricCluster, Panel, Skeleton, StatusPill } from "../ui";
@@ -156,9 +157,9 @@ export function OverviewRoute({ active, range, refreshTrigger, onRequestClick }:
 			},
 			{
 				key: "cost",
-				header: "Cost",
+				header: "API-equivalent estimate",
 				numeric: true,
-				render: (item: MessageStats) => formatCost(item.usage.cost.total, 4),
+				render: (item: MessageStats) => formatMessageCost(item, 4),
 			},
 			{
 				key: "duration",
@@ -197,8 +198,8 @@ export function OverviewRoute({ active, range, refreshTrigger, onRequestClick }:
 					<div className="stats-mobile-card-value">{formatRelativeTime(item.timestamp)}</div>
 				</div>
 				<div>
-					<div className="stats-mobile-card-label">Cost</div>
-					<div className="stats-mobile-card-value">{formatCost(item.usage.cost.total, 4)}</div>
+					<div className="stats-mobile-card-label">API-equivalent estimate</div>
+					<div className="stats-mobile-card-value">{formatMessageCost(item, 4)}</div>
 				</div>
 				<div>
 					<div className="stats-mobile-card-label">Tokens</div>
@@ -223,6 +224,15 @@ export function OverviewRoute({ active, range, refreshTrigger, onRequestClick }:
 			<AsyncBoundary loading={overviewLoading} error={overviewError} data={overview}>
 				{overview && <MetricCluster stats={overview.overall} />}
 			</AsyncBoundary>
+
+			<Panel
+				title="Conversation Tokens by Agent"
+				subtitle="Uncached input + cache reads + cache writes + output, grouped by agent type"
+			>
+				<AsyncBoundary loading={overviewLoading} error={overviewError} data={overview}>
+					{overview && <AgentTokenShare stats={overview.byAgentType} />}
+				</AsyncBoundary>
+			</Panel>
 
 			<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 				<div className="lg:col-span-2">
@@ -288,7 +298,7 @@ export function OverviewRoute({ active, range, refreshTrigger, onRequestClick }:
 													<div>{req.provider}</div>
 													<div>
 														{req.duration ? formatDurationMs(req.duration) : ""}{" "}
-														{req.usage?.cost?.total ? `· ${formatCost(req.usage.cost.total, 4)}` : ""}
+														{req.usage.totalTokens > 0 ? `· ${formatMessageCost(req, 4)}` : ""}
 													</div>
 												</div>
 												{isError && (

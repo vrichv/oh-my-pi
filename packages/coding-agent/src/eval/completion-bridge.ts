@@ -11,10 +11,11 @@
  * The call is oneshot and toolless from the model's perspective — pure text
  * in, text (or, with `schema`, a structured object) out.
  */
+
+import { type } from "@oh-my-pi/omptype";
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model, type Tool } from "@oh-my-pi/pi-ai";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
-import { z } from "zod/v4";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 
 import {
@@ -37,16 +38,16 @@ const STRUCTURED_TOOL_NAME = "respond";
 type CompletionTier = "smol" | "default" | "slow";
 
 const TIER_TO_PATTERN: Record<CompletionTier, string> = {
-	smol: "pi/smol",
-	default: "pi/default",
-	slow: "pi/slow",
+	smol: "@smol",
+	default: "@default",
+	slow: "@slow",
 };
 
-const completionArgsSchema = z.object({
-	prompt: z.string().min(1, "prompt must be a non-empty string"),
-	model: z.enum(["smol", "default", "slow"]).default("default"),
-	system: z.string().optional(),
-	schema: z.record(z.string(), z.unknown()).optional(),
+const completionArgsSchema = type({
+	prompt: "string>0",
+	"model?": "'smol'|'default'|'slow'",
+	"system?": "string",
+	"schema?": { "[string]": "unknown" },
 });
 
 export interface EvalCompletionBridgeOptions {
@@ -62,7 +63,7 @@ export interface EvalCompletionResult {
 
 /**
  * Resolve a tier to a concrete {@link Model}. `default` prefers the session's
- * active model and falls back to the `pi/default` role; `smol`/`slow` resolve
+ * active model and falls back to the `@default` role; `smol`/`slow` resolve
  * their respective role patterns. Returns `undefined` when nothing matches.
  */
 function resolveTierModel(tier: CompletionTier, session: ToolSession): Model<Api> | undefined {
@@ -75,7 +76,7 @@ function resolveTierModel(tier: CompletionTier, session: ToolSession): Model<Api
 	const resolve = (pattern: string | undefined): Model<Api> | undefined => {
 		if (!pattern) return undefined;
 		const expanded = expandRoleAlias(pattern, session.settings);
-		return resolveModelFromString(expanded, available, matchPreferences, modelRegistry);
+		return resolveModelFromString(expanded, available, matchPreferences);
 	};
 
 	if (tier === "default") {
@@ -107,18 +108,18 @@ export async function runEvalCompletion(
 	args: unknown,
 	options: EvalCompletionBridgeOptions,
 ): Promise<EvalCompletionResult> {
-	const parsed = completionArgsSchema.safeParse(args);
-	if (!parsed.success) {
-		const issue = parsed.error.issues[0];
-		const where = issue?.path.length ? `${issue.path.join(".")}: ` : "";
-		throw new ToolError(`completion() received invalid arguments: ${where}${issue?.message ?? "bad input"}`);
+	const parsed = completionArgsSchema(args);
+	if (parsed instanceof type.errors) {
+		throw new ToolError(`completion() received invalid arguments: ${parsed.summary}`);
 	}
-	const { prompt, model: tier, system, schema } = parsed.data;
+	const { prompt, model: modelTier, system, schema } = parsed;
+	// Apply default value for model if not provided
+	const finalTier: CompletionTier = modelTier ?? "default";
 
-	const model = resolveTierModel(tier, options.session);
+	const model = resolveTierModel(finalTier, options.session);
 	if (!model) {
 		throw new ToolError(
-			`completion() could not resolve a model for the "${tier}" tier. Configure modelRoles.${tier === "default" ? "default" : tier} or ensure a provider is available.`,
+			`completion() could not resolve a model for the "${finalTier}" tier. Configure modelRoles.${finalTier === "default" ? "default" : finalTier} or ensure a provider is available.`,
 		);
 	}
 
@@ -162,7 +163,7 @@ export async function runEvalCompletion(
 			{
 				apiKey: registry.resolver(model, options.session.getSessionId?.() ?? undefined),
 				signal: options.signal,
-				reasoning: reasoningForTier(tier, model),
+				reasoning: reasoningForTier(finalTier, model),
 				toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,
 			},
 			{ telemetry, oneshotKind: "eval_completion" },
@@ -197,7 +198,15 @@ export async function runEvalCompletion(
 		if (!resultText) throw new ToolError("completion() returned no text output.");
 	}
 
-	options.emitStatus?.({ op: "completion", model: formatModelString(model), tier, chars: resultText.length });
+	options.emitStatus?.({
+		op: "completion",
+		model: formatModelString(model),
+		tier: finalTier,
+		chars: resultText.length,
+	});
 
-	return { text: resultText, details: { model: formatModelString(model), tier, structured: Boolean(schema) } };
+	return {
+		text: resultText,
+		details: { model: formatModelString(model), tier: finalTier, structured: Boolean(schema) },
+	};
 }

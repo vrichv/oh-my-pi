@@ -4,7 +4,8 @@
 
 import type { Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { type Dialect, getDialectDefinition } from "@oh-my-pi/pi-ai/dialect";
-import { formatGroupedPaths, prompt } from "@oh-my-pi/pi-utils";
+import { escapeHarmonyControlTokens } from "@oh-my-pi/pi-ai/utils/harmony-leak";
+import { formatGroupedPaths, prompt, stringifyJson } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
 import fileOperationsTemplate from "./prompts/file-operations.md" with { type: "text" };
 import summarizationSystemPrompt from "./prompts/summarization-system.md" with { type: "text" };
@@ -77,6 +78,23 @@ export function stripReadSelector(path: string): string {
 }
 
 /**
+ * A real filesystem path never contains a `scheme://` URL. Tool-call paths that
+ * do — `conflict://1`, `artifact://3`, `local://ctx.md`, `history://…`,
+ * `issue://12`, `https://…`, and the tolerated `file.ts:conflict://1` prefix
+ * form — are session-scoped or remote resources, not files the post-compaction
+ * agent can re-ground on. Keep them out of the `<files>` summary.
+ */
+const URL_SCHEME_RE = /[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Whether `path` references a `scheme://` URL (internal URI or web URL) rather
+ * than a filesystem path that belongs in the compaction `<files>` summary.
+ */
+export function isUrlSchemePath(path: string): boolean {
+	return URL_SCHEME_RE.test(path);
+}
+
+/**
  * Extract file operations from tool calls in an assistant message.
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
@@ -93,6 +111,10 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 
 		const path = typeof args.path === "string" ? args.path : undefined;
 		if (!path) continue;
+
+		// Internal URIs (conflict://, artifact://, local://, history://, …) and
+		// web URLs are not re-groundable files — keep them out of `<files>`.
+		if (isUrlSchemePath(path)) continue;
 
 		switch (block.name) {
 			case "read":
@@ -113,8 +135,11 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
  * Returns readFiles (files only read, not modified) and modifiedFiles.
  */
 export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
-	const modified = new Set([...fileOps.edited, ...fileOps.written]);
-	const readOnly = [...fileOps.read].filter(f => !modified.has(f)).sort();
+	// Drop any `scheme://` URLs (e.g. legacy `conflict://`/`artifact://` entries
+	// rehydrated straight into `fileOps` from a pre-fix compaction summary) — only
+	// real files belong in `<files>`. New tool-call scans are already filtered.
+	const modified = new Set([...fileOps.edited, ...fileOps.written].filter(f => !isUrlSchemePath(f)));
+	const readOnly = [...fileOps.read].filter(f => !isUrlSchemePath(f) && !modified.has(f)).sort();
 	const modifiedFiles = [...modified].sort();
 	return { readFiles: readOnly, modifiedFiles };
 }
@@ -149,7 +174,7 @@ export function formatFileOperations(
 	const all = [...mode.keys()].sort();
 	let files = formatGroupedPaths(all.slice(0, FILE_OPERATION_SUMMARY_LIMIT), path => ` (${mode.get(path)})`);
 	if (all.length > FILE_OPERATION_SUMMARY_LIMIT) {
-		files += `\n… (${all.length - FILE_OPERATION_SUMMARY_LIMIT} more files omitted)`;
+		files += `\n[…${all.length - FILE_OPERATION_SUMMARY_LIMIT} files elided…]`;
 	}
 	return prompt.render(fileOperationsTemplate, { files });
 }
@@ -175,18 +200,32 @@ export function upsertFileOperations(
 const TOOL_RESULT_MAX_CHARS = 2000;
 
 /**
- * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
+ * Truncate tool results to the same representation used in summarization prompts.
  */
-function truncateForSummary(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+export function truncateToolResultForSummary(text: string): string {
+	if (text.length <= TOOL_RESULT_MAX_CHARS) return text;
+	const truncatedChars = text.length - TOOL_RESULT_MAX_CHARS;
+	return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n\n[... ${truncatedChars} more characters truncated]`;
+}
+
+const SUMMARY_BOUNDARY_TAG_RE = /<\s*\/?\s*(?:conversation|previous-summary)\s*>/gi;
+
+/** Keep untrusted summary input from closing or impersonating harness-owned boundaries. */
+export function escapeSummaryBoundaryTags(text: string): string {
+	return text.replace(SUMMARY_BOUNDARY_TAG_RE, tag => `&lt;${tag.slice(1)}`);
 }
 
 /**
- * Serialize LLM messages to text for summarization.
- * This prevents the model from treating it as a conversation to continue.
+ * Serialize LLM messages as plain summary input without provider control tokens.
+ */
+export function serializeConversationForSummary(messages: Message[], dialect?: Dialect): string {
+	const conversation = serializeConversation(messages, dialect);
+	const escaped = dialect === "harmony" ? escapeHarmonyControlTokens(conversation) : conversation;
+	return escapeSummaryBoundaryTags(escaped);
+}
+
+/**
+ * Serialize LLM messages to transcript text.
  * Call convertToLlm() first to handle custom message types.
  */
 export function serializeConversation(messages: Message[], dialect?: Dialect): string {
@@ -201,10 +240,21 @@ export function serializeConversation(messages: Message[], dialect?: Dialect): s
 		}
 	}
 	if (dialect) {
+		// Claude's classifier refuses inputs that reproduce the model's own
+		// reasoning as text ("reasoning_extraction"), and the anthropic dialect
+		// otherwise renders thinking verbatim inside <thinking> tags. Reasoning is
+		// ephemeral and low-signal for a summary, so drop it from Anthropic-target
+		// summary input. Other dialects (e.g. Harmony) carry reasoning natively in
+		// their transcript format and keep it.
+		const dropThinking = dialect === "anthropic";
 		const processed: Message[] = [];
 		for (const msg of messages) {
 			if (msg.role === "assistant") {
-				const content = msg.content.filter(block => block.type !== "toolCall" || !uselessCallIds.has(block.id));
+				const content = msg.content.filter(
+					block =>
+						(block.type !== "toolCall" || !uselessCallIds.has(block.id)) &&
+						(!dropThinking || block.type !== "thinking"),
+				);
 				if (content.length > 0) processed.push(content.length === msg.content.length ? msg : { ...msg, content });
 				continue;
 			}
@@ -217,7 +267,7 @@ export function serializeConversation(messages: Message[], dialect?: Dialect): s
 				if (!text) continue;
 				processed.push({
 					...msg,
-					content: [{ type: "text", text: truncateForSummary(text, TOOL_RESULT_MAX_CHARS) }],
+					content: [{ type: "text", text: truncateToolResultForSummary(text) }],
 				});
 				continue;
 			}
@@ -269,7 +319,7 @@ export function serializeConversation(messages: Message[], dialect?: Dialect): s
 				.map(c => c.text)
 				.join("");
 			if (content) {
-				const text = truncateForSummary(content, TOOL_RESULT_MAX_CHARS);
+				const text = truncateToolResultForSummary(content);
 				parts.push(`[Tool Result]: ${text}`);
 			}
 		}
@@ -286,7 +336,7 @@ function renderToolCalls(calls: ToolCall[]): string {
 	return calls
 		.map(call => {
 			const argsStr = Object.entries(call.arguments as Record<string, unknown>)
-				.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+				.map(([k, v]) => `${k}=${stringifyJson(v) ?? "null"}`)
 				.join(", ");
 			return `${call.name}(${argsStr})`;
 		})

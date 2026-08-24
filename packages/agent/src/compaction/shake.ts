@@ -11,12 +11,13 @@
  */
 
 import type { TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { countTokens } from "@oh-my-pi/pi-natives";
+import type { Tokenizer } from "../tokenizer";
 import type { AgentMessage } from "../types";
-import { estimateTokens } from "./compaction";
 import type { CustomMessageEntry, SessionEntry, SessionMessageEntry } from "./entries";
+import { invalidateMessageCache } from "./message-cache";
 import {
 	collectToolCallsById,
+	isArtifactRecoveryToolResult,
 	isProtectedToolResult,
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
@@ -31,22 +32,45 @@ export interface ShakeConfig {
 	protectedTools: ProtectedToolMatcher[];
 	/** Minimum token size for a fenced/XML block to be eligible. */
 	fenceMinTokens: number;
+	/**
+	 * Compaction boundary (`firstKeptEntryId` of the latest compaction). Entries
+	 * before it are summarized away and never sent, so they are skipped — shaking
+	 * them only churns persisted history. Undefined = no compaction (whole branch
+	 * is sent). Note: shake still elides the warm cached prefix at/after the
+	 * boundary — that is its job as a compaction-class reducer.
+	 */
+	keepBoundaryId?: string;
 }
 
 /** Auto-shake config: protects the live tail, conservative thresholds. */
 export const DEFAULT_SHAKE_CONFIG: ShakeConfig = {
 	protectTokens: 16_000,
 	minSavings: 4_000,
+	protectedTools: ["skill", isSkillReadToolResult, isArtifactRecoveryToolResult],
+	fenceMinTokens: 400,
+};
+
+/**
+ * Manual `/shake`: aggressive — no savings threshold and drops eligible
+ * regions across history, artifact recovery reads included (the user's full
+ * escape hatch). Still keeps a small recent tail so it cannot strip the tool
+ * results the agent is currently working from (#7776).
+ */
+export const AGGRESSIVE_SHAKE_CONFIG: ShakeConfig = {
+	protectTokens: 4_000,
+	minSavings: 0,
 	protectedTools: ["skill", isSkillReadToolResult],
 	fenceMinTokens: 400,
 };
 
-/** Manual `/shake`: aggressive — drops every eligible region across history. */
-export const AGGRESSIVE_SHAKE_CONFIG: ShakeConfig = {
+/** Compaction dead-end rescue: aggressive reach, but artifact recovery reads stay protected. */
+export const RESCUE_SHAKE_CONFIG: ShakeConfig = {
+	...AGGRESSIVE_SHAKE_CONFIG,
+	// Rescue must be able to elide the newest oversized result even inside the
+	// manual preset's recent-tail window (#7776) — a dead-end recovery that
+	// cannot drop its blocker is not a recovery.
 	protectTokens: 0,
-	minSavings: 0,
-	protectedTools: ["skill", isSkillReadToolResult],
-	fenceMinTokens: 400,
+	protectedTools: [...AGGRESSIVE_SHAKE_CONFIG.protectedTools, isArtifactRecoveryToolResult],
 };
 
 /** Rough token cost of a placeholder line; used only for the savings gate. */
@@ -98,15 +122,15 @@ function toolResultText(message: ToolResultMessage): string {
 }
 
 /** Estimate the token contribution of an entry for the protect-recent window. */
-function entryTokens(entry: SessionEntry): number {
+function entryTokens(entry: SessionEntry, tokenizer: Tokenizer): number {
 	if (entry.type === "message") {
-		return estimateTokens(entry.message);
+		return tokenizer.countMessage(entry.message);
 	}
 	if (entry.type === "custom_message") {
 		const content = entry.content;
-		if (typeof content === "string") return content.length === 0 ? 0 : countTokens(content);
+		if (typeof content === "string") return content.length === 0 ? 0 : tokenizer.countTokens(content);
 		const fragments = content.filter((block): block is TextContent => block.type === "text").map(block => block.text);
-		return fragments.length === 0 ? 0 : countTokens(fragments);
+		return fragments.length === 0 ? 0 : tokenizer.countTokens(fragments);
 	}
 	return 0;
 }
@@ -197,6 +221,7 @@ function pushBlockRegions(
 	entry: SessionMessageEntry | CustomMessageEntry,
 	blockIndex: number,
 	text: string,
+	tokenizer: Tokenizer,
 	config: ShakeConfig,
 	label: string,
 	out: ShakeRegion[],
@@ -204,7 +229,7 @@ function pushBlockRegions(
 	for (const range of scanTextForBlockRanges(text)) {
 		const slice = text.slice(range.start, range.end);
 		if (slice.length === 0) continue;
-		const tokens = countTokens(slice);
+		const tokens = tokenizer.countTokens(slice);
 		if (tokens < config.fenceMinTokens) continue;
 		out.push({
 			kind: "block",
@@ -221,6 +246,7 @@ function pushBlockRegions(
 
 function collectBlockRegions(
 	entry: SessionMessageEntry | CustomMessageEntry,
+	tokenizer: Tokenizer,
 	config: ShakeConfig,
 	out: ShakeRegion[],
 ): void {
@@ -229,34 +255,35 @@ function collectBlockRegions(
 		if (message.role === "assistant") {
 			for (let bi = 0; bi < message.content.length; bi++) {
 				const block = message.content[bi];
-				if (block.type === "text") pushBlockRegions(entry, bi, block.text, config, "assistant", out);
+				if (block.type === "text") pushBlockRegions(entry, bi, block.text, tokenizer, config, "assistant", out);
 			}
 			return;
 		}
 		if (message.role === "user" || message.role === "developer") {
-			scanContentBlocks(entry, message.content, config, message.role, out);
+			scanContentBlocks(entry, message.content, tokenizer, config, message.role, out);
 		}
 		return;
 	}
 	// custom_message
-	scanContentBlocks(entry, entry.content, config, entry.customType, out);
+	scanContentBlocks(entry, entry.content, tokenizer, config, entry.customType, out);
 }
 
 function scanContentBlocks(
 	entry: SessionMessageEntry | CustomMessageEntry,
 	content: string | Array<{ type: string; text?: string }>,
+	tokenizer: Tokenizer,
 	config: ShakeConfig,
 	label: string,
 	out: ShakeRegion[],
 ): void {
 	if (typeof content === "string") {
-		pushBlockRegions(entry, -1, content, config, label, out);
+		pushBlockRegions(entry, -1, content, tokenizer, config, label, out);
 		return;
 	}
 	for (let bi = 0; bi < content.length; bi++) {
 		const block = content[bi];
 		if (block.type === "text" && typeof block.text === "string") {
-			pushBlockRegions(entry, bi, block.text, config, label, out);
+			pushBlockRegions(entry, bi, block.text, tokenizer, config, label, out);
 		}
 	}
 }
@@ -275,7 +302,7 @@ function scanContentBlocks(
  * and regions never span a message boundary. When the combined estimated
  * savings is below `minSavings`, returns `[]` (no-op).
  */
-export function collectShakeRegions(entries: SessionEntry[], config: ShakeConfig): ShakeRegion[] {
+export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenizer, config: ShakeConfig): ShakeRegion[] {
 	const n = entries.length;
 	if (n === 0) return [];
 
@@ -284,14 +311,25 @@ export function collectShakeRegions(entries: SessionEntry[], config: ShakeConfig
 	let acc = 0;
 	for (let i = n - 1; i >= 0; i--) {
 		accumulatedAfter[i] = acc;
-		acc += entryTokens(entries[i]);
+		acc += entryTokens(entries[i], tokenizer);
 	}
 
 	const toolCallsById = collectToolCallsById(entries);
 
+	// Entries before the compaction boundary are summarized away and never sent —
+	// shaking them only churns persisted history (no prompt/cache effect).
+	const boundaryIndex =
+		config.keepBoundaryId === undefined
+			? 0
+			: Math.max(
+					0,
+					entries.findIndex(entry => entry.id === config.keepBoundaryId),
+				);
+
 	const regions: ShakeRegion[] = [];
 	for (let i = 0; i < n; i++) {
 		const entry = entries[i];
+		if (i < boundaryIndex) continue;
 		const toolResult = getToolResultMessage(entry);
 		// Useless-flagged results carry no information once consumed; they are
 		// eligible even inside the protect-recent window.
@@ -306,7 +344,7 @@ export function collectShakeRegions(entries: SessionEntry[], config: ShakeConfig
 			regions.push({
 				kind: "toolResult",
 				entry: entry as SessionMessageEntry,
-				tokens: estimateTokens(toolResult as AgentMessage),
+				tokens: tokenizer.countMessage(toolResult as AgentMessage),
 				originalText: text,
 				label: toolResult.toolName,
 			});
@@ -314,7 +352,7 @@ export function collectShakeRegions(entries: SessionEntry[], config: ShakeConfig
 		}
 
 		if (entry.type === "message" || entry.type === "custom_message") {
-			collectBlockRegions(entry as SessionMessageEntry | CustomMessageEntry, config, regions);
+			collectBlockRegions(entry as SessionMessageEntry | CustomMessageEntry, tokenizer, config, regions);
 		}
 	}
 
@@ -387,12 +425,18 @@ export function applyShakeRegion(region: ShakeRegion, replacement: string): void
 		const message = region.entry.message as ToolResultMessage;
 		message.content = [{ type: "text", text: replacement }];
 		message.prunedAt = Date.now();
+		invalidateMessageCache(message as AgentMessage);
 		return;
 	}
 	const slot = getBlockTextSlot(region.entry, region.blockIndex);
 	if (!slot) return;
 	const text = slot.read();
 	slot.write(text.slice(0, region.start) + replacement + text.slice(region.end));
+	// Message entries keep a stable `entry.message` identity across context
+	// rebuilds, so an in-place block rewrite must drop its cached estimate/convert.
+	// Custom-message entries are re-materialized into a fresh AgentMessage on every
+	// buildSessionContext, so they carry no stable cached identity to invalidate.
+	if (region.entry.type === "message") invalidateMessageCache(region.entry.message);
 }
 
 /**

@@ -2,12 +2,11 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use anyhow::{Result, anyhow};
-use ast_grep_core::tree_sitter::LanguageExt;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
-use crate::language::SupportLang;
+use crate::{language::SupportLang, parse_cache::parse_cached};
 
 const DEFAULT_MIN_BODY_LINES: u32 = 4;
 const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
@@ -172,11 +171,7 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 		return Ok(unparsed_result(source, total_lines));
 	};
 
-	let mut parser = Parser::new();
-	parser
-		.set_language(&language.get_ts_language())
-		.map_err(|err| anyhow!("Failed to load tree-sitter language: {err}"))?;
-	let Some(tree) = parser.parse(&source, None) else {
+	let Some(tree) = parse_cached(&source, language)? else {
 		return Ok(unparsed_result(source, total_lines));
 	};
 	let root = tree.root_node();
@@ -401,6 +396,7 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Rust => kind == "block_comment",
 		SupportLang::Python => kind == "comment",
 		SupportLang::Go => kind == "comment",
+		SupportLang::Fortran => kind == "comment",
 		SupportLang::Java => kind == "block_comment",
 		SupportLang::C | SupportLang::Cpp | SupportLang::ObjC => kind == "comment",
 		SupportLang::CSharp => kind == "comment",
@@ -589,9 +585,6 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "string"
 		),
 		SupportLang::Lua => matches!(kind, "block" | "table_constructor" | "string"),
-		SupportLang::Perl => {
-			matches!(kind, "block" | "list_expression" | "heredoc_content" | "regexp_content")
-		},
 		SupportLang::Dart => matches!(
 			kind,
 			"block"
@@ -732,6 +725,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Cmake => matches!(kind, "argument_list" | "body"),
 		SupportLang::Make => kind == "recipe",
 		SupportLang::Just => kind == "recipe_body",
+		SupportLang::Fortran => false,
 		// Skip: data formats with no closing-token anchor (Yaml mappings,
 		// Toml tables, Ini sections), the diff format whose informational
 		// content IS the lines inside hunks, and the leaf-token-only Regex
@@ -767,7 +761,7 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Solidity => kind == "import_directive",
 		SupportLang::Julia => matches!(kind, "import_statement" | "using_statement"),
 		SupportLang::Proto => kind == "import",
-		SupportLang::Perl => kind == "use_statement",
+		SupportLang::Fortran => kind == "use_statement",
 		// Languages where imports either have no run pattern, are wrapped in a
 		// single AST node already covered by `is_elidable_kind` (Kotlin's
 		// `import_list`, Haskell's `imports`), or live inside a too-generic
@@ -982,6 +976,15 @@ mod tests {
 				.unwrap_or_default()
 				.contains("return")
 		);
+	}
+
+	#[test]
+	fn summarizes_fortran_program() {
+		let result = summarize("program hello\n  print *, 'hi'\nend program hello\n", "fixture.f90");
+
+		assert!(result.parsed);
+		assert_eq!(result.language.as_deref(), Some("fortran"));
+		assert!(!result.segments.is_empty());
 	}
 
 	#[test]

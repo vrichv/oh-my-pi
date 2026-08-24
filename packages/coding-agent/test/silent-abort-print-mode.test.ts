@@ -5,9 +5,15 @@
  * when stopReason is "aborted", which would surface the sentinel to stderr
  * (and exit with code 1). This test verifies the guard skips silent-abort.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import * as AIError from "@oh-my-pi/pi-ai/error";
+import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
+import {
+	type AgentSession,
+	type AgentSessionDisposeOptions,
+	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -32,31 +38,45 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 }
 
 /** Minimal mock of AgentSession for print-mode text output path */
-function createMockSession(messages: AssistantMessage[]): AgentSession {
+function createMockSession(
+	messages: AssistantMessage[],
+	dispose: (options?: AgentSessionDisposeOptions) => Promise<void> = async () => {},
+): AgentSession {
 	return {
 		state: { messages },
+		getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
+		settings: { get: () => false },
 		sessionManager: {
 			getHeader: () => undefined,
+			buildSessionContext: () => ({ messages: [] }),
+			getEntries: () => [],
 		},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
 		prompt: async () => {},
-		dispose: async () => {},
+		prepareForHeadlessAdvisorDrain: () => {},
+		setTextOutputCommitted: () => {},
+		waitForAdvisorCatchup: async () => true,
+		dispose,
 	} as unknown as AgentSession;
 }
 
 describe("Print-mode silent-abort regression", () => {
-	let exitSpy: ReturnType<typeof vi.spyOn>;
+	let exitSpy: Mock<typeof process.exit>;
 	let stderrOutput: string[];
+	let stdoutOutput: string[];
 
 	beforeEach(() => {
 		stderrOutput = [];
+		stdoutOutput = [];
 		vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
 			stderrOutput.push(String(chunk));
 			return true;
 		});
 		exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
 		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			const chunk = args[0];
+			if (typeof chunk === "string") stdoutOutput.push(chunk);
 			// Invoke callback if present (runPrintMode flushes stdout before returning)
 			const last = args[args.length - 1];
 			if (typeof last === "function") last();
@@ -69,8 +89,6 @@ describe("Print-mode silent-abort regression", () => {
 	});
 
 	it("does not write silent-abort marker to stderr or exit non-zero", async () => {
-		const { runPrintMode } = await import("@oh-my-pi/pi-coding-agent/modes/print-mode");
-
 		const silentAbortMsg = makeAssistantMessage({
 			stopReason: "aborted",
 			errorMessage: SILENT_ABORT_MARKER,
@@ -87,16 +105,43 @@ describe("Print-mode silent-abort regression", () => {
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 
-	it("writes real error messages to stderr and exits non-zero", async () => {
-		const { runPrintMode } = await import("@oh-my-pi/pi-coding-agent/modes/print-mode");
+	it("bounds final memory consolidation so print mode can exit", async () => {
+		let disposeOptions: AgentSessionDisposeOptions | undefined;
+		const session = createMockSession([makeAssistantMessage()], async options => {
+			disposeOptions = options;
+		});
 
+		await runPrintMode(session, { mode: "text" });
+
+		expect(disposeOptions?.mnemopiConsolidateTimeoutMs).toBe(SHUTDOWN_CONSOLIDATE_BUDGET_MS);
+	});
+
+	it("does not write bit-classified silent aborts to stderr or exit non-zero", async () => {
+		const silentAbortMsg = makeAssistantMessage({
+			stopReason: "aborted",
+			errorId: AIError.create(AIError.Flag.SilentAbort),
+			errorMessage: undefined,
+			content: [],
+		});
+
+		const session = createMockSession([silentAbortMsg]);
+		await runPrintMode(session, { mode: "text" });
+
+		expect(stderrOutput.join("")).toBe("");
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it("writes real error messages to stderr and exits non-zero", async () => {
 		const errorMsg = makeAssistantMessage({
 			stopReason: "error",
 			errorMessage: "Rate limit exceeded",
 			content: [],
 		});
 
-		const session = createMockSession([errorMsg]);
+		let disposeOptions: AgentSessionDisposeOptions | undefined;
+		const session = createMockSession([errorMsg], async options => {
+			disposeOptions = options;
+		});
 		await runPrintMode(session, { mode: "text" });
 
 		// A real error SHOULD be written to stderr
@@ -104,5 +149,22 @@ describe("Print-mode silent-abort regression", () => {
 		expect(stderrText).toContain("Rate limit exceeded");
 		// process.exit(1) SHOULD have been called
 		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(disposeOptions?.mnemopiConsolidateTimeoutMs).toBe(SHUTDOWN_CONSOLIDATE_BUDGET_MS);
+	});
+
+	it("prints thinking blocks only when printThoughts is enabled", async () => {
+		const message = makeAssistantMessage({
+			content: [
+				{ type: "thinking", thinking: "inspect hidden branch" },
+				{ type: "text", text: "final answer" },
+			],
+		});
+
+		await runPrintMode(createMockSession([message]), { mode: "text" });
+		expect(stdoutOutput.join("")).toBe("final answer\n");
+
+		stdoutOutput = [];
+		await runPrintMode(createMockSession([message]), { mode: "text", printThoughts: true });
+		expect(stdoutOutput.join("")).toBe("inspect hidden branch\nfinal answer\n");
 	});
 });

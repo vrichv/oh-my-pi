@@ -1,42 +1,30 @@
-Drives real Chromium tab; full puppeteer access via JS execution.
+Drives real Chromium tab; full puppeteer access via JS.
 
 <instruction>
-- Static content (articles, docs, issues/PRs, JSON, PDFs, feeds)? Use `read` with the URL. Reach for browser only for JS execution, authentication, or interactive actions.
-- Three actions:
-  - `open` — acquire or reuse named tab (`name` defaults `"main"`). Optional `url` (navigate once ready), `viewport`, `dialogs: "accept" | "dismiss"` (auto-handle `alert`/`confirm`/`beforeunload`; unhandled dialogs hang the page until you wire `page.on('dialog', …)`).
-  - `close` — release tab by `name`, or every tab with `all: true`. `kill: true` also terminates spawned-app process trees (default leaves them running).
-  - `run` — execute JS in an existing tab. `code` is the body of an async function with `page`, `browser`, `tab`, `display`, `assert`, `wait` in scope. Return value is JSON-stringified into the result; `display(value)` calls accumulate text/images.
-- Tabs survive across `run` calls and in-process subagents — open once, reuse.
-- Browser kinds (`app` field on `open`):
-  - default (no `app`) → headless Chromium with stealth patches.
-  - `app.path` → spawn absolute binary (Electron/CDP); a running instance with an open CDP port is reused. No stealth patches — NEVER tamper with a real desktop app.
-  - `app.cdp_url` → connect to existing CDP endpoint (e.g. `http://127.0.0.1:9222`).
-  - `app.target` (with `path`/`cdp_url`) — substring matched against url+title to pick a BrowserWindow.
-- `tab` helpers; drop to raw puppeteer `page` for anything they don't cover:
-  - `tab.goto(url, { waitUntil? })` — navigate; clears element cache.
-  - `tab.observe({ includeAll?, viewportOnly? })` — accessibility snapshot: `{ url, title, viewport, scroll, elements: [{ id, role, name, value, states, … }] }`. Ids stable until next observe/goto.
-  - `tab.id(n)` — element id from last observe → `ElementHandle` (`.click()`, `.type()`, …).
-  - `tab.click(selector)` / `tab.type(selector, text)` / `tab.fill(selector, value)` / `tab.press(key, { selector? })` / `tab.scroll(dx, dy)`.
-  - `tab.waitFor(selector)` — wait until attached; returns the `ElementHandle`.
-  - `tab.drag(from, to)` — endpoints: selector (center-to-center) or `{ x, y }` viewport point (canvases, sliders).
-  - `tab.scrollIntoView(selector)` — center element in viewport; use before clicking off-screen elements.
-  - `tab.select(selector, …values)` — set `<select>` option(s); returns resulting selection. `tab.fill` NEVER works for selects.
-  - `tab.uploadFile(selector, …filePaths)` — attach files to `<input type="file">`; paths relative to cwd.
-  - `tab.waitForUrl(pattern, { timeout? })` — substring or `RegExp`; polls `location.href` (catches SPA pushState). Returns matched URL.
-  - `tab.waitForResponse(pattern, { timeout? })` — substring, `RegExp`, or `(response) => boolean`; returns puppeteer `HTTPResponse` (`.text()`/`.json()`/`.status()`/`.headers()`).
-  - `tab.evaluate(fn, …args)` — `page.evaluate` with abort signal wired; use for ad-hoc DOM reads.
-  - `tab.screenshot({ selector?, fullPage?, save?, silent? })` — capture and attach for viewing (`silent: true` skips). Pass `save` (a path) only when a later step needs the file.
-  - `tab.extract(format = "markdown")` — Readability-extracted content (`"markdown"` | `"text"`); throws when nothing readable.
-- Selectors: CSS plus puppeteer handlers `aria/Sign in`, `text/Continue`, `xpath/…`, `pierce/…`; Playwright-style `p-aria/…`, `p-text/…` normalized.
+- Static content? `read` the URL. Browser only for JS execution, auth, interactive actions.
+- `open` → `run` — tabs survive calls and subagents, open once reuse.
+- `run` scope: `page`, `browser`, `tab`, `display`, `assert`, `wait` available. `wait(fn)` polls until truthy — use instead of polling inside `tab.evaluate`.
+
+- `tab` helpers (drop to raw puppeteer `page` for anything uncovered):
+  Element handles: `tab.ref("e5")` / `tab.id(n)` return a handle you call methods on directly — `(await tab.id(n)).click()`. Handles are NOT selectors: `tab.click`/`type`/`fill`/`waitFor*` take STRING selectors only. Snapshot refs work in any selector slot: `tab.click("e5")` ≡ `tab.click("aria-ref=e5")`.
+  Simple: `tab.goto`, `tab.click`, `tab.type`, `tab.fill`, `tab.press`, `tab.scroll`, `tab.scrollIntoView`, `tab.drag`, `tab.uploadFile`, `tab.select`, `tab.screenshot`, `tab.extract`, `tab.evaluate`.
+  Screenshots: `tab.screenshot({ selector?, fullPage?, silent? })` saves to `browser.screenshotDir`, or OS temp when unset, then returns the path. It NEVER accepts a path.
+  Waits: `tab.waitFor`, `tab.waitForSelector`, `tab.waitForUrl`, `tab.waitForResponse`, `tab.waitForNavigation`.
+  Snapshots: `tab.observe()` → accessibility tree; `tab.ariaSnapshot()` → ARIA YAML with `[ref=eN]`.
+
+  Gotchas:
+  - `tab.fill` NEVER works for `<select>` — use `tab.select`.
+  - `tab.waitForNavigation` must start BEFORE the trigger click.
+  - Navigation and re-renders (virtualized lists, SPA updates) invalidate ids/refs — re-observe or re-snapshot, then act in the same cell.
+  - Stalled actions fail fast with named error, never whole-cell timeout.
+  - Raw request interception is run-scoped: run end removes `request` handlers, disables interception, releases held requests.
+
+- `app.path` → NEVER tamper with a real desktop app (no stealth patches).
+- `app.relay: true` → drive the user's own Chrome tabs via the omp browser relay (auto-started; needs the OMP Browser Relay extension installed). `app.target` picks a tab by URL/title substring; without it the visible tab is adopted without stealing focus.
+- `close` releases the named tool session. It closes tool-owned headless pages and owned cmux surfaces, but NEVER closes pages in CDP-connected or relay browsers. Spawned-browser pages remain open unless `kill: true` terminates their process.
+- Selectors: CSS + puppeteer `aria/…`, `text/…`, `xpath/…`, `pierce/…`. Playwright-only pseudos (`:has-text()`, `:visible`) are REJECTED.
 </instruction>
 
 <critical>
-- MUST `open` before `run` — `run` never creates a tab.
-- Default to `tab.observe()` for page state — structured data with actionable element ids. Screenshot ONLY when visual appearance matters.
-- Navigation invalidates element ids — re-observe before using them.
-- `code` runs with full Node access. Treat as your code, not sandboxed code.
+- MUST `open` before `run`. Default to `tab.observe()`; screenshot only for appearance. `code` runs with full Node access — not sandboxed.
 </critical>
-
-<output>
-Per call: `display(value)` outputs (text/images), then the JSON-stringified return value of `code`. `run` always produces at least a status line.
-</output>

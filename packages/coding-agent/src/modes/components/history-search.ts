@@ -1,11 +1,9 @@
 import {
 	type Component,
-	Container,
 	Ellipsis,
 	Input,
 	matchesKey,
 	padding,
-	ScrollView,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -20,8 +18,9 @@ import {
 	matchesSelectUp,
 } from "../../modes/utils/keybinding-matchers";
 import type { HistoryEntry, HistoryStorage } from "../../session/history-storage";
-import { DynamicBorder } from "./dynamic-border";
 import { rawKeyHint } from "./keybinding-hints";
+import { OverlayPanel } from "./overlay-box";
+import { centeredWindow, contentRowWidth, renderScrollableList } from "./selector-helpers";
 
 /** Visible result rows; also the jump distance for PageUp/PageDown. */
 const MAX_VISIBLE = 10;
@@ -110,14 +109,9 @@ class HistoryResultsList implements Component {
 		const cursorSymbol = `${theme.nav.cursor} `;
 		const gutterWidth = visibleWidth(cursorSymbol);
 
-		const startIndex = Math.max(
-			0,
-			Math.min(this.#selectedIndex - Math.floor(this.#maxVisible / 2), this.#results.length - this.#maxVisible),
-		);
-		const endIndex = Math.min(startIndex + this.#maxVisible, this.#results.length);
+		const { startIndex, endIndex } = centeredWindow(this.#selectedIndex, this.#results.length, this.#maxVisible);
 
-		const overflow = this.#results.length > this.#maxVisible;
-		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
+		const rowWidth = contentRowWidth(width, this.#results.length, this.#maxVisible);
 		const rows: string[] = [];
 
 		for (let i = startIndex; i < endIndex; i++) {
@@ -148,19 +142,12 @@ class HistoryResultsList implements Component {
 			);
 		}
 
-		const sv = new ScrollView(rows, {
-			height: rows.length,
-			scrollbar: "auto",
-			totalRows: this.#results.length,
-			theme: { track: t => theme.fg("muted", t), thumb: t => theme.fg("accent", t) },
-		});
-		sv.setScrollOffset(startIndex);
-		lines.push(...sv.render(width));
+		lines.push(...renderScrollableList(rows, { width, totalRows: this.#results.length, scrollOffset: startIndex }));
 		return lines;
 	}
 }
 
-export class HistorySearchComponent extends Container {
+export class HistorySearchComponent extends OverlayPanel {
 	#historyStorage: HistoryStorage;
 	#searchInput: Input;
 	#results: HistoryEntry[] = [];
@@ -171,7 +158,7 @@ export class HistorySearchComponent extends Container {
 	#resultLimit = 100;
 
 	constructor(historyStorage: HistoryStorage, onSelect: (prompt: string) => void, onCancel: () => void) {
-		super();
+		super("History");
 		this.#historyStorage = historyStorage;
 		this.#onSelect = onSelect;
 		this.#onCancel = onCancel;
@@ -189,22 +176,16 @@ export class HistorySearchComponent extends Container {
 
 		this.#resultsList = new HistoryResultsList();
 
-		const title = theme.bold(theme.fg("accent", `${theme.icon.rewind} Search History`));
 		const dot = theme.fg("dim", theme.sep.dot);
 		const hint = [rawKeyHint("↑↓", "navigate"), rawKeyHint("enter", "select"), rawKeyHint("esc", "cancel")].join(dot);
 
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(title, 1, 0));
-		this.addChild(new Spacer(1));
-		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 		this.addChild(this.#searchInput);
 		this.addChild(new Spacer(1));
 		this.addChild(this.#resultsList);
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(hint, 1, 0));
+		this.addChild(new Text(hint, 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new DynamicBorder());
 
 		this.#updateResults();
 	}

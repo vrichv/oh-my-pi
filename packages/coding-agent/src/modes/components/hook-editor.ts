@@ -3,30 +3,41 @@
  * Supports Ctrl+G for external editor.
  *
  * Two modes:
- * - Default (hook): Enter inserts newline, Ctrl+Enter submits, bordered popup
+ * - Default (hook): Enter inserts newline, the `app.message.followUp` chord
+ *   (Ctrl+Q / Ctrl+Enter) submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import { Container, Editor, matchesKey, Spacer, Text, type TUI } from "@oh-my-pi/pi-tui";
+import { Editor, type Focusable, matchesKey, Spacer, Text, type TUI } from "@oh-my-pi/pi-tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
-import { matchesAppExternalEditor, matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
+import {
+	matchesAppExternalEditor,
+	matchesAppFollowUp,
+	matchesAppInterrupt,
+} from "../../modes/utils/keybinding-matchers";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { DynamicBorder } from "./dynamic-border";
+import { OverlayPanel } from "./overlay-box";
 
 export interface HookEditorOptions {
 	/** When true, use prompt-style keybindings with the legacy ask prompt chrome. */
 	promptStyle?: boolean;
+	/**
+	 * Max rows the inner Editor may occupy. When omitted, the editor is
+	 * bounded to the current terminal height minus the component's chrome
+	 * (≈10 rows) so long content scrolls instead of pushing the submit
+	 * hint out of view.
+	 */
+	maxHeight?: number;
 }
 
-function isCtrlEnterSubmit(keyData: string): boolean {
-	return matchesKey(keyData, "ctrl+enter") || (keyData.charCodeAt(0) === 10 && keyData.length > 1);
-}
-
-export class HookEditorComponent extends Container {
+/** Interactive multiline dialog used by hooks and the ask tool's Other response. */
+export class HookEditorComponent extends OverlayPanel implements Focusable {
 	#editor: Editor;
 	#onSubmitCallback: (value: string) => void;
 	#onCancelCallback: () => void;
 	#tui: TUI;
 	#promptStyle: boolean;
+	/** Focus state mirrored to the nested editor during rendering. */
+	focused = false;
 
 	constructor(
 		tui: TUI,
@@ -36,19 +47,22 @@ export class HookEditorComponent extends Container {
 		onCancel: () => void,
 		options?: HookEditorOptions,
 	) {
-		super();
+		// First title line insets into the panel border; remaining lines (e.g. the
+		// bounded ask question under "◆ Other (type your own)") stay as body rows
+		// so they are never truncated into the one-row border.
+		const [titleLine = "", ...detailLines] = title.split("\n");
+		super(titleLine);
 
 		this.#tui = tui;
 		this.#onSubmitCallback = onSubmit;
 		this.#onCancelCallback = onCancel;
 		this.#promptStyle = options?.promptStyle ?? false;
 
-		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
-
-		// Title
-		this.addChild(new Text(theme.fg("accent", title), 1, 0));
-		this.addChild(new Spacer(1));
+		if (detailLines.length > 0) {
+			for (const line of detailLines) this.addChild(new Text(theme.fg("accent", line), 0, 0));
+			this.addChild(new Spacer(1));
+		}
 
 		// Editor
 		this.#editor = new Editor(getEditorTheme());
@@ -57,6 +71,11 @@ export class HookEditorComponent extends Container {
 			this.#editor.setPromptGutter("> ");
 			this.#editor.disableSubmit = true;
 		}
+		// Bound the editor so long content scrolls instead of pushing the
+		// submit hint off-screen. Caller may override via options.maxHeight.
+		const termRows = this.#tui.terminal?.rows ?? process.stdout.rows ?? 40;
+		this.#editor.setMaxHeight(options?.maxHeight ?? Math.max(3, termRows - 12));
+		this.#editor.setScrollbarVisible(true);
 		if (prefill) {
 			this.#editor.setText(prefill);
 		}
@@ -66,12 +85,22 @@ export class HookEditorComponent extends Container {
 
 		// Hint
 		const hint = this.#promptStyle
-			? "enter submit  esc cancel  ctrl+g external editor"
-			: "ctrl+enter submit  esc cancel  ctrl+g external editor";
-		this.addChild(new Text(theme.fg("dim", hint), 1, 0));
-
+			? "enter or ctrl+q submit  esc cancel  ctrl+g external editor"
+			: "ctrl+q/ctrl+enter submit  esc cancel  ctrl+g external editor";
+		this.addChild(new Text(theme.fg("dim", hint), 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new DynamicBorder());
+	}
+
+	/** Keep the nested editor's software/hardware cursor mode aligned with the dialog focus target. */
+	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		if (this.#editor.getUseTerminalCursor() === useTerminalCursor) return;
+		this.#editor.setUseTerminalCursor(useTerminalCursor);
+	}
+
+	/** Render the dialog after forwarding its focus state to the nested editor. */
+	override render(width: number): readonly string[] {
+		this.#editor.focused = this.focused;
+		return super.render(width);
 	}
 
 	handleInput(keyData: string): void {
@@ -94,8 +123,21 @@ export class HookEditorComponent extends Container {
 		this.#editor.pasteText(text);
 	}
 
-	/** Prompt-style: raw Enter submits; Editor owns newline-producing sequences. */
+	/**
+	 * Prompt-style: raw Enter submits; Editor owns newline-producing sequences.
+	 * The follow-up chord (`app.message.followUp` → Ctrl+Q / Ctrl+Enter) also
+	 * submits, so muscle memory from the main editor / hook-style surface works
+	 * here and Windows Terminal — which can't deliver a distinct Ctrl+Enter
+	 * event (#1903) — still has a working chord via Ctrl+Q (#3353).
+	 */
 	#handlePromptStyleInput(keyData: string): void {
+		// Submit on the follow-up chord first so it wins over Editor's own
+		// Ctrl+Enter newline handling. Mirrors #handleHookStyleInput.
+		if (matchesAppFollowUp(keyData)) {
+			this.#submitCurrentText();
+			return;
+		}
+
 		// Prompt-style keeps Escape as an explicit cancel key and also honors app.interrupt remaps.
 		if (matchesKey(keyData, "escape") || matchesKey(keyData, "esc") || matchesAppInterrupt(keyData)) {
 			this.#onCancelCallback();
@@ -118,10 +160,12 @@ export class HookEditorComponent extends Container {
 		this.#editor.handleInput(keyData);
 	}
 
-	/** Hook-style: Enter=newline, Ctrl+Enter=submit (original behavior) */
+	/** Hook-style: Enter=newline, app.message.followUp chord (Ctrl+Q/Ctrl+Enter) submits. */
 	#handleHookStyleInput(keyData: string): void {
-		// Ctrl+Enter to submit. Use key matching so lock-key and keypad Enter variants work.
-		if (isCtrlEnterSubmit(keyData)) {
+		// Submit on the follow-up chord. Uses the shared keybinding so Ctrl+Q works
+		// on Windows Terminal (#1903) and any user remap of `app.message.followUp`
+		// applies here too.
+		if (matchesAppFollowUp(keyData)) {
 			this.#submitCurrentText();
 			return;
 		}

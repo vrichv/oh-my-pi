@@ -7,13 +7,18 @@
  * - skill://<name> - Reads SKILL.md
  * - skill://<name>/<path> - Reads relative path within skill's baseDir
  */
+import type * as fsTypes from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isEnoent } from "@oh-my-pi/pi-utils";
+import { resolveContainedPath } from "../discovery/contained-path";
 import { getActiveSkills } from "../extensibility/skills";
-import type { InternalResource, InternalUrl, ProtocolHandler, UrlCompletion } from "./types";
+import { isMarkdownPath } from "../utils/lang-from-path";
+import { buildDirectoryResource } from "./filesystem-resource";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 function getContentType(filePath: string): InternalResource["contentType"] {
-	const ext = path.extname(filePath).toLowerCase();
-	if (ext === ".md") return "text/markdown";
+	if (isMarkdownPath(filePath)) return "text/markdown";
 	return "text/plain";
 }
 
@@ -26,7 +31,12 @@ export function validateRelativePath(relativePath: string): void {
 	}
 
 	const normalized = path.normalize(relativePath);
-	if (normalized.startsWith("..") || normalized.includes("/../") || normalized.includes("/..")) {
+	if (
+		relativePath.split(/[\\/]/).includes("..") ||
+		normalized.startsWith("..") ||
+		normalized.includes("/../") ||
+		normalized.includes("/..")
+	) {
 		throw new Error("Path traversal (..) is not allowed in skill:// URLs");
 	}
 }
@@ -38,8 +48,8 @@ export class SkillProtocolHandler implements ProtocolHandler {
 	readonly scheme = "skill";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const skills = getActiveSkills();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const skills = context?.skills ?? getActiveSkills();
 
 		const skillName = url.rawHost || url.hostname;
 		if (!skillName) {
@@ -67,16 +77,41 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
 				throw new Error("Path traversal is not allowed");
 			}
+			// Agent Plugin skills (§4.1): the resource must canonically resolve
+			// within the plugin root; a dangling or unresolvable path fails closed.
+			// Symlinks may target other files inside the same package.
+			if (skill.containRoot) {
+				const contained = await resolveContainedPath(skill.containRoot, resolvedPath);
+				if (contained.status === "outside") {
+					throw new Error(`skill:// path resolves outside the plugin root: ${url.href}`);
+				}
+				if (contained.status === "missing") {
+					throw new Error(`File not found: ${resolvedPath}`);
+				}
+				targetPath = contained.realPath;
+			}
 		} else {
-			targetPath = skill.filePath;
+			targetPath = context?.pathOnly === true ? skill.baseDir : skill.filePath;
 		}
 
-		const file = Bun.file(targetPath);
-		if (!(await file.exists())) {
-			throw new Error(`File not found: ${targetPath}`);
+		let stats: fsTypes.Stats;
+		try {
+			stats = await fs.stat(targetPath);
+		} catch (error) {
+			if (isEnoent(error)) {
+				throw new Error(`File not found: ${targetPath}`);
+			}
+			throw error;
 		}
 
-		const content = await file.text();
+		if (stats.isDirectory()) {
+			return buildDirectoryResource(url.href, targetPath);
+		}
+		if (!stats.isFile()) {
+			throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
+		}
+
+		const content = await Bun.file(targetPath).text();
 		return {
 			url: url.href,
 			content,

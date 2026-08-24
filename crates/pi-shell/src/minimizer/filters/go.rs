@@ -315,12 +315,12 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 			.get("Pos")
 			.and_then(|pos| pos.get("Line"))
 			.and_then(serde_json::Value::as_u64)
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let col_no = issue
 			.get("Pos")
 			.and_then(|pos| pos.get("Column"))
 			.and_then(serde_json::Value::as_u64)
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let linter = issue
 			.get("FromLinter")
 			.and_then(|v| v.as_str())
@@ -341,9 +341,9 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 		out.push_str(")\n");
 	}
 	if issues.len() > 40 {
-		out.push_str("… ");
+		out.push_str("[…");
 		out.push_str(&(issues.len() - 40).to_string());
-		out.push_str(" more issues\n");
+		out.push_str(" issues elided…]\n");
 	}
 	Some(out)
 }
@@ -506,6 +506,22 @@ mod tests {
 		let out = filter_golangci_lint(input);
 		assert!(out.contains("golangci-lint: 1 issues"));
 		assert!(out.contains("main.go:7:2: unreachable code (govet)"));
+
+		// Match up-to-40 limits, testing elison formatting
+		let mut many_issues = r#"{"Issues":["#.to_string();
+		for i in 0..42 {
+			if i > 0 {
+				many_issues.push(',');
+			}
+			let _ = write!(
+				many_issues,
+				r#"{{"FromLinter":"govet","Text":"err {i}","Pos":{{"Filename":"main.go","Line":{i},"Column":2}}}}"#
+			);
+		}
+		many_issues.push_str("]}");
+		let out_many = filter_golangci_lint(&many_issues);
+		assert!(out_many.contains("golangci-lint: 42 issues"));
+		assert!(out_many.contains("[…2 issues elided…]"));
 	}
 
 	#[test]

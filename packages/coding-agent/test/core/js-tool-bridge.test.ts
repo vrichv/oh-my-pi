@@ -1,19 +1,17 @@
 import { describe, expect, it, vi } from "bun:test";
-import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { z } from "zod/v4";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
-function createTool(
-	name: string,
-	execute: (toolCallId: string, args: unknown, signal?: AbortSignal) => Promise<AgentToolResult>,
-): AgentTool {
+function createTool(name: string, execute: AgentTool["execute"]): AgentTool {
 	return {
 		name,
 		label: name,
 		description: `${name} tool`,
-		parameters: z.object({}),
+		parameters: type({}),
 		concurrency: "parallel",
 		execute,
 	} as unknown as AgentTool;
@@ -53,10 +51,31 @@ describe("callSessionTool", () => {
 		expect(result).toBe("hello");
 		expect(execute).toHaveBeenCalledWith(
 			expect.stringMatching(/^js-read-/),
-			{ path: "/tmp/demo.txt", _i: "js prelude" },
+			{ path: "/tmp/demo.txt", [INTENT_FIELD]: "js prelude" },
+			undefined,
+			undefined,
 			undefined,
 		);
 		expect(statuses).toEqual([expect.objectContaining({ op: "read", path: "/tmp/demo.txt", chars: 5 })]);
+	});
+
+	it("passes the session tool context to bridged executions", async () => {
+		const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+		const context = { settings: Settings.isolated() } as AgentToolContext;
+		const session = {
+			...createSession([createTool("bash", execute)]),
+			getToolContext: () => context,
+		};
+
+		await callSessionTool("bash", { command: "true" }, { session });
+
+		expect(execute).toHaveBeenCalledWith(
+			expect.stringMatching(/^js-bash-/),
+			{ command: "true", [INTENT_FIELD]: "js prelude" },
+			undefined,
+			undefined,
+			context,
+		);
 	});
 
 	it("returns structured tool results when details or images are present", async () => {
@@ -143,5 +162,33 @@ describe("callSessionTool", () => {
 		const session = createSession([]);
 
 		await expect(callSessionTool("missing", {}, { session })).rejects.toThrow("Unknown tool from js runtime");
+	});
+
+	it("executes the bridge-authorized tool instead of the raw registry tool", async () => {
+		const rawExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "raw" }] });
+		const authorizedExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "authorized" }] });
+		const session = {
+			...createSession([createTool("write", rawExecute)]),
+			getToolForEvalBridge: () => createTool("write", authorizedExecute),
+		};
+
+		const result = await callSessionTool("write", { path: "out.txt", content: "data" }, { session });
+
+		expect(result).toBe("authorized");
+		expect(authorizedExecute).toHaveBeenCalledTimes(1);
+		expect(rawExecute).not.toHaveBeenCalled();
+	});
+
+	it("rejects a registry tool excluded from the eval bridge", async () => {
+		const rawExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "raw" }] });
+		const session = {
+			...createSession([createTool("write", rawExecute)]),
+			getToolForEvalBridge: () => undefined,
+		};
+
+		await expect(callSessionTool("write", { path: "out.txt", content: "data" }, { session })).rejects.toThrow(
+			"Unknown tool from js runtime",
+		);
+		expect(rawExecute).not.toHaveBeenCalled();
 	});
 });

@@ -1,11 +1,13 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { StoppingCriteria, TextGenerationPipeline } from "@huggingface/transformers";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isSubcommand } from "@oh-my-pi/pi-coding-agent/cli-commands";
 import { getDefault, getEnumValues, getUi } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { TinyTitleDownloadProgressComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tiny-title-download-progress";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { RefCountedWorkerHandle } from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
 import {
 	TINY_MODEL_DEVICE_DEFAULT,
 	TINY_MODEL_DEVICE_SETTING_OPTIONS,
@@ -21,17 +23,16 @@ import {
 	TINY_TITLE_MODEL_OPTIONS,
 	TINY_TITLE_MODEL_VALUES,
 } from "@oh-my-pi/pi-coding-agent/tiny/models";
-import { createTinyTitleSubprocess, tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import {
-	generateSessionTitle,
-	raceFirstNonNull,
-	TITLE_LOCAL_FALLBACK_DELAY_MS,
-} from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+	createTinyTitleSubprocess,
+	TinyTitleClient,
+	tinyTitleClient,
+} from "@oh-my-pi/pi-coding-agent/tiny/title-client";
+import type { TinyTitleWorkerInbound, TinyTitleWorkerOutbound } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
+import { generateSessionTitle } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import type { Subprocess } from "bun";
-
-async function flushMicrotasks(turns = 4): Promise<void> {
-	for (let i = 0; i < turns; i += 1) await Promise.resolve();
-}
+import { buildCompletionPrompt } from "../src/tiny/completion-prompt";
+import { createStopOnTextCriteria, type TransformersRuntime } from "../src/tiny/worker";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -92,16 +93,7 @@ function createTinyWorkerSpawnMock(calls: TinyWorkerSpawnCall[]) {
 function mockOnlineTitle(title: string | null) {
 	return vi.spyOn(ai, "completeSimple").mockResolvedValue({
 		stopReason: "stop",
-		content: title
-			? [
-					{
-						type: "toolCall",
-						id: "call-title",
-						name: "set_title",
-						arguments: { title },
-					},
-				]
-			: [{ type: "text", text: "" }],
+		content: title ? [{ type: "text", text: `<title>${title}</title>` }] : [{ type: "text", text: "" }],
 	} as never);
 }
 
@@ -112,102 +104,6 @@ beforeAll(() => {
 afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
-});
-
-describe("raceFirstNonNull", () => {
-	it("resolves with local result without starting fallback", async () => {
-		let fallbackStarted = false;
-		const title = await raceFirstNonNull(
-			Promise.resolve("Local Title"),
-			() => {
-				fallbackStarted = true;
-				return Promise.resolve("Online Title");
-			},
-			TITLE_LOCAL_FALLBACK_DELAY_MS,
-		);
-
-		expect(title).toBe("Local Title");
-		expect(fallbackStarted).toBe(false);
-	});
-
-	it("starts fallback after the hardcoded delay", async () => {
-		vi.useFakeTimers();
-		const local = Promise.withResolvers<string | null>();
-		let fallbackStarted = false;
-		const result = raceFirstNonNull(
-			local.promise,
-			() => {
-				fallbackStarted = true;
-				return Promise.resolve("Online Title");
-			},
-			TITLE_LOCAL_FALLBACK_DELAY_MS,
-		);
-
-		await flushMicrotasks();
-		expect(fallbackStarted).toBe(false);
-		vi.advanceTimersByTime(TITLE_LOCAL_FALLBACK_DELAY_MS - 1);
-		await flushMicrotasks();
-		expect(fallbackStarted).toBe(false);
-		vi.advanceTimersByTime(1);
-		await flushMicrotasks();
-
-		expect(fallbackStarted).toBe(true);
-		await expect(result).resolves.toBe("Online Title");
-		local.resolve(null);
-	});
-
-	it("starts fallback immediately when local fails", async () => {
-		let fallbackStarted = false;
-		const title = await raceFirstNonNull(
-			Promise.reject(new Error("local failed")),
-			() => {
-				fallbackStarted = true;
-				return Promise.resolve("Online Title");
-			},
-			TITLE_LOCAL_FALLBACK_DELAY_MS,
-		);
-
-		expect(title).toBe("Online Title");
-		expect(fallbackStarted).toBe(true);
-	});
-
-	it("returns null only after local and fallback return null", async () => {
-		const title = await raceFirstNonNull(
-			Promise.resolve(null),
-			() => Promise.resolve(null),
-			TITLE_LOCAL_FALLBACK_DELAY_MS,
-		);
-
-		expect(title).toBeNull();
-	});
-
-	it("runs the loser-cancel callback when local wins after fallback starts", async () => {
-		vi.useFakeTimers();
-		const local = Promise.withResolvers<string | null>();
-		const fallback = Promise.withResolvers<string | null>();
-		let fallbackStarted = false;
-		let cancelCount = 0;
-		const result = raceFirstNonNull(
-			local.promise,
-			() => {
-				fallbackStarted = true;
-				return fallback.promise;
-			},
-			TITLE_LOCAL_FALLBACK_DELAY_MS,
-			() => {
-				cancelCount += 1;
-			},
-		);
-
-		vi.advanceTimersByTime(TITLE_LOCAL_FALLBACK_DELAY_MS);
-		await flushMicrotasks();
-		expect(fallbackStarted).toBe(true);
-
-		local.resolve("Local Title");
-		await expect(result).resolves.toBe("Local Title");
-		expect(cancelCount).toBe(1);
-		fallback.resolve(null);
-	});
 });
 
 describe("tiny title generator routing", () => {
@@ -264,10 +160,10 @@ describe("tiny title generator routing", () => {
 		expect(online).not.toHaveBeenCalled();
 	});
 
-	it("starts online fallback immediately when local returns null", async () => {
+	it("does NOT fall back to online when local returns null (issue #3187)", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
-		vi.spyOn(tinyTitleClient, "generate").mockResolvedValue(null);
-		const online = mockOnlineTitle("Online Title");
+		const local = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue(null);
+		const online = mockOnlineTitle("Billed Online Title");
 
 		const title = await generateSessionTitle(
 			"Investigate fallback",
@@ -275,63 +171,171 @@ describe("tiny title generator routing", () => {
 			createSettings(model, "lfm2-350m"),
 		);
 
-		expect(title).toBe("Online Title");
-		expect(online).toHaveBeenCalledTimes(1);
+		expect(title).toBeNull();
+		expect(local).toHaveBeenCalledTimes(1);
+		expect(online).not.toHaveBeenCalled();
 	});
 
-	it("aborts the online request when delayed local generation wins", async () => {
-		vi.useFakeTimers();
+	it("does NOT fall back to online when local throws", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
-		const local = Promise.withResolvers<string | null>();
-		const onlineHold = Promise.withResolvers<AssistantMessage>();
-		let onlineSignal: AbortSignal | undefined;
-		vi.spyOn(tinyTitleClient, "generate").mockReturnValue(local.promise);
-		vi.spyOn(ai, "completeSimple").mockImplementation((_model, _context, options) => {
-			onlineSignal = options?.signal;
-			return onlineHold.promise;
-		});
+		vi.spyOn(tinyTitleClient, "generate").mockRejectedValue(new Error("worker crashed"));
+		const online = mockOnlineTitle("Billed Online Title");
 
-		const result = generateSessionTitle(
-			"Investigate cancellation",
-			createRegistry(model),
-			createSettings(model, "lfm2-350m"),
-		);
-
-		vi.advanceTimersByTime(TITLE_LOCAL_FALLBACK_DELAY_MS);
-		await flushMicrotasks();
-		expect(onlineSignal?.aborted).toBe(false);
-
-		local.resolve("Local Title");
-		await expect(result).resolves.toBe("Local Title");
-		expect(onlineSignal?.aborted).toBe(true);
-		onlineHold.resolve({ stopReason: "abort", content: [] } as never);
-	});
-
-	it("keeps local generation alive when the delayed online fallback wins", async () => {
-		vi.useFakeTimers();
-		const model = getModelOrThrow("claude-sonnet-4-5");
-		const local = Promise.withResolvers<string | null>();
-		let localSettled = false;
-		void local.promise.then(() => {
-			localSettled = true;
-		});
-		vi.spyOn(tinyTitleClient, "generate").mockReturnValue(local.promise);
-		mockOnlineTitle("Online Title");
-
-		const result = generateSessionTitle(
-			"Investigate background download",
+		const title = await generateSessionTitle(
+			"Investigate crash",
 			createRegistry(model),
 			createSettings(model, "lfm2-700m"),
 		);
 
-		vi.advanceTimersByTime(TITLE_LOCAL_FALLBACK_DELAY_MS);
-		await flushMicrotasks();
-		await expect(result).resolves.toBe("Online Title");
-		expect(localSettled).toBe(false);
+		expect(title).toBeNull();
+		expect(online).not.toHaveBeenCalled();
+	});
 
-		local.resolve("Late Local Title");
-		await flushMicrotasks();
-		expect(localSettled).toBe(true);
+	it("does NOT call the local worker or online path for an unknown tinyModel key", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const local = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("Late Local");
+		const online = mockOnlineTitle("Billed Online Title");
+
+		const title = await generateSessionTitle(
+			"Investigate unknown",
+			createRegistry(model),
+			createSettings(model, "ollama:gpt-oss"),
+		);
+
+		expect(title).toBeNull();
+		expect(local).not.toHaveBeenCalled();
+		expect(online).not.toHaveBeenCalled();
+	});
+});
+
+interface FakeTinyWorker {
+	handle: RefCountedWorkerHandle<TinyTitleWorkerInbound, TinyTitleWorkerOutbound>;
+	sent: TinyTitleWorkerInbound[];
+	refCount: number;
+	emit(message: TinyTitleWorkerOutbound): void;
+}
+
+function createFakeTinyWorker(): FakeTinyWorker {
+	const sent: TinyTitleWorkerInbound[] = [];
+	let onMessage: ((message: TinyTitleWorkerOutbound) => void) | undefined;
+	const worker: FakeTinyWorker = {
+		sent,
+		refCount: 0,
+		emit(message) {
+			onMessage?.(message);
+		},
+		handle: {
+			send(message) {
+				sent.push(message);
+			},
+			onMessage(handler) {
+				onMessage = handler;
+				return () => {
+					onMessage = undefined;
+				};
+			},
+			onError() {
+				return () => {};
+			},
+			async terminate() {},
+			ref() {
+				worker.refCount++;
+			},
+			unref() {
+				worker.refCount--;
+			},
+		},
+	};
+	return worker;
+}
+
+describe("tiny memory completion prompts", () => {
+	it("renders extraction instructions as a system turn separate from user input", () => {
+		const applyChatTemplate = vi.fn(() => "rendered prompt");
+		const tokenizer = { apply_chat_template: applyChatTemplate };
+
+		expect(buildCompletionPrompt(tokenizer as never, "actual user input", " extraction instructions ")).toBe(
+			"rendered prompt",
+		);
+		expect(applyChatTemplate).toHaveBeenCalledWith(
+			[
+				{ role: "system", content: "extraction instructions" },
+				{ role: "user", content: "actual user input" },
+			],
+			{
+				add_generation_prompt: true,
+				tokenize: false,
+				enable_thinking: false,
+			},
+		);
+	});
+
+	it("carries the extraction system prompt over the worker protocol", async () => {
+		const worker = createFakeTinyWorker();
+		const client = new TinyTitleClient(() => worker.handle);
+
+		const completion = client.complete("lfm2-1.2b", "actual user input", {
+			maxTokens: 64,
+			systemPrompt: "extraction instructions",
+		});
+		const request = worker.sent.find(message => message.type === "complete");
+		expect(request).toEqual({
+			type: "complete",
+			id: expect.any(String),
+			modelKey: "lfm2-1.2b",
+			prompt: "actual user input",
+			maxTokens: 64,
+			systemPrompt: "extraction instructions",
+		});
+		worker.emit({ type: "completion", id: request?.id ?? "", text: "extracted fact" });
+
+		expect(await completion).toBe("extracted fact");
+		await client.terminate();
+	});
+});
+
+describe("tiny title prewarm", () => {
+	it("spawns one idle worker that the first generate reuses (issue #6462)", async () => {
+		const workers: FakeTinyWorker[] = [];
+		let spawnCount = 0;
+		const client = new TinyTitleClient(() => {
+			spawnCount++;
+			const worker = createFakeTinyWorker();
+			workers.push(worker);
+			return worker.handle;
+		});
+
+		client.prewarm("lfm2-350m");
+
+		expect(spawnCount).toBe(1);
+		// No pending request registered, so the prewarmed worker is never
+		// referenced and never blocks process exit.
+		expect(workers[0]?.refCount).toBe(0);
+		// A no-op ping warms the transport without loading a model.
+		expect(workers[0]?.sent).toEqual([{ type: "ping", id: expect.any(String) }]);
+
+		const generated = client.generate("lfm2-350m", "Investigate routing");
+		// The first submit reuses the prewarmed worker — no second spawn.
+		expect(spawnCount).toBe(1);
+
+		const request = workers[0]?.sent.find(message => message.type === "generate");
+		expect(request?.type).toBe("generate");
+		workers[0]?.emit({ type: "title", id: request?.id ?? "", title: "Routing" });
+
+		expect(await generated).toBe("Routing");
+		await client.terminate();
+	});
+
+	it("does not spawn a worker for the online default", () => {
+		let spawnCount = 0;
+		const client = new TinyTitleClient(() => {
+			spawnCount++;
+			return createFakeTinyWorker().handle;
+		});
+
+		client.prewarm("online");
+
+		expect(spawnCount).toBe(0);
 	});
 });
 
@@ -344,7 +348,8 @@ describe("tiny title subprocess", () => {
 
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.options.stdout).toBe("ignore");
-		expect(calls[0]?.options.stderr).toBe("ignore");
+		expect(calls[0]?.options.stderr).not.toBe("inherit");
+		expect(calls[0]?.options.stderr).not.toBe("pipe");
 		await worker.proc.exited;
 	});
 });
@@ -393,5 +398,51 @@ describe("tiny title download progress UI", () => {
 describe("tiny-models CLI", () => {
 	it("registers tiny-models as a top-level subcommand", () => {
 		expect(isSubcommand("tiny-models")).toBe(true);
+	});
+});
+
+describe("local title stop criteria", () => {
+	/** Minimal stand-ins: the criteria only needs a StoppingCriteria base to extend
+	 *  and a tokenizer that can decode a token window. */
+	const transformers = { StoppingCriteria: class {} } as unknown as TransformersRuntime;
+	const tokenizer = {
+		decode: (ids: number[]) => ids.map(id => (id === 1 ? "</title>" : "x")).join(""),
+	} as unknown as TextGenerationPipeline["tokenizer"];
+	/** `_call(inputIds, scores)`; the criteria ignores scores. */
+	const call = (criteria: StoppingCriteria, inputIds: number[][]): boolean[] =>
+		criteria._call(
+			inputIds,
+			inputIds.map(() => []),
+		);
+
+	it("ignores a stop string that appears only in the prompt", () => {
+		const criteria = createStopOnTextCriteria(transformers, tokenizer, "</title>");
+		// Token 1 decodes to the stop string and sits inside the prompt.
+		const prompt = [1, 0, 0];
+		expect(call(criteria, [[...prompt, 0]])).toEqual([false]);
+		expect(call(criteria, [[...prompt, 0, 0]])).toEqual([false]);
+	});
+
+	it("stops once the stop string is generated", () => {
+		const criteria = createStopOnTextCriteria(transformers, tokenizer, "</title>");
+		const prompt = [1, 0, 0];
+		expect(call(criteria, [[...prompt, 0]])).toEqual([false]);
+		expect(call(criteria, [[...prompt, 0, 1]])).toEqual([true]);
+	});
+
+	it("tracks each batch entry independently", () => {
+		const criteria = createStopOnTextCriteria(transformers, tokenizer, "</title>");
+		expect(
+			call(criteria, [
+				[1, 0],
+				[0, 0],
+			]),
+		).toEqual([false, false]);
+		expect(
+			call(criteria, [
+				[1, 0, 0],
+				[0, 0, 1],
+			]),
+		).toEqual([false, true]);
 	});
 });

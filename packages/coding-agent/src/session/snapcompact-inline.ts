@@ -14,9 +14,10 @@
  * estimate (`estimateInlineSavings`) so the two can never disagree.
  */
 
+import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type { Context, ImageContent, Model, TextContent, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
-import { countTokens } from "@oh-my-pi/pi-natives";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import type { SnapcompactFrameSink } from "../blob-broker/service";
 import contextFramesNote from "../prompts/system/snapcompact-context-frames-note.md" with { type: "text" };
 import contextStub from "../prompts/system/snapcompact-context-stub.md" with { type: "text" };
 import systemFramesNote from "../prompts/system/snapcompact-system-frames-note.md" with { type: "text" };
@@ -46,8 +47,8 @@ export type SnapcompactSavingsSink = (
 // Per-provider image-count budgets live in @oh-my-pi/snapcompact
 // (`providerImageBudget`): snapcompact frames are 1568px (<2000px) so
 // dimension/size limits never bind; only COUNT does. Once the budget is
-// spent (e.g. OpenRouter's hard 8-image cap, already consumed by archive
-// frames), tool results ship verbatim as text.
+// spent by already-attached archive/system-prompt images, tool results ship
+// verbatim as text.
 const MAX_SYSTEM_PROMPT_FRAMES = 6;
 /** Tool results under this many tokens are never rasterized — the swap can't
  *  save enough to justify trading crisp text for an image. */
@@ -85,7 +86,7 @@ interface SystemPromptImageTarget {
 }
 
 const CONTEXT_SECTION_PATTERNS = [
-	/<context>\n[\s\S]*?\n<\/context>/g,
+	/<repo-rules>\n[\s\S]*?\n<\/repo-rules>/g,
 	/## Context\n<instructions>\n[\s\S]*?\n<\/instructions>/g,
 ] as const;
 
@@ -282,6 +283,7 @@ export function estimateInlineSavings(input: {
 	}
 
 	const shape = snapcompact.resolveShape(model, options.shape);
+	const tokenizer = new Tokenizer(model);
 	let existingImages = 0;
 	for (const message of input.messages) {
 		if (!Array.isArray(message.content)) continue;
@@ -304,7 +306,7 @@ export function estimateInlineSavings(input: {
 						.filter(block => block.type === "text" && typeof block.text === "string")
 						.map(block => block.text as string)
 						.join("\n");
-			const textTokens = text.length > 0 ? countTokens(text) : 0;
+			const textTokens = text.length > 0 ? tokenizer.countTokens(text) : 0;
 			candidates.push({
 				id: message.toolCallId,
 				textTokens,
@@ -320,7 +322,7 @@ export function estimateInlineSavings(input: {
 		systemPromptTarget = selectSystemPromptImageTarget(input.systemPrompt, options.renderSystemPrompt);
 		if (systemPromptTarget) {
 			systemPromptCandidate = {
-				textTokens: countTokens(systemPromptTarget.text),
+				textTokens: tokenizer.countTokens(systemPromptTarget.text),
 				frames: snapcompact.frames(systemPromptTarget.text, { shape }),
 			};
 		}
@@ -412,14 +414,16 @@ export class SnapcompactInlineTransformer {
 	constructor(
 		private readonly options: SnapcompactInlineOptions,
 		private readonly onToolResultSavings?: SnapcompactSavingsSink,
+		private readonly frameSink?: SnapcompactFrameSink,
 	) {}
 
-	transform(context: Context, model: Model): Context {
+	async transform(context: Context, model: Model): Promise<Context> {
 		// Vision gate: providers silently DROP images on text-only models —
 		// rendering would lose the content entirely.
 		if (!model.input.includes("image")) return context;
 
 		const shape = snapcompact.resolveShape(model, this.options.shape);
+		const tokenizer = new Tokenizer(model);
 		const budget = snapcompact.providerImageBudget(model.provider) - countContextImages(context);
 		if (budget <= 0) return context;
 
@@ -444,7 +448,7 @@ export class SnapcompactInlineTransformer {
 							.filter(isTextContent)
 							.map(block => block.text)
 							.join("\n");
-				const textTokens = text.length > 0 ? countTokens(text) : 0;
+				const textTokens = text.length > 0 ? tokenizer.countTokens(text) : 0;
 				candidates.push({
 					id: message.toolCallId,
 					textTokens,
@@ -461,7 +465,7 @@ export class SnapcompactInlineTransformer {
 			systemPromptTarget = selectSystemPromptImageTarget(context.systemPrompt, this.options.renderSystemPrompt);
 			if (systemPromptTarget) {
 				systemPromptCandidate = {
-					textTokens: countTokens(systemPromptTarget.text),
+					textTokens: tokenizer.countTokens(systemPromptTarget.text),
 					frames: snapcompact.frames(systemPromptTarget.text, { shape }),
 				};
 			}
@@ -482,7 +486,7 @@ export class SnapcompactInlineTransformer {
 		for (const swap of plan.toolResults) {
 			const target = targets.get(swap.id);
 			if (!target) continue;
-			const frames = this.#framesFor(this.#toolCache, swap.id, target.text, shape);
+			const frames = await this.#framesFor(this.#toolCache, swap.id, target.text, shape);
 			messages[target.index] = { ...target.message, content: [{ type: "text", text: toolResultNote }, ...frames] };
 			changed = true;
 			savings.push({
@@ -506,7 +510,12 @@ export class SnapcompactInlineTransformer {
 			if (!cached || cached.hash !== hash) {
 				cached = {
 					hash,
-					frames: snapcompact.renderMany(systemPromptTarget.text, { shape, maxFrames: MAX_SYSTEM_PROMPT_FRAMES }),
+					frames:
+						(await this.frameSink?.framesFor(systemPromptTarget.text, shape, MAX_SYSTEM_PROMPT_FRAMES)) ??
+						(await snapcompact.renderMany(systemPromptTarget.text, {
+							shape,
+							maxFrames: MAX_SYSTEM_PROMPT_FRAMES,
+						})),
 				};
 				this.#systemCache = cached;
 			}
@@ -526,16 +535,18 @@ export class SnapcompactInlineTransformer {
 		return { ...context, systemPrompt, messages };
 	}
 
-	#framesFor(
+	async #framesFor(
 		cache: Map<string, FrameCacheEntry>,
 		key: string,
 		text: string,
 		shape: snapcompact.Shape,
-	): ImageContent[] {
+	): Promise<ImageContent[]> {
 		const hash = Bun.hash(text);
 		const cached = cache.get(key);
 		if (cached && cached.hash === hash) return cached.frames;
-		const frames = snapcompact.renderMany(text, { shape });
+		// A frame sink defers rasterization until a provider actually fetches
+		// the frame URL — the cache then holds tiny placeholders, not pixels.
+		const frames = (await this.frameSink?.framesFor(text, shape)) ?? (await snapcompact.renderMany(text, { shape }));
 		cache.set(key, { hash, frames });
 		return frames;
 	}

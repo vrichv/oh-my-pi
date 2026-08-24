@@ -19,18 +19,29 @@
  */
 
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { extractRetryHint, logger } from "@oh-my-pi/pi-utils";
+import { extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "../auth-retry";
 import type { AuthStorage } from "../auth-storage";
+import * as AIError from "../error";
+import { classifyGatewayError } from "../error/gateway";
+import { isUsageLimitOutcome } from "../error/rate-limit";
 import * as anthropicMessages from "../providers/anthropic-messages-server";
 import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
-import { isUsageLimitError } from "../rate-limit-utils";
-import { streamSimple } from "../stream";
+import { completeSimple, streamSimple } from "../stream";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
-import { captureRequestHeaders, corsHeaders, isAuthorized, json, resolvePeer, withCors } from "./http";
+import {
+	captureRequestHeaders,
+	corsHeaders,
+	gatewayResponseHeaders,
+	isAuthorized,
+	json,
+	resolvePeer,
+	withCors,
+} from "./http";
 import type {
 	AuthGatewayServerHandle,
 	AuthGatewayServerOptions,
@@ -110,35 +121,37 @@ function deriveSessionId(modelId: string, context: Context): string {
 		parts.push(JSON.stringify({ role: first.role, content: first.content }));
 	}
 	const seed = parts.join("\u0000");
-	const hex = new Bun.CryptoHasher("sha256").update(seed).digest("hex");
-	// Format the leading 128 bits as a v4-shape UUID (8-4-4-4-12). Codex's
-	// `normalizeOpenAIResponsesPromptCacheKey` accepts ≤64 chars verbatim, so
-	// the 36-char UUID flows through unchanged.
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+	// The 36-char UUID flows through unchanged:
+	// `normalizeOpenAIPromptCacheKey` accepts ≤64 chars verbatim.
+	return deterministicUuid(seed);
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: AbortSignal): SimpleStreamOptions {
 	const opts: SimpleStreamOptions = { signal };
 	const { options } = parsed;
-	// Codex backend rejects `temperature` / `top_p` (per-model defaults only),
-	// so we drop them silently for that one provider. Every other unsupported
-	// option is just ignored by `streamSimple` if the underlying provider
-	// doesn't honour it.
+	// Codex backend rejects every sampling control with
+	// `Unsupported parameter: …` (#3117). Strip the full set for that one
+	// provider; everything else is harmless to forward — `streamSimple` ignores
+	// what the underlying provider doesn't honour.
 	const isCodex = api === "openai-codex-responses";
 	if (options.maxOutputTokens !== undefined) opts.maxTokens = options.maxOutputTokens;
 	if (options.temperature !== undefined && !isCodex) opts.temperature = options.temperature;
 	if (options.topP !== undefined && !isCodex) opts.topP = options.topP;
-	if (options.topK !== undefined) opts.topK = options.topK;
-	if (options.minP !== undefined) opts.minP = options.minP;
-	if (options.stopSequences !== undefined) opts.stopSequences = options.stopSequences;
-	if (options.presencePenalty !== undefined) opts.presencePenalty = options.presencePenalty;
-	if (options.frequencyPenalty !== undefined) opts.frequencyPenalty = options.frequencyPenalty;
-	if (options.repetitionPenalty !== undefined) opts.repetitionPenalty = options.repetitionPenalty;
+	if (options.topK !== undefined && !isCodex) opts.topK = options.topK;
+	if (options.minP !== undefined && !isCodex) opts.minP = options.minP;
+	if (options.stopSequences !== undefined && !isCodex) opts.stopSequences = options.stopSequences;
+	if (options.presencePenalty !== undefined && !isCodex) opts.presencePenalty = options.presencePenalty;
+	if (options.frequencyPenalty !== undefined && !isCodex) opts.frequencyPenalty = options.frequencyPenalty;
+	if (options.repetitionPenalty !== undefined && !isCodex) opts.repetitionPenalty = options.repetitionPenalty;
 	if (options.metadata !== undefined) opts.metadata = options.metadata;
 	if (options.headers !== undefined) opts.headers = { ...(opts.headers ?? {}), ...options.headers };
 	if (options.toolChoice !== undefined) {
 		opts.toolChoice =
-			typeof options.toolChoice === "object" ? { type: "tool", name: options.toolChoice.name } : options.toolChoice;
+			typeof options.toolChoice !== "object"
+				? options.toolChoice
+				: "type" in options.toolChoice
+					? options.toolChoice
+					: { type: "tool", name: options.toolChoice.name };
 	}
 	if (options.reasoning !== undefined) opts.reasoning = options.reasoning;
 	if (options.disableReasoning !== undefined) opts.disableReasoning = options.disableReasoning;
@@ -146,6 +159,7 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.taskBudget !== undefined) opts.taskBudget = options.taskBudget;
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
+	if (options.include !== undefined) opts.include = options.include;
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
@@ -194,93 +208,6 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 }
 
 /**
- * Classify an upstream / gateway-internal error into a status code and a
- * format-neutral type. The order is intentional:
- *
- *  1. Honour an explicit numeric `status` property on the thrown error.
- *  2. Parse a status code embedded in the message string. Provider errors
- *     virtually always carry one (`Google API error (400): …`, `HTTP 429`,
- *     `status=503`) and the embedded value is authoritative.
- *  3. Fall through to **word-boundaried** substring heuristics. The old
- *     `lower.includes("rate")` test famously matched
- *     `GenerateContentRequest`, surfacing every Google 400 as a 429
- *     `rate_limit_error`. The patterns here all require boundaries so they
- *     don't collide with provider field names.
- */
-export function classifyGatewayError(err: unknown): { status: number; type: string; message: string } {
-	const message = err instanceof Error ? err.message : String(err);
-
-	// 1. Custom pi-ai errors may attach a numeric `status` property.
-	const statusProp =
-		typeof err === "object" && err !== null && typeof (err as { status?: unknown }).status === "number"
-			? (err as { status: number }).status | 0
-			: undefined;
-	if (statusProp !== undefined) return bucketStatus(statusProp, message);
-
-	if (err instanceof Error && err.name === "AbortError") return { status: 499, type: "request_aborted", message };
-
-	// 2. Status code embedded in the message. Requires a contextual keyword
-	// (`HTTP`, `API error`, `status`, …) or a leading `(NNN)` token so we
-	// don't trip on incidental three-digit numbers ("took 200ms").
-	const embedded = extractEmbeddedStatus(message);
-	if (embedded !== undefined) return bucketStatus(embedded, message);
-
-	// 3. Word-boundaried substring heuristics.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return { status: 499, type: "request_aborted", message };
-	}
-	if (/\b(?:unauthorized|forbidden)\b/i.test(message)) {
-		return { status: 401, type: "authentication_error", message };
-	}
-	if (
-		// Match rate-limit phrasings without colliding with
-		// `GenerateContentRequest`, `accelerate`, `iterate`, `deprecated`, etc.
-		/\brate[- _]?limit(?:s|ed|ing)?\b|\bquota(?:_exceeded| exceeded)?\b|\btoo[- _]many[- _]requests\b/i.test(
-			message,
-		) ||
-		// Usage-limit phrasings emit no embedded status. Codex friendly text
-		// reads "You have hit your ChatGPT usage limit … Try again in ~158
-		// min."; pi-ai's central `isUsageLimitError` already encodes every
-		// known provider variant, so reuse it instead of forking the regex.
-		// Without this branch the classifier falls through to the default
-		// 502/upstream_error, which is what callers were seeing when their
-		// account hit its cap.
-		isUsageLimitError(message)
-	) {
-		return { status: 429, type: "rate_limit_error", message };
-	}
-	if (/\b(?:unsupported|invalid_request|invalid request|bad request|malformed)\b/i.test(message)) {
-		return { status: 400, type: "invalid_request_error", message };
-	}
-	return { status: 502, type: "upstream_error", message };
-}
-
-function bucketStatus(status: number, message: string): { status: number; type: string; message: string } {
-	if (status === 401 || status === 403) return { status, type: "authentication_error", message };
-	if (status === 429) return { status, type: "rate_limit_error", message };
-	if (status >= 400 && status < 500) return { status, type: "invalid_request_error", message };
-	if (status >= 500) return { status, type: "upstream_error", message };
-	return { status: 502, type: "upstream_error", message };
-}
-
-/**
- * Pull a status code from common error-message shapes. Returns undefined when
- * no contextual keyword is present, so we never guess at incidental numbers.
- */
-function extractEmbeddedStatus(message: string): number | undefined {
-	// `Google API error (400)`, `OpenAI API error (429): …`, `(503)`
-	// `HTTP 429: too many requests`
-	// `status: 503`, `status_code=429`, `status=400`
-	const re = /(?:\bHTTP\b|\bAPI error\b|\bstatus(?:[- _]?code)?\b)\s*[:=]?\s*\(?\s*(\d{3})\b|\((\d{3})\)/i;
-	const m = message.match(re);
-	if (!m) return undefined;
-	const raw = m[1] ?? m[2];
-	if (!raw) return undefined;
-	const code = Number.parseInt(raw, 10);
-	return Number.isFinite(code) && code >= 100 && code < 600 ? code : undefined;
-}
-
-/**
  * Hook fired by {@link streamSimple} when the upstream request fails in a
  * way that's rotatable — today that's HTTP 401 (credential is bad) and
  * usage-limit phrasing matched by {@link isUsageLimitError} (Codex's
@@ -314,12 +241,14 @@ async function refreshGatewayApiKeyAfterAuthError(
 	peer: string,
 ): Promise<string | undefined> {
 	const message = error instanceof Error ? error.message : String(error);
-	if (isUsageLimitError(message)) {
+	const status = extractHttpStatusFromError(error);
+	if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) {
 		const retryAfterMs = extractRetryHint(undefined, message);
 		const { switched, retryAtMs } = await storage.markUsageLimitReached(provider, sessionId, {
 			retryAfterMs,
 			baseUrl: model.baseUrl,
 			modelId: model.id,
+			apiKey: oldKey,
 			signal,
 		});
 		logger.debug("auth-gateway retrying provider request after usage-limit block", {
@@ -420,6 +349,8 @@ async function handleFormatEndpoint(
 	req: Request,
 	peer: string,
 ): Promise<Response> {
+	const startedAt = performance.now();
+	const requestId = crypto.randomUUID();
 	const controller = mirrorRequestAbort(req);
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
@@ -516,6 +447,7 @@ async function handleFormatEndpoint(
 	);
 
 	logger.info("auth-gateway request", {
+		requestId,
 		format: route.label,
 		model: parsed.modelId,
 		resolvedProvider: model.provider,
@@ -524,20 +456,10 @@ async function handleFormatEndpoint(
 		peer,
 	});
 
-	let events: AssistantMessageEventStream;
-	try {
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		events = streamSimple(model, parsed.context, streamOpts);
-	} catch (error) {
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
-		return route.module.formatError(classified.status, classified.type, classified.message);
-	}
-
 	if (!parsed.stream) {
 		try {
 			if (controller.signal.aborted) return clientClosedResponse(route);
-			const message = await events.result();
+			const message = await completeSimple(model, parsed.context, streamOpts);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -551,10 +473,14 @@ async function handleFormatEndpoint(
 				if (message.stopReason === "aborted") {
 					return route.module.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return route.module.formatError(classified.status, classified.type, errorMessage);
 			}
-			return json(200, route.module.encodeResponse(message, parsed.modelId));
+			return json(
+				200,
+				route.module.encodeResponse(message, parsed.modelId),
+				gatewayResponseHeaders(model, { requestId, message, startedAt }),
+			);
 		} catch (error) {
 			if (controller.signal.aborted) return clientClosedResponse(route);
 			const classified = classifyGatewayError(error);
@@ -565,6 +491,16 @@ async function handleFormatEndpoint(
 			});
 			return route.module.formatError(classified.status, classified.type, classified.message);
 		}
+	}
+
+	let events: AssistantMessageEventStream;
+	try {
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		events = streamSimple(model, parsed.context, streamOpts);
+	} catch (error) {
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
+		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
@@ -579,6 +515,7 @@ async function handleFormatEndpoint(
 	return new Response(sseStream, {
 		status: 200,
 		headers: {
+			...gatewayResponseHeaders(model, { requestId }),
 			"Content-Type": "text/event-stream; charset=utf-8",
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
@@ -605,6 +542,8 @@ async function handleFormatEndpoint(
  * path.
  */
 async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, peer: string): Promise<Response> {
+	const startedAt = performance.now();
+	const requestId = crypto.randomUUID();
 	const controller = mirrorRequestAbort(req);
 	const aborted = (): Response => piNative.formatError(499, "request_aborted", "client closed request");
 	if (controller.signal.aborted) return aborted();
@@ -662,8 +601,8 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and
-	// only inject server-controlled fields. The codex temperature/topP strip
-	// matches `buildStreamOptions` — Codex rejects them with a 400.
+	// only inject server-controlled fields. The codex sampling strip mirrors
+	// `buildStreamOptions` — Codex rejects every one with a 400 (#3117).
 	const streamOpts: SimpleStreamOptions = { ...parsed.options, apiKey, signal: controller.signal };
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
 		bootOpts.storage,
@@ -677,6 +616,12 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	if (model.api === "openai-codex-responses") {
 		delete streamOpts.temperature;
 		delete streamOpts.topP;
+		delete streamOpts.topK;
+		delete streamOpts.minP;
+		delete streamOpts.stopSequences;
+		delete streamOpts.presencePenalty;
+		delete streamOpts.frequencyPenalty;
+		delete streamOpts.repetitionPenalty;
 	}
 	// Merge gateway-captured passthrough headers under the client's own
 	// headers — the client's values win when they collide.
@@ -685,6 +630,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	streamOpts.sessionId ??= sessionId;
 
 	logger.info("auth-gateway request", {
+		requestId,
 		format: "pi-native",
 		model: parsed.modelId,
 		resolvedProvider: model.provider,
@@ -693,20 +639,10 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		peer,
 	});
 
-	let events: AssistantMessageEventStream;
-	try {
-		if (controller.signal.aborted) return aborted();
-		events = streamSimple(model, parsed.context, streamOpts);
-	} catch (error) {
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
-		return piNative.formatError(classified.status, classified.type, classified.message);
-	}
-
 	if (!parsed.stream) {
 		try {
 			if (controller.signal.aborted) return aborted();
-			const message = await events.result();
+			const message = await completeSimple(model, parsed.context, streamOpts);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -720,16 +656,26 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 				if (message.stopReason === "aborted") {
 					return piNative.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return piNative.formatError(classified.status, classified.type, errorMessage);
 			}
-			return json(200, { message });
+			return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
 		} catch (error) {
 			if (controller.signal.aborted) return aborted();
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway non-streaming aborted", { format: "pi-native", error: classified.message, peer });
 			return piNative.formatError(classified.status, classified.type, classified.message);
 		}
+	}
+
+	let events: AssistantMessageEventStream;
+	try {
+		if (controller.signal.aborted) return aborted();
+		events = streamSimple(model, parsed.context, streamOpts);
+	} catch (error) {
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
+		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return aborted();
 
@@ -744,6 +690,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	return new Response(sseStream, {
 		status: 200,
 		headers: {
+			...gatewayResponseHeaders(model, { requestId }),
 			"Content-Type": "text/event-stream; charset=utf-8",
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
@@ -783,14 +730,46 @@ async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal)
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
+/**
+ * Row shape for `GET /v1/models`. Beyond the OpenAI-standard `id`/`object`/
+ * `owned_by`, rows advertise the catalog metadata OpenAI-compatible clients
+ * (omp's own proxy discovery, Zed's openai_compatible provider, ...) read to
+ * size and capability-gate discovered models: `context_length`,
+ * `max_output_tokens`, `input_modalities`, and `supports_tools` (only emitted
+ * when the catalog explicitly reports `false`; absent means usable).
+ */
+interface ModelListRow {
+	id: string;
+	object: "model";
+	owned_by: string;
+	api: Api;
+	display_name: string;
+	context_length?: number;
+	max_output_tokens?: number;
+	input_modalities: ("text" | "image")[];
+	supports_tools?: boolean;
+}
+
 function handleModelsList(opts: AuthGatewayBootOptions): Response {
-	const list = opts.listModels ? Array.from(opts.listModels()) : [];
-	const data = list.map(model => ({
-		id: model.id,
-		object: "model" as const,
-		owned_by: model.provider,
-		api: model.api,
-	}));
+	const seen = new Set<string>();
+	const data: ModelListRow[] = [];
+	for (const model of opts.listModels?.() ?? []) {
+		const id = `${model.provider}/${model.id}`;
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const row: ModelListRow = {
+			id,
+			object: "model",
+			owned_by: model.provider,
+			api: model.api,
+			display_name: model.name,
+			input_modalities: model.input,
+		};
+		if (model.contextWindow != null) row.context_length = model.contextWindow;
+		if (model.maxTokens != null) row.max_output_tokens = model.maxTokens;
+		if (model.supportsTools === false) row.supports_tools = false;
+		data.push(row);
+	}
 	return json(200, { object: "list", data });
 }
 

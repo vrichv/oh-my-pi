@@ -6,8 +6,11 @@
  * how assistant text snaps at message_end.
  */
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { kStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EDIT_MODE_STRATEGIES } from "@oh-my-pi/pi-coding-agent/edit";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { STREAMING_REVEAL_FRAME_MS } from "@oh-my-pi/pi-coding-agent/modes/controllers/streaming-reveal";
@@ -39,26 +42,41 @@ function makeStreamingMessage(content: AssistantMessage["content"]): AssistantMe
 	};
 }
 
-function createFixture(streamingMessage: AssistantMessage) {
+function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
+	let approvalWaiter: ((toolCallId: string) => Promise<void>) | undefined;
+	const extensionRunner = {
+		setToolApprovalPreviewWaiter(waiter: (toolCallId: string) => Promise<void>) {
+			approvalWaiter = waiter;
+			return () => {
+				if (approvalWaiter === waiter) approvalWaiter = undefined;
+			};
+		},
+	};
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 		settings,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
 		streamingMessage,
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools,
+		noteDisplayableThinkingContent: vi.fn(() => false),
 		chatContainer: { addChild: vi.fn() },
 		toolOutputExpanded: false,
-		session: { getToolByName: () => undefined },
-		viewSession: { getToolByName: () => undefined },
+		session: { getToolByName: () => tool, hasBuiltInTool: () => true, extensionRunner },
+		viewSession: { getToolByName: () => tool, hasBuiltInTool: () => true },
 		sessionManager: { getCwd: () => process.cwd() },
 	} as unknown as InteractiveModeContext;
 
-	return { controller: new EventController(ctx), pendingTools };
+	return {
+		controller: new EventController(ctx),
+		pendingTools,
+		getApprovalWaiter: () => approvalWaiter,
+	};
 }
 
 async function dispatch(controller: EventController, message: AssistantMessage) {
@@ -70,6 +88,18 @@ async function dispatch(controller: EventController, message: AssistantMessage) 
 	await controller.handleEvent(event);
 }
 
+async function dispatchToolStart(
+	controller: EventController,
+	payload: { toolCallId: string; toolName: string; args: Record<string, unknown> },
+) {
+	await controller.handleEvent({
+		type: "tool_execution_start",
+		toolCallId: payload.toolCallId,
+		toolName: payload.toolName,
+		args: payload.args,
+	} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
+}
+
 describe("EventController paces streamed tool args", () => {
 	afterEach(() => {
 		vi.useRealTimers();
@@ -77,26 +107,45 @@ describe("EventController paces streamed tool args", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("reveals partialJson prefixes per frame, then snaps to final args when the JSON closes", async () => {
+	it("reveals the initial slice immediately, then paces growth across message_updates", async () => {
 		await Settings.init({ inMemory: true, cwd: process.cwd() });
 		vi.useFakeTimers();
 		const updateArgsSpy = vi.spyOn(ToolExecutionComponent.prototype, "updateArgs");
 		const content = "x".repeat(400);
 		const target = `{"path":"/tmp/a.ts","content":"${content}"}`;
-		const streaming = makeStreamingMessage([
-			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, partialJson: target } as never,
-		]);
-		const { controller, pendingTools } = createFixture(streaming);
+		// Seed includes the complete `path` field (closing quote at byte 20) plus
+		// the opening of `content`, so the rendered preview must show the real
+		// path on the very first dispatch.
+		const seed = target.slice(0, 35);
 
-		await dispatch(controller, streaming);
+		// First message_update: only a small slice has arrived. The reveal
+		// MUST surface it as-is (no empty initial frame).
+		const seedStreaming = makeStreamingMessage([
+			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: seed },
+		]);
+		const { controller, pendingTools } = createFixture(seedStreaming);
+		await dispatch(controller, seedStreaming);
 		expect(pendingTools.size).toBe(1);
+
+		// Component constructor consumes the initial render args directly; no
+		// updateArgs has been invoked yet, but the seeded prefix is already on
+		// the pending preview.
+		const componentRender = pendingTools.get("tc-1")!.render(80).join("\n");
+		expect(Bun.stripANSI(componentRender)).toContain("/tmp/a.ts");
+
+		// Second message_update: the rest of the payload arrives. The controller
+		// paces the new backlog through reveal ticks.
+		const fullStreaming = makeStreamingMessage([
+			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
+		]);
+		await dispatch(controller, fullStreaming);
 
 		for (let i = 0; i < 3; i++) {
 			vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
 		}
 		const pacedFrames = updateArgsSpy.mock.calls.map(call => call[0] as Record<string, unknown>);
 		expect(pacedFrames.length).toBeGreaterThan(0);
-		let previousLength = 0;
+		let previousLength = seed.length;
 		for (const frame of pacedFrames) {
 			const prefix = frame.__partialJson;
 			if (typeof prefix !== "string") throw new Error("Expected __partialJson string on paced frame");
@@ -132,8 +181,8 @@ describe("EventController paces streamed tool args", () => {
 				id: "tc-1",
 				name: "write",
 				arguments: { path: "/tmp/a.ts" },
-				partialJson: target,
-			} as never,
+				[kStreamingPartialJson]: target,
+			},
 		]);
 		const { controller } = createFixture(streaming);
 
@@ -145,5 +194,82 @@ describe("EventController paces streamed tool args", () => {
 		const calls = updateArgsSpy.mock.calls.length;
 		vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS * 5);
 		expect(updateArgsSpy.mock.calls.length).toBe(calls);
+	});
+
+	it("reconciles validated full args on tool_execution_start when the closing args update never lands", async () => {
+		await Settings.init({ inMemory: true, cwd: process.cwd() });
+		vi.useFakeTimers();
+		const content = "y".repeat(50);
+		const target = `{"path":"/tmp/exec.ts","content":"${content}"}`;
+		const streaming = makeStreamingMessage([
+			{ type: "toolCall", id: "tc-1", name: "write", arguments: {}, [kStreamingPartialJson]: target },
+		]);
+		const { controller, pendingTools } = createFixture(streaming);
+
+		// Args still streaming, but the reveal now seeds the preview with the
+		// full available partialJson on the very first message_update — so the
+		// path is already visible before the tool starts executing.
+		await dispatch(controller, streaming);
+		const component = pendingTools.get("tc-1");
+		if (!component) throw new Error("expected a pending write component");
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("/tmp/exec.ts");
+
+		// The closing full-args message_update never arrives (throttled `arguments`
+		// with smoothing off, an owned-dialect projector, or a superseded turn that
+		// still runs the call). The tool executes anyway: tool_execution_start is the
+		// one event every path emits with the validated args, so it must reconcile.
+		await dispatchToolStart(controller, {
+			toolCallId: "tc-1",
+			toolName: "write",
+			args: { path: "/tmp/exec.ts", content },
+		});
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("/tmp/exec.ts");
+
+		// The reveal entry was cancelled: a late tick cannot re-truncate the body
+		// back to a streaming prefix.
+		vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS * 5);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("/tmp/exec.ts");
+	});
+	it("holds approval until the final edit preview is ready", async () => {
+		await Settings.init({ inMemory: true, cwd: process.cwd() });
+		const compute = Promise.withResolvers<void>();
+		vi.spyOn(EDIT_MODE_STRATEGIES.replace, "computeDiffPreview").mockImplementation(async () => {
+			await compute.promise;
+			return [
+				{
+					path: "/tmp/approval.ts",
+					diff: "@@ -1 +1 @@\n-old\n+ISSUE_7957_PROPOSED_EDIT",
+					firstChangedLine: 1,
+				},
+			];
+		});
+		const args = {
+			path: "/tmp/approval.ts",
+			old_string: "old",
+			new_string: "ISSUE_7957_PROPOSED_EDIT",
+		};
+		const streaming = makeStreamingMessage([{ type: "toolCall", id: "tc-approval", name: "edit", arguments: args }]);
+		const tool = { mode: "replace" } as unknown as AgentTool;
+		const { controller, pendingTools, getApprovalWaiter } = createFixture(streaming, tool);
+		await dispatch(controller, streaming);
+
+		const waiter = getApprovalWaiter();
+		if (!waiter) throw new Error("expected the TUI approval-preview waiter");
+		let approvalReady = false;
+		const waiting = waiter("tc-approval").then(() => {
+			approvalReady = true;
+		});
+		await dispatchToolStart(controller, {
+			toolCallId: "tc-approval",
+			toolName: "edit",
+			args,
+		});
+		await Promise.resolve();
+		expect(approvalReady).toBe(false);
+
+		compute.resolve();
+		await waiting;
+		const rendered = pendingTools.get("tc-approval")?.render(100).join("\n") ?? "";
+		expect(Bun.stripANSI(rendered)).toContain("ISSUE_7957_PROPOSED_EDIT");
 	});
 });

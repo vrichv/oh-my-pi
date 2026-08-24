@@ -1,7 +1,4 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ExtensionList } from "@oh-my-pi/pi-coding-agent/modes/components/extensions/extension-list";
@@ -15,6 +12,7 @@ import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storag
 import type { SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const CTRL_N = "\x0e";
 const CTRL_P = "\x10";
@@ -23,7 +21,7 @@ const TEST_KEYBINDINGS = KeybindingsManager.inMemory({
 	"tui.select.down": "ctrl+n",
 });
 
-const tempDirs: string[] = [];
+const tempDirs: TempDir[] = [];
 
 beforeAll(() => {
 	initTheme();
@@ -32,7 +30,8 @@ beforeAll(() => {
 afterEach(async () => {
 	setKeybindings(KeybindingsManager.inMemory());
 	HistoryStorage.resetInstance();
-	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+	await Bun.sleep(0);
+	await Promise.all(tempDirs.splice(0).map(tempDir => tempDir.remove().catch(() => {})));
 });
 
 function createSession(id: string, title: string): SessionInfo {
@@ -52,6 +51,18 @@ function createSession(id: string, title: string): SessionInfo {
 
 function createMessageNode(id: string, parentId: string | null, content: string): SessionTreeNode {
 	const message: AgentMessage = { role: "user", content, timestamp: 1 };
+	return {
+		entry: {
+			type: "message",
+			id,
+			parentId,
+			timestamp: "2024-01-01T00:00:00Z",
+			message,
+		},
+		children: [],
+	};
+}
+function createAgentMessageNode(id: string, parentId: string | null, message: AgentMessage): SessionTreeNode {
 	return {
 		entry: {
 			type: "message",
@@ -83,10 +94,10 @@ function createExtension(id: string, displayName: string): Extension {
 }
 
 async function createHistoryStorage(prompts: string[]): Promise<HistoryStorage> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-history-nav-"));
+	const dir = TempDir.createSync("@omp-history-nav-");
 	tempDirs.push(dir);
 	HistoryStorage.resetInstance();
-	const storage = HistoryStorage.open(path.join(dir, "history.db"));
+	const storage = HistoryStorage.open(dir.join("history.db"));
 	// add() batches writes behind a 100ms AsyncDrain timer. Drive that timer with
 	// fake timers so the flush is instant instead of waiting real wall-clock time.
 	vi.useFakeTimers();
@@ -134,6 +145,164 @@ describe("selector navigation keybindings", () => {
 		selector.handleInput("\n");
 
 		expect(selected).toEqual(["child"]);
+	});
+	it("traverses actual turns and jumps to first/last visible tree items", () => {
+		const firstUser = createMessageNode("first-user", null, "First question");
+		const assistant = createAgentMessageNode("assistant", "first-user", {
+			role: "assistant",
+			content: [{ type: "text", text: "Working on it" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "test",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 2,
+		});
+		const firstToolResult = createAgentMessageNode("first-tool-result", "assistant", {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "first file contents" }],
+			isError: false,
+			timestamp: 3,
+		});
+		const secondUser = createMessageNode("second-user", "first-tool-result", "Second question");
+		const trailingToolResult = createAgentMessageNode("trailing-tool-result", "second-user", {
+			role: "toolResult",
+			toolCallId: "call-2",
+			toolName: "read",
+			content: [{ type: "text", text: "second file contents" }],
+			isError: false,
+			timestamp: 5,
+		});
+		firstUser.children.push(assistant);
+		assistant.children.push(firstToolResult);
+		firstToolResult.children.push(secondUser);
+		secondUser.children.push(trailingToolResult);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[firstUser],
+			"trailing-tool-result",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;3B");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[F");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[H");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual([
+			"second-user",
+			"assistant",
+			"first-user",
+			"assistant",
+			"trailing-tool-result",
+			"first-user",
+		]);
+	});
+
+	it("honors configured row bindings before Alt+Up and Alt+Down turn traversal", () => {
+		setKeybindings(
+			KeybindingsManager.inMemory({
+				"tui.select.up": "alt+up",
+				"tui.select.down": "alt+down",
+			}),
+		);
+		const firstUser = createMessageNode("first-user", null, "First question");
+		const toolResult = createAgentMessageNode("tool-result", "first-user", {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "file contents" }],
+			isError: false,
+			timestamp: 2,
+		});
+		const secondUser = createMessageNode("second-user", "tool-result", "Second question");
+		firstUser.children.push(toolResult);
+		toolResult.children.push(secondUser);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[firstUser],
+			"first-user",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;3B");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["tool-result", "first-user"]);
+	});
+
+	it("uses rendered tree order for Home and End across branches", () => {
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const inactiveBranch = createMessageNode("inactive-branch", "root", "Inactive branch");
+		root.children.push(activeBranch, inactiveBranch);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"active-branch",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[F");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[H");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["inactive-branch", "root"]);
+	});
+
+	it("uses PageUp and PageDown to move by a visible page in the session tree", () => {
+		const root = createMessageNode("node-0", null, "Message 0");
+		let parent = root;
+		for (let index = 1; index <= 25; index++) {
+			const child = createMessageNode(`node-${index}`, parent.entry.id, `Message ${index}`);
+			parent.children.push(child);
+			parent = child;
+		}
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"node-0",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[6~");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[5~");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["node-20", "node-0"]);
 	});
 
 	it("uses tui.select.up in the user message selector", () => {

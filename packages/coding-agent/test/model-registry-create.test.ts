@@ -21,7 +21,7 @@ describe("ModelRegistry.create() factory (F6)", () => {
 	});
 
 	test("produces an instance whose authStorage matches and that exposes bundled models", async () => {
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		try {
 			const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 			expect(registry.authStorage).toBe(authStorage);
@@ -44,7 +44,7 @@ describe("ModelRegistry.create() factory (F6)", () => {
 		await Bun.write(json, JSON.stringify({ models: [] }));
 		expect(fs.existsSync(yml)).toBe(false);
 
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		try {
 			new ModelRegistry(authStorage, yml);
 			expect(fs.existsSync(yml)).toBe(true);
@@ -68,5 +68,24 @@ describe("ModelRegistry.create() factory (F6)", () => {
 		cf.tryLoad();
 		const mtime2 = fs.statSync(yml).mtimeMs;
 		expect(mtime2).toBe(mtime1);
+	});
+
+	test("ConfigFile migrates legacy models.json containing comments", async () => {
+		const yml = path.join(tempDir.path(), "models.yml");
+		const json = path.join(tempDir.path(), "models.json");
+		await Bun.write(
+			json,
+			`{
+				// Custom models comment
+				"providers": {
+					/* Block comment */
+				}
+			}`,
+		);
+
+		const cf = new ConfigFile("models", ModelsConfigSchema, yml);
+		const result = cf.tryLoad();
+		expect(result.status).toBe("ok");
+		expect(fs.existsSync(yml)).toBe(true);
 	});
 });

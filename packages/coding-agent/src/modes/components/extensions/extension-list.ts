@@ -5,30 +5,37 @@
  * that toggles the entire provider. All items below are dimmed when the
  * master switch is off.
  */
-import {
-	type Component,
-	extractPrintableText,
-	matchesKey,
-	padding,
-	ScrollView,
-	truncateToWidth,
-	visibleWidth,
-} from "@oh-my-pi/pi-tui";
+import { type Component, matchesKey, padding, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { isProviderEnabled } from "../../../discovery";
 import { theme } from "../../../modes/theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../../utils/keybinding-matchers";
+import { clampSelection, contentRowWidth, renderScrollableList, searchableChar } from "../selector-helpers";
+import { sanitizeDisplayLine } from "./display-text";
+import {
+	formatExtensionListHint,
+	joinListHints,
+	liveToolsForExtension,
+	projectListHint,
+	type ToolRuntimeSource,
+} from "./inspector-model";
+import { snapshotToolRuntimeSource } from "./live-tool-session";
+import {
+	formatMcpListHint,
+	isDiscoveredMcpServer,
+	type MCPConnectionHealth,
+	type MCPRuntimeSource,
+	snapshotMcpRuntime,
+} from "./mcp-runtime";
 import { applyFilter } from "./state-manager";
-import type { Extension, ExtensionKind, ExtensionState } from "./types";
+import { type Extension, type ExtensionKind, type ExtensionState, isShadowedExtension } from "./types";
 
 export interface ExtensionListCallbacks {
-	/** Called when selection changes */
 	onSelectionChange?: (extension: Extension | null) => void;
-	/** Called when extension is toggled */
 	onToggle?: (extensionId: string, enabled: boolean) => void;
-	/** Called when master switch is toggled */
 	onMasterToggle?: (providerId: string) => void;
-	/** Provider ID for master switch (null = no master switch) */
 	masterSwitchProvider?: string | null;
+	mcpSource?: MCPRuntimeSource;
+	toolSource?: ToolRuntimeSource;
 }
 
 const DEFAULT_MAX_VISIBLE = 15;
@@ -47,6 +54,12 @@ export class ExtensionList implements Component {
 	#focused = false;
 	#masterSwitchProvider: string | null = null;
 	#maxVisible: number;
+	#hoveredIndex: number | null = null;
+	/** Item rows rendered in the last frame, for mouse hit-testing. */
+	#visibleCount = 0;
+	#mcpSource: MCPRuntimeSource | undefined;
+	#toolSource: ToolRuntimeSource | undefined;
+	#toolFrame: ToolRuntimeSource | undefined;
 
 	constructor(
 		private extensions: Extension[],
@@ -54,6 +67,8 @@ export class ExtensionList implements Component {
 		maxVisible?: number,
 	) {
 		this.#masterSwitchProvider = callbacks.masterSwitchProvider ?? null;
+		this.#mcpSource = callbacks.mcpSource;
+		this.#toolSource = callbacks.toolSource;
 		this.#maxVisible = maxVisible ?? DEFAULT_MAX_VISIBLE;
 		this.#rebuildList();
 	}
@@ -76,6 +91,14 @@ export class ExtensionList implements Component {
 	setMasterSwitchProvider(providerId: string | null): void {
 		this.#masterSwitchProvider = providerId;
 		this.#rebuildList();
+	}
+
+	setMcpSource(source: MCPRuntimeSource | undefined): void {
+		this.#mcpSource = source;
+	}
+
+	setToolSource(source: ToolRuntimeSource | undefined): void {
+		this.#toolSource = source;
 	}
 
 	getSearchQuery(): string {
@@ -114,7 +137,9 @@ export class ExtensionList implements Component {
 	invalidate(): void {}
 
 	render(width: number): readonly string[] {
+		this.#toolFrame = snapshotToolRuntimeSource(this.#toolSource);
 		const lines: string[] = [];
+		this.#visibleCount = 0;
 
 		// Search bar
 		const searchPrefix = theme.fg("muted", "Search: ");
@@ -136,32 +161,35 @@ export class ExtensionList implements Component {
 		const endIdx = Math.min(startIdx + this.#maxVisible, this.#listItems.length);
 
 		// Reserve the rightmost column for the scrollbar when overflowing
-		const overflow = this.#listItems.length > this.#maxVisible;
-		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
+		const rowWidth = contentRowWidth(width, this.#listItems.length, this.#maxVisible);
 
 		// Render visible items
 		const rows: string[] = [];
 		for (let i = startIdx; i < endIdx; i++) {
 			const listItem = this.#listItems[i];
 			const isSelected = this.#focused && i === this.#selectedIndex;
+			const isHovered = this.#focused && i === this.#hoveredIndex && !isSelected;
 
+			let rowStr: string;
 			if (listItem.type === "master") {
-				rows.push(this.#renderMasterSwitch(listItem, isSelected, rowWidth));
+				rowStr = this.#renderMasterSwitch(listItem, isSelected, rowWidth);
 			} else if (listItem.type === "kind-header") {
-				rows.push(this.#renderKindHeader(listItem, isSelected, rowWidth));
+				rowStr = this.#renderKindHeader(listItem, isSelected, rowWidth);
 			} else {
-				rows.push(this.#renderExtensionRow(listItem.item, isSelected, rowWidth, masterDisabled));
+				rowStr = this.#renderExtensionRow(listItem.item, isSelected, rowWidth, masterDisabled);
 			}
+			if (isHovered) rowStr = theme.bg("selectedBg", rowStr);
+			rows.push(rowStr);
 		}
+		this.#visibleCount = rows.length;
 
-		const sv = new ScrollView(rows, {
-			height: rows.length,
-			scrollbar: "auto",
-			totalRows: this.#listItems.length,
-			theme: { track: t => theme.fg("muted", t), thumb: t => theme.fg("accent", t) },
-		});
-		sv.setScrollOffset(this.#scrollOffset);
-		lines.push(...sv.render(width));
+		lines.push(
+			...renderScrollableList(rows, {
+				width,
+				totalRows: this.#listItems.length,
+				scrollOffset: this.#scrollOffset,
+			}),
+		);
 
 		return lines;
 	}
@@ -201,14 +229,22 @@ export class ExtensionList implements Component {
 	}
 
 	#renderExtensionRow(ext: Extension, isSelected: boolean, width: number, masterDisabled: boolean): string {
-		// When master is disabled, all items appear dimmed
+		const shadowed = isShadowedExtension(ext);
 		const effectivelyDisabled = masterDisabled || ext.state === "disabled";
+		const mcpSnap =
+			ext.kind === "mcp" && isDiscoveredMcpServer(ext.raw) && !shadowed
+				? snapshotMcpRuntime(ext.raw, this.#mcpSource, {
+						enabled: !effectivelyDisabled,
+						shadowed: false,
+					})
+				: undefined;
 
-		// Status icon
-		const stateIcon = this.#getStateIcon(ext.state, masterDisabled);
-
-		// Name
-		let name = ext.displayName;
+		const stateIcon = shadowed
+			? this.#getStateIcon("shadowed", masterDisabled)
+			: mcpSnap
+				? this.#getMcpHealthIcon(mcpSnap.health, masterDisabled)
+				: this.#getStateIcon(ext.state, masterDisabled);
+		let name = sanitizeDisplayLine(ext.displayName);
 		const nameWidth = Math.min(24, width - 16);
 
 		// Build the line with indentation (visually "inside" the master switch)
@@ -218,7 +254,7 @@ export class ExtensionList implements Component {
 			name = theme.bold(theme.fg("accent", name));
 		} else if (effectivelyDisabled) {
 			name = theme.fg("dim", name);
-		} else if (ext.state === "shadowed") {
+		} else if (shadowed) {
 			name = theme.fg("warning", name);
 		}
 
@@ -226,12 +262,20 @@ export class ExtensionList implements Component {
 		const namePadded = this.#padText(name, nameWidth);
 		line += namePadded;
 
-		// Trigger hint
-		if (ext.trigger) {
-			const triggerStyle = effectivelyDisabled ? "dim" : "muted";
+		const hint = mcpSnap
+			? joinListHints(formatMcpListHint(mcpSnap), projectListHint(ext))
+			: formatExtensionListHint(ext, ext.kind === "tool" ? liveToolsForExtension(ext, this.#toolFrame) : []);
+		if (hint) {
+			const triggerStyle = effectivelyDisabled
+				? "dim"
+				: mcpSnap?.health === "disconnected" || mcpSnap?.health === "inactive"
+					? mcpSnap.health === "inactive"
+						? "warning"
+						: "dim"
+					: "muted";
 			const remainingWidth = width - visibleWidth(line) - 2;
 			if (remainingWidth > 5) {
-				line += `  ${truncateToWidth(theme.fg(triggerStyle as "dim" | "muted", ext.trigger), remainingWidth)}`;
+				line += `  ${truncateToWidth(theme.fg(triggerStyle, sanitizeDisplayLine(hint)), remainingWidth)}`;
 			}
 		}
 
@@ -281,6 +325,22 @@ export class ExtensionList implements Component {
 				return theme.fg("dim", theme.status.disabled);
 			case "shadowed":
 				return theme.fg("warning", theme.status.shadowed);
+		}
+	}
+
+	#getMcpHealthIcon(health: MCPConnectionHealth, masterDisabled: boolean): string {
+		if (masterDisabled) {
+			return theme.fg("dim", theme.status.disabled);
+		}
+		switch (health) {
+			case "connected":
+				return theme.fg("success", theme.status.enabled);
+			case "connecting":
+				return theme.fg("muted", theme.status.running);
+			case "disconnected":
+				return theme.fg("dim", theme.status.shadowed);
+			case "inactive":
+				return theme.fg("warning", theme.status.disabled);
 		}
 	}
 
@@ -391,65 +451,79 @@ export class ExtensionList implements Component {
 	}
 
 	#clampSelection(): void {
-		if (this.#listItems.length === 0) {
-			this.#selectedIndex = 0;
-			this.#scrollOffset = 0;
+		const next = clampSelection(this.#selectedIndex, this.#scrollOffset, this.#listItems.length, this.#maxVisible);
+		this.#selectedIndex = next.selectedIndex;
+		this.#scrollOffset = next.scrollOffset;
+	}
+
+	/** Toggle the selected item, or flip the provider master switch when on it. */
+	#activateSelected(): void {
+		const item = this.#listItems[this.#selectedIndex];
+		if (item?.type === "master") {
+			this.callbacks.onMasterToggle?.(item.providerId);
+		} else if (item?.type === "extension") {
+			// Shadowed same-name rows share the winner's id (`mcp:github`).
+			// Toggling them would mutate whichever config `find(id)` hits first.
+			if (isShadowedExtension(item.item)) return;
+			const masterDisabled = this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
+			if (!masterDisabled) {
+				const newEnabled = item.item.state === "disabled";
+				this.callbacks.onToggle?.(item.item.id, newEnabled);
+			}
+		}
+	}
+
+	/** Highlight the row under the pointer (null clears). */
+	setHoverIndex(index: number | null): void {
+		this.#hoveredIndex = index;
+	}
+
+	/**
+	 * Map a 0-based line within this component's render to the absolute list-item
+	 * index, or null when the line is the search banner, a padding row, or outside
+	 * the visible window. The first two lines are the search banner and a blank
+	 * separator; item rows follow, windowed at the current scroll offset.
+	 */
+	hitTest(line: number): number | null {
+		const rowLine = line - 2;
+		if (rowLine < 0 || rowLine >= this.#visibleCount) return null;
+		const index = this.#scrollOffset + rowLine;
+		return index < this.#listItems.length ? index : null;
+	}
+
+	/** Wheel notch: move the selection (and the inspector) one row. */
+	handleWheel(delta: -1 | 1): void {
+		if (delta < 0) this.#moveSelectionUp();
+		else this.#moveSelectionDown();
+	}
+
+	/** Click: select the row under the pointer, or activate it when already selected. */
+	handleClick(line: number): void {
+		const index = this.hitTest(line);
+		if (index === null) return;
+		if (index === this.#selectedIndex) {
+			this.#activateSelected();
 			return;
 		}
-
-		this.#selectedIndex = Math.min(this.#selectedIndex, this.#listItems.length - 1);
-		this.#selectedIndex = Math.max(0, this.#selectedIndex);
-
-		// Adjust scroll offset
-		if (this.#selectedIndex < this.#scrollOffset) {
-			this.#scrollOffset = this.#selectedIndex;
-		} else if (this.#selectedIndex >= this.#scrollOffset + this.#maxVisible) {
-			this.#scrollOffset = this.#selectedIndex - this.#maxVisible + 1;
-		}
+		this.#selectedIndex = index;
+		this.#notifySelectionChange();
 	}
 
 	handleInput(data: string): void {
 		// Navigation
-		if (matchesSelectUp(data) || data === "k") {
+		if (matchesSelectUp(data) || matchesKey(data, "k")) {
 			this.#moveSelectionUp();
 			return;
 		}
 
-		if (matchesSelectDown(data) || data === "j") {
+		if (matchesSelectDown(data) || matchesKey(data, "j")) {
 			this.#moveSelectionDown();
 			return;
 		}
 
-		// Space: Toggle selected item
-		if (data === " ") {
-			const item = this.#listItems[this.#selectedIndex];
-			if (item?.type === "master") {
-				this.callbacks.onMasterToggle?.(item.providerId);
-			} else if (item?.type === "extension") {
-				// Only allow toggling if master is enabled
-				const masterDisabled =
-					this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
-				if (!masterDisabled) {
-					const newEnabled = item.item.state === "disabled";
-					this.callbacks.onToggle?.(item.item.id, newEnabled);
-				}
-			}
-			return;
-		}
-
-		// Enter: Same as space - toggle selected item
-		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
-			const item = this.#listItems[this.#selectedIndex];
-			if (item?.type === "master") {
-				this.callbacks.onMasterToggle?.(item.providerId);
-			} else if (item?.type === "extension") {
-				const masterDisabled =
-					this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
-				if (!masterDisabled) {
-					const newEnabled = item.item.state === "disabled";
-					this.callbacks.onToggle?.(item.item.id, newEnabled);
-				}
-			}
+		// Space or Enter: activate the selected row (toggle item / master switch)
+		if (data === " " || matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			this.#activateSelected();
 			return;
 		}
 
@@ -462,16 +536,9 @@ export class ExtensionList implements Component {
 		}
 
 		// Printable characters -> search
-		const printableText = extractPrintableText(data);
-		if (printableText && printableText.length === 1) {
-			const printableCharCode = printableText.charCodeAt(0);
-			if (printableCharCode > 32 && printableCharCode < 127) {
-				if (printableText === "j" || printableText === "k") {
-					return;
-				}
-				this.setSearchQuery(this.#searchQuery + printableText);
-				return;
-			}
+		const char = searchableChar(data);
+		if (char !== null) {
+			this.setSearchQuery(this.#searchQuery + char);
 		}
 	}
 

@@ -1,12 +1,36 @@
 import type { Component } from "../tui";
-import { applyBackgroundToLine, getPaddingX, padding, visibleWidth } from "../utils";
+import {
+	getPaddingX,
+	getPublishedLineWidths,
+	getWidthConfigEpoch,
+	padding,
+	publishLineWidths,
+	visibleWidth,
+} from "../utils";
 
 type Cache = {
 	width: number;
+	widthEpoch: number;
 	bgSample: string | undefined;
+	borderSample: string | undefined;
 	childLines: (readonly string[])[];
+	childWidths: (readonly number[] | undefined)[];
+	childSnapshots: (readonly string[] | undefined)[];
 	result: string[];
 };
+
+/** Box-drawing glyphs plus an optional colorizer for an outline drawn around a {@link Box}. */
+export interface BoxBorder {
+	chars: {
+		topLeft: string;
+		topRight: string;
+		bottomLeft: string;
+		bottomRight: string;
+		horizontal: string;
+		vertical: string;
+	};
+	color?: (text: string) => string;
+}
 
 /**
  * Box component - a container that applies padding and background to all children
@@ -16,6 +40,7 @@ export class Box implements Component {
 	#paddingX: number;
 	#paddingY: number;
 	#bgFn?: (text: string) => string;
+	#border?: BoxBorder;
 
 	#ignoreTight = false;
 
@@ -28,10 +53,11 @@ export class Box implements Component {
 	// Cache for rendered output
 	#cached?: Cache;
 
-	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
+	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string, border?: BoxBorder) {
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#bgFn = bgFn;
+		this.#border = border;
 	}
 
 	addChild(component: Component): void {
@@ -72,6 +98,11 @@ export class Box implements Component {
 		// Don't invalidate here - we'll detect bgFn changes by sampling output
 	}
 
+	setBorder(border?: BoxBorder): void {
+		this.#border = border;
+		this.#invalidateCache();
+	}
+
 	#invalidateCache(): void {
 		this.#cached = undefined;
 	}
@@ -87,62 +118,119 @@ export class Box implements Component {
 		const children = this.children;
 		const count = children.length;
 		const paddingX = this.#ignoreTight ? this.#paddingX : getPaddingX(this.#paddingX);
-		const contentWidth = Math.max(1, width - paddingX * 2);
-		// bgFn output can change without the function reference changing (theme
-		// mutation); sample it so a silent palette swap still misses the cache.
+		// A border eats one column on each side; skip it unless the interior can still
+		// hold the horizontal padding plus at least one content column, so a bordered
+		// Box never overflows the width it was given.
+		const border = this.#border && width - 2 >= paddingX * 2 + 1 ? this.#border : undefined;
+		const innerWidth = border ? width - 2 : width;
+		const contentWidth = Math.max(1, innerWidth - paddingX * 2);
+		// bgFn / border output can change without the function reference changing
+		// (theme mutation); sample both so a silent palette swap still misses the cache.
 		const bgSample = this.#bgFn ? this.#bgFn("test") : undefined;
+		const borderSample = border
+			? `${border.color ? border.color("|") : "|"}${border.chars.topLeft}${border.chars.vertical}`
+			: undefined;
 
 		// Render every child every frame (renders may carry side effects); the
-		// memo only skips re-deriving the padded/background rows. Per the
-		// Component render contract, identical child array references prove the
-		// content is unchanged.
+		// memo only skips re-deriving the padded/background rows.
+		const widthEpoch = getWidthConfigEpoch();
+		let contentRows = 0;
+		const childLines = children.map(child => {
+			const lines = child.render(contentWidth);
+			contentRows += lines.length;
+			return lines;
+		});
+		const childWidths = childLines.map(lines => getPublishedLineWidths(lines));
 		const cached = this.#cached;
-		let unchanged =
+		if (
 			cached !== undefined &&
 			cached.width === width &&
+			cached.widthEpoch === widthEpoch &&
+			cached.widthEpoch === getWidthConfigEpoch() &&
 			cached.bgSample === bgSample &&
-			cached.childLines.length === count;
-		const childLines: (readonly string[])[] = new Array(count);
-		let contentRows = 0;
-		for (let i = 0; i < count; i++) {
-			const lines = children[i]!.render(contentWidth);
-			childLines[i] = lines;
-			contentRows += lines.length;
-			if (unchanged && cached!.childLines[i] !== lines) unchanged = false;
+			cached.borderSample === borderSample &&
+			cached.childLines.length === count &&
+			childLines.every((lines, i) => {
+				if (cached.childLines[i] !== lines) return false;
+				const published = childWidths[i];
+				const cachedPublished = cached.childWidths[i];
+				if (published !== undefined || cachedPublished !== undefined) {
+					return published === cachedPublished;
+				}
+				const snapshot = cached.childSnapshots[i];
+				return (
+					snapshot !== undefined &&
+					snapshot.length === lines.length &&
+					lines.every((line, j) => snapshot[j] === line)
+				);
+			})
+		) {
+			return cached.result;
 		}
-		if (unchanged) return cached!.result;
 
 		const result: string[] = [];
+		// Exact visible widths of `result` rows, published only when the row
+		// bytes are `content + spaces` (no bg/border transform of unknown width).
+		const resultWidths: number[] | undefined = !border && !this.#bgFn ? [] : undefined;
 		if (contentRows > 0) {
 			const leftPad = padding(paddingX);
+			const interior: string[] = [];
+			const pushRow = (row: string, visLen: number): void => {
+				const padNeeded = Math.max(0, innerWidth - visLen);
+				const padded = padNeeded > 0 ? row + padding(padNeeded) : row;
+				interior.push(this.#bgFn ? this.#bgFn(padded) : padded);
+				resultWidths?.push(visLen + padNeeded);
+			};
 			// Top padding
 			for (let i = 0; i < this.#paddingY; i++) {
-				result.push(this.#applyBg("", width));
+				pushRow("", 0);
 			}
 			// Content
+			let childIndex = 0;
 			for (const lines of childLines) {
-				for (const line of lines) {
-					result.push(this.#applyBg(leftPad + line, width));
+				const widths = childWidths[childIndex++];
+				for (let j = 0; j < lines.length; j++) {
+					const line = lines[j] ?? "";
+					const row = paddingX > 0 ? leftPad + line : line;
+					const carried = widths?.[j];
+					const visLen = carried !== undefined && paddingX === 0 ? carried : visibleWidth(row);
+					pushRow(row, visLen);
 				}
 			}
 			// Bottom padding
 			for (let i = 0; i < this.#paddingY; i++) {
-				result.push(this.#applyBg("", width));
+				pushRow("", 0);
+			}
+
+			if (border) {
+				const paint = border.color ?? (s => s);
+				const rule = border.chars.horizontal.repeat(Math.max(0, innerWidth));
+				const side = paint(border.chars.vertical);
+				result.push(paint(border.chars.topLeft + rule + border.chars.topRight));
+				for (const row of interior) {
+					result.push(side + row + side);
+				}
+				result.push(paint(border.chars.bottomLeft + rule + border.chars.bottomRight));
+			} else {
+				for (const row of interior) {
+					result.push(row);
+				}
 			}
 		}
 
-		this.#cached = { width, bgSample, childLines, result };
+		const finalWidthEpoch = getWidthConfigEpoch();
+		if (resultWidths !== undefined) publishLineWidths(result, resultWidths);
+		const childSnapshots = childLines.map((lines, i) => (childWidths[i] === undefined ? [...lines] : undefined));
+		this.#cached = {
+			width,
+			widthEpoch: finalWidthEpoch,
+			bgSample,
+			borderSample,
+			childLines,
+			childWidths,
+			childSnapshots,
+			result,
+		};
 		return result;
-	}
-
-	#applyBg(line: string, width: number): string {
-		const visLen = visibleWidth(line);
-		const padNeeded = Math.max(0, width - visLen);
-		const padded = line + padding(padNeeded);
-
-		if (this.#bgFn) {
-			return applyBackgroundToLine(padded, width, this.#bgFn);
-		}
-		return padded;
 	}
 }

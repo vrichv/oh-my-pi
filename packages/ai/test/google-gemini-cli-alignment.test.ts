@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as geminiCliProvider from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import {
-	ANTIGRAVITY_SYSTEM_INSTRUCTION,
 	buildRequest,
 	parseGeminiCliCredentials,
 	shouldRefreshGeminiCliCredentials,
@@ -129,6 +128,18 @@ describe("Google Gemini CLI alignment", () => {
 		});
 	});
 
+	it("keeps projectId alias precedence and tolerates a mistyped projectId", () => {
+		// projectId wins over project_id even when it is an empty string.
+		const emptyPrimary = parseGeminiCliCredentials(
+			JSON.stringify({ token: "t", projectId: "", project_id: "fallback" }),
+		);
+		expect(emptyPrimary.projectId).toBe("");
+
+		// A non-string projectId is dropped, so project_id is used instead.
+		const mistyped = parseGeminiCliCredentials(JSON.stringify({ token: "t", projectId: 42, project_id: "fallback" }));
+		expect(mistyped.projectId).toBe("fallback");
+	});
+
 	it("avoids excessive antigravity refresh churn with pre-buffered OAuth expiry", () => {
 		const issuedAt = 1_700_000_000_000;
 		const preBufferedExpiry = issuedAt + 55 * 60 * 1000;
@@ -142,6 +153,7 @@ describe("Google Gemini CLI alignment", () => {
 		expect(shouldRefreshGeminiCliCredentials).toBe(geminiCliProvider.shouldRefreshGeminiCliCredentials);
 		expect(Object.hasOwn(geminiCliProvider, "refreshGeminiCliCredentialsIfNeeded")).toBe(false);
 	});
+
 	it("omits antigravity-only metadata in non-antigravity request payloads", () => {
 		const model = createModel("google-gemini-cli");
 		const payload = buildRequest(model, createContext(), "proj-123", {}, false) as {
@@ -176,9 +188,70 @@ describe("Google Gemini CLI alignment", () => {
 		expect(payload.request.contents).toEqual([{ role: "user", parts: [{ text: "implement token refresh" }] }]);
 	});
 
+	it("drops only unsigned thinking when replaying Antigravity Claude history", () => {
+		const signedThinking = "signed reasoning";
+		const unsignedThinking = "unsigned reasoning";
+		const signature = "c2lnbmVk";
+		const createThinkingContext = (model: Model<"google-gemini-cli">): Context => ({
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: signedThinking, thinkingSignature: signature },
+						{ type: "thinking", thinking: unsignedThinking },
+					],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+				{ role: "user", content: "continue", timestamp: 2 },
+			],
+		});
+		const claudeModel = buildModel({
+			...createModel("google-antigravity"),
+			id: "claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			reasoning: true,
+		} as ModelSpec<"google-gemini-cli">);
+		const claudePayload = buildRequest(claudeModel, createThinkingContext(claudeModel), "proj-123", {}, true) as {
+			request: {
+				contents: Array<{
+					role: string;
+					parts: Array<{ text?: string; thought?: boolean; thoughtSignature?: string }>;
+				}>;
+			};
+		};
+		const claudeParts = claudePayload.request.contents.find(content => content.role === "model")?.parts;
+		expect(claudeParts).toEqual([{ thought: true, text: signedThinking, thoughtSignature: signature }]);
+
+		const geminiModel = createModel("google-antigravity");
+		const geminiPayload = buildRequest(geminiModel, createThinkingContext(geminiModel), "proj-123", {}, true) as {
+			request: {
+				contents: Array<{
+					role: string;
+					parts: Array<{ text?: string; thought?: boolean; thoughtSignature?: string }>;
+				}>;
+			};
+		};
+		const geminiParts = geminiPayload.request.contents.find(content => content.role === "model")?.parts ?? [];
+		expect(geminiParts).toContainEqual({ thought: true, text: signedThinking, thoughtSignature: signature });
+		expect(geminiParts.some(part => part.text?.includes(unsignedThinking))).toBe(true);
+	});
+
 	it("keeps antigravity metadata in antigravity request payloads", () => {
 		const model = createModel("google-antigravity");
-		const payload = buildRequest(model, createContext(), "proj-123", {}, true) as {
+		const context: Context = { ...createContext(), systemPrompt: ["be terse"] };
+		const payload = buildRequest(model, context, "proj-123", {}, true) as {
 			request: {
 				sessionId?: string;
 				labels?: Record<string, string>;
@@ -219,6 +292,24 @@ describe("Google Gemini CLI alignment", () => {
 		expect(payload.model).toBe("gemini-3.5-flash-low");
 		expect(payload.request.generationConfig?.maxOutputTokens).toBe(65536);
 		expect(payload.request.labels?.model_enum).toBe("MODEL_PLACEHOLDER_M20");
+	});
+
+	it("caps Claude maxOutputTokens at 64000 and omits the unset model_enum label", () => {
+		// Regression for #3067: discovery may advertise 65536, but
+		// `daily-cloudcode-pa` 400s when Claude requests exceed 64000.
+		// The Claude profiles also lack a captured model_enum token, so
+		// the request must not emit a stale or placeholder label.
+		const cases = [{ requestModelId: "claude-sonnet-4-6" }, { requestModelId: "claude-opus-4-6-thinking" }];
+		for (const opts of cases) {
+			const payload = buildRequest(createModel("google-antigravity"), createContext(), "proj-123", opts, true) as {
+				model?: string;
+				request: { generationConfig?: { maxOutputTokens?: number }; labels?: Record<string, string> };
+			};
+
+			expect(payload.model).toBe(opts.requestModelId);
+			expect(payload.request.generationConfig?.maxOutputTokens).toBe(64000);
+			expect(payload.request.labels?.model_enum).toBeUndefined();
+		}
 	});
 
 	it("defaults antigravity tools to VALIDATED but omits AUTO toolConfig for plain gemini-cli", () => {
@@ -293,30 +384,6 @@ describe("Google Gemini CLI alignment", () => {
 		expect(parameters).toBeDefined();
 		expect(JSON.stringify(parameters)).not.toContain('"patternProperties"');
 	});
-	it("injects ANTIGRAVITY_SYSTEM_INSTRUCTION for gemini-3.1-pro-high and gemini-3.1-pro-low", () => {
-		// Regression test for #1274: shouldInjectAntigravitySystemInstruction checked
-		// "gemini-3-pro-high" (hyphen) but the deployed model IDs use "gemini-3.1-pro-high" (dot),
-		// so the injection was silently skipped and the Cloud Code Assist API returned HTTP 400.
-		for (const modelId of ["gemini-3.1-pro-high", "gemini-3.1-pro-low"] as const) {
-			const model: Model<"google-gemini-cli"> = buildModel({
-				...createModel("google-antigravity"),
-				id: modelId,
-			} as ModelSpec<"google-gemini-cli">);
-			const context: Context = {
-				systemPrompt: ["my instructions"],
-				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
-			};
-			const payload = buildRequest(model, context, "proj-123", {}, true) as {
-				request: { systemInstruction?: { role?: string; parts: Array<{ text: string }> } };
-			};
-
-			const parts = payload.request.systemInstruction?.parts ?? [];
-			// The antigravity identity header must be injected as the first part.
-			expect(parts[0]?.text).toBe(ANTIGRAVITY_SYSTEM_INSTRUCTION);
-			// The user-supplied system prompt must appear after the single injected part.
-			expect(parts.slice(1).some(p => p.text === "my instructions")).toBe(true);
-		}
-	});
 	it("adds anthropic-beta for Antigravity Claude reasoning models without relying on id suffix", async () => {
 		let requestHeaders: Headers | undefined;
 		const fetchMock: FetchImpl = async (_url, init) => {
@@ -337,7 +404,6 @@ describe("Google Gemini CLI alignment", () => {
 		}).result();
 
 		expect(result.stopReason).toBe("error");
-		expect(requestHeaders).toBeDefined();
 		expect(requestHeaders!.get("anthropic-beta")).toBe("interleaved-thinking-2025-05-14");
 		expect(requestHeaders!.get("X-Goog-Api-Client")).toBeNull();
 		expect(requestHeaders!.get("Client-Metadata")).toBeNull();
@@ -356,7 +422,6 @@ describe("Google Gemini CLI alignment", () => {
 			fetch: fetchMock,
 		}).result();
 
-		expect(requestHeaders).toBeDefined();
 		expect(requestHeaders!.get("User-Agent")).toMatch(/^antigravity\/hub\/[0-9.]+ /);
 	});
 
@@ -372,7 +437,7 @@ describe("Google Gemini CLI alignment", () => {
 					const encoder = new TextEncoder();
 					for (const chunk of sseChunks) {
 						controller.enqueue(encoder.encode(chunk));
-						await Bun.sleep(5);
+						await Promise.resolve();
 					}
 					controller.close();
 				},
@@ -435,7 +500,7 @@ describe("Google Gemini CLI alignment", () => {
 					const encoder = new TextEncoder();
 					for (const chunk of sseChunks) {
 						controller.enqueue(encoder.encode(chunk));
-						await Bun.sleep(5);
+						await Promise.resolve();
 					}
 					controller.close();
 				},
@@ -523,6 +588,373 @@ describe("Google Gemini CLI alignment", () => {
 			expect(fetchCalls).toBe(1);
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("Cloud Code Assist API error (503)");
+		});
+	});
+
+	describe("planning leak interception", () => {
+		it("intercepts a fragmented planning leak and retries after discarding it", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n"}]}}]}}\n\n',
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"  \\"thought\\": \\"let us do something\\",\\n"}]}}]}}\n\n',
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"  \\"call\\": \\"read\\",\\n  \\"paths\\": [\\"src/main.ts\\"]\\n}"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+
+			let fetchCalls = 0;
+			const fetchMock: FetchImpl = async () => {
+				fetchCalls += 1;
+				const chunks =
+					fetchCalls === 1
+						? sseChunks
+						: [
+								'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Recovered."}]},"finishReason":"STOP"}]}}\n\n',
+							];
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of chunks) {
+							controller.enqueue(encoder.encode(chunk));
+							await Promise.resolve();
+						}
+						controller.close();
+					},
+				});
+				const response = new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+				Object.defineProperty(response, "url", {
+					value: "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+				});
+				return response;
+			};
+
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+
+			expect(fetchCalls).toBe(2);
+			expect(result.content).toEqual([{ type: "text", text: "Recovered." }]);
+			expect(result.stopReason).toBe("stop");
+
+			const textDeltaEvents = events.filter(e => e.type === "text_delta");
+			expect(textDeltaEvents).toHaveLength(1);
+			expect(textDeltaEvents[0].delta).toBe("Recovered.");
+		});
+
+		it("does not intercept normal JSON starting with { and releases it", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n"}]}}]}}\n\n',
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"  \\"some\\": \\"normal json\\"\\n}"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+							await Promise.resolve();
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0]).toEqual({
+				type: "text",
+				text: '{\n  "some": "normal json"\n}',
+			});
+
+			const textDeltaEvents = events.filter(e => e.type === "text_delta");
+			expect(textDeltaEvents.length).toBeGreaterThan(0);
+		});
+
+		it("releases buffer immediately if prefix does not match thought within 100 chars", async () => {
+			const longNonThoughtKey = `{${"a".repeat(105)}}`;
+			const sseChunks = [
+				`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"${longNonThoughtKey}"}]},"finishReason":"STOP"}]}}\n\n`,
+			];
+
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+							await Promise.resolve();
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+
+			expect(result.content).toHaveLength(1);
+			const block = result.content[0];
+			if (block.type !== "text") throw new Error("expected text content");
+			expect(block.text).toBe(longNonThoughtKey);
+
+			const textDeltaEvents = events.filter(e => e.type === "text_delta");
+			expect(textDeltaEvents).toHaveLength(1);
+			expect(textDeltaEvents[0].delta).toBe(longNonThoughtKey);
+		});
+
+		it("preserves visible suffix after a leaked planning object", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"The user asked for a rewrite\\"\\n}好的，我来复述这段文本。"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0]).toEqual({
+				type: "text",
+				text: "好的，我来复述这段文本。",
+			});
+		});
+
+		it("does not swallow a visible suffix that itself contains }", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"plan\\",\\n  \\"call\\": \\"read\\"\\n}示例里保留这个右花括号 } 以及后面的正文"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0]).toEqual({
+				type: "text",
+				text: "示例里保留这个右花括号 } 以及后面的正文",
+			});
+		});
+
+		it("does not erase already-emitted text when a later chunk starts with a leaked planning object", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"先说明一下："}]}}]}}\n\n',
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"plan\\"\\n}真正答案"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0]).toEqual({
+				type: "text",
+				text: "先说明一下：真正答案",
+			});
+		});
+
+		it("handles functionCall immediately after a planning leak", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"doing reading\\",\\n  \\"call\\": \\"read\\",\\n  \\"paths\\": [\\"src/main.ts\\"]\\n}"}]}}]}}\n\n',
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"path":"src/main.ts"}}}]},"finishReason":"STOP"}]}}\n\n',
+			];
+
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+							await Promise.resolve();
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0].type).toBe("toolCall");
+			if (result.content[0].type === "toolCall") {
+				expect(result.content[0].name).toBe("read");
+				expect(result.content[0].arguments).toEqual({ path: "src/main.ts" });
+			}
+
+			expect(events.filter(e => e.type === "toolcall_start")).toHaveLength(1);
+		});
+
+		it("handles unescaped quotes in leak with trailing response", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"He said \\"hello\\" to me\\"\\n}好的，我来复述这段文本。"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+			expect(result.content).toHaveLength(1);
+			expect(result.content[0]).toEqual({
+				type: "text",
+				text: "好的，我来复述这段文本。",
+			});
+		});
+
+		it("discards incomplete planning leak with unescaped quotes at EOF", async () => {
+			const sseChunks = [
+				'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"{\\n  \\"thought\\": \\"incomplete thought with \\"unescaped quotes\\" inside"}]},"finishReason":"STOP"}]}}\n\n',
+			];
+			const fetchMock: FetchImpl = async () => {
+				const stream = new ReadableStream({
+					async start(controller) {
+						const encoder = new TextEncoder();
+						for (const chunk of sseChunks) {
+							controller.enqueue(encoder.encode(chunk));
+						}
+						controller.close();
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				});
+			};
+			const model = createModel("google-gemini-cli");
+			const events: AssistantMessageEvent[] = [];
+			const stream = streamGoogleGeminiCli(model, createContext(), {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+			});
+			for await (const event of stream) {
+				events.push(event);
+			}
+			const result = await stream.result();
+			expect(result.content).toHaveLength(0);
 		});
 	});
 });

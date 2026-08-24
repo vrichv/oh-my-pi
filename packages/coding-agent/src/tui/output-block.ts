@@ -17,6 +17,7 @@ export interface OutputBlockOptions {
 	width: number;
 	applyBg?: boolean;
 	contentPaddingLeft?: number;
+	contentPaddingRight?: number;
 	/** Override the state-derived border color. Used for muted "legacy" tool
 	 * frames that should not visually compete with framed-output tools. */
 	borderColor?: ThemeColor;
@@ -46,10 +47,26 @@ function normalizeContentPaddingLeft(value: number | undefined): number {
 	return Math.max(0, Math.floor(value));
 }
 
+/**
+ * Inner content width that {@link renderOutputBlock} wraps its body to, for a
+ * given outer `width`: both vertical borders plus symmetric content padding.
+ * An explicit left padding of zero keeps legacy flush blocks flush on both
+ * sides unless a right padding is provided separately.
+ */
+export function outputBlockContentWidth(
+	width: number,
+	contentPaddingLeft?: number,
+	contentPaddingRight?: number,
+): number {
+	const left = normalizeContentPaddingLeft(contentPaddingLeft);
+	const right = normalizeContentPaddingLeft(contentPaddingRight ?? left);
+	return Math.max(1, width - 2 - left - right);
+}
+
 export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): string[] {
 	const { header, headerMeta, state, sections = [], width, applyBg = true } = options;
-	const h = theme.boxSharp.horizontal;
-	const v = theme.boxSharp.vertical;
+	const h = theme.boxRound.horizontal;
+	const v = theme.boxRound.vertical;
 	const cap = h.repeat(3);
 	const lineWidth = Math.max(0, width);
 	// Border colors: running/pending use accent, success uses dim (gray), error/warning keep their colors
@@ -77,15 +94,20 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 	})();
 
 	const contentPaddingLeft = normalizeContentPaddingLeft(options.contentPaddingLeft);
-	const contentWidth = Math.max(0, lineWidth - visibleWidth(v) - contentPaddingLeft - visibleWidth(v));
+	const contentPaddingRight = normalizeContentPaddingLeft(options.contentPaddingRight ?? contentPaddingLeft);
+	const contentWidth = Math.max(
+		0,
+		lineWidth - visibleWidth(v) - contentPaddingLeft - contentPaddingRight - visibleWidth(v),
+	);
 	const contentLeftPadding = contentPaddingLeft > 0 ? padding(contentPaddingLeft) : "";
+	const contentRightPadding = contentPaddingRight > 0 ? padding(contentPaddingRight) : "";
 
 	// ── Layout pass: collect row descriptors before emitting the bordered lines. ──
 	const rows: BlockRow[] = [];
 	rows.push({
 		kind: "bar",
-		leftChar: theme.boxSharp.topLeft,
-		rightChar: theme.boxSharp.topRight,
+		leftChar: theme.boxRound.topLeft,
+		rightChar: theme.boxRound.topRight,
 		label: header,
 		meta: headerMeta,
 	});
@@ -99,15 +121,15 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 		if (section.label) {
 			rows.push({
 				kind: "bar",
-				leftChar: theme.boxSharp.teeRight,
-				rightChar: theme.boxSharp.teeLeft,
+				leftChar: theme.boxRound.teeRight,
+				rightChar: theme.boxRound.teeLeft,
 				label: section.label,
 			});
 		} else if (section.separator && sectionIndex > 0) {
 			rows.push({
 				kind: "bar",
-				leftChar: theme.boxSharp.teeRight,
-				rightChar: theme.boxSharp.teeLeft,
+				leftChar: theme.boxRound.teeRight,
+				rightChar: theme.boxRound.teeLeft,
 			});
 		}
 		const allLines = section.lines.flatMap(l => l.split("\n"));
@@ -126,7 +148,7 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 		}
 	}
 
-	rows.push({ kind: "bottom", leftChar: theme.boxSharp.bottomLeft, rightChar: theme.boxSharp.bottomRight });
+	rows.push({ kind: "bottom", leftChar: theme.boxRound.bottomLeft, rightChar: theme.boxRound.bottomRight });
 
 	const H = rows.length;
 
@@ -159,7 +181,8 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 		return `${border(leftGlyphs)}${border(fillGlyphs)}${border(rightGlyph)}`;
 	};
 
-	const renderContent = (inner: string): string => `${border(v)}${contentLeftPadding}${inner}${border(v)}`;
+	const renderContent = (inner: string): string =>
+		`${border(v)}${contentLeftPadding}${inner}${contentRightPadding}${border(v)}`;
 
 	const lines: string[] = [];
 	for (let r = 0; r < H; r++) {
@@ -204,6 +227,11 @@ export class CachedOutputBlock {
 		const h = new Hasher();
 		h.u32(options.width);
 		h.u32(normalizeContentPaddingLeft(options.contentPaddingLeft));
+		h.u32(
+			normalizeContentPaddingLeft(
+				options.contentPaddingRight ?? normalizeContentPaddingLeft(options.contentPaddingLeft),
+			),
+		);
 		h.optional(options.header);
 		h.optional(options.headerMeta);
 		h.optional(options.state);

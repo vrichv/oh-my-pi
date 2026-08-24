@@ -12,11 +12,10 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
-import type { CanonicalModelVariant } from "@oh-my-pi/pi-catalog/identity";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, getProjectDir } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
-import { type CanonicalModelQueryOptions, ModelRegistry } from "../config/model-registry";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	getModelMatchPreferences,
@@ -26,7 +25,7 @@ import {
 } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import dryBalanceBenchPrompt from "../prompts/dry-balance-bench.md" with { type: "text" };
-import { discoverAuthStorage } from "../sdk";
+import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 
 const DEFAULT_SAMPLE_COUNT = 100;
 const DEFAULT_CONCURRENCY = 32;
@@ -74,9 +73,6 @@ export interface DryBalanceModelRegistry {
 	getAll(): Model<Api>[];
 	getAvailable(): Model<Api>[];
 	getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined>;
-	getCanonicalVariants(canonicalId: string, options?: CanonicalModelQueryOptions): CanonicalModelVariant[];
-	resolveCanonicalModel?(canonicalId: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined;
-	getCanonicalId?(model: Model<Api>): string | undefined;
 }
 
 export interface DryBalanceRuntime {
@@ -218,8 +214,15 @@ function extractAccount(access: {
 	accountId?: string;
 	projectId?: string;
 	enterpriseUrl?: string;
+	orgId?: string;
+	orgName?: string;
 }): string {
-	return access.email ?? access.accountId ?? access.projectId ?? access.enterpriseUrl ?? "(unknown oauth account)";
+	const base =
+		access.email ?? access.accountId ?? access.projectId ?? access.enterpriseUrl ?? "(unknown oauth account)";
+	// Two subscriptions (orgs) can share one email — name the org so per-account
+	// bench rows stay tellable apart.
+	const org = access.orgName ?? access.orgId;
+	return org ? `${base} (${org})` : base;
 }
 
 function getBenchTargetKey(access: {
@@ -229,15 +232,18 @@ function getBenchTargetKey(access: {
 	projectId?: string;
 	enterpriseUrl?: string;
 	accessToken?: string;
+	orgId?: string;
 }): string {
-	return (
+	const base =
 		access.email ??
 		access.accountId ??
 		access.projectId ??
 		access.enterpriseUrl ??
 		(access.credentialId === undefined ? access.accessToken : `credential:${access.credentialId}`) ??
-		"(unknown oauth account)"
-	);
+		"(unknown oauth account)";
+	// Org-qualify: two org-scoped credentials under one email are two distinct
+	// benchmark targets, not duplicates.
+	return access.orgId ? `${base}|org:${access.orgId}` : base;
 }
 
 function sanitizeBenchText(text: string, width: number): string {
@@ -523,8 +529,10 @@ async function runBenchTargets(
 async function createDefaultRuntime(): Promise<DryBalanceRuntime> {
 	const authStorage = await discoverAuthStorage();
 	try {
-		const settings = await Settings.init({ cwd: getProjectDir() });
+		const cwd = getProjectDir();
+		const settings = await Settings.init({ cwd });
 		const modelRegistry = new ModelRegistry(authStorage);
+		await loadCliExtensionProviders(modelRegistry, settings, cwd);
 		return {
 			modelRegistry,
 			settings,
@@ -547,6 +555,7 @@ async function resolveDryBalanceModel(
 		const resolved = resolveCliModel({
 			cliModel: modelSelector,
 			modelRegistry,
+			settings,
 			preferences,
 		});
 		if (resolved.error) throw new Error(resolved.error);
@@ -564,7 +573,6 @@ async function resolveDryBalanceModel(
 	const defaultRoleSpec = resolveModelRoleValue(settings?.getModelRole("default"), allowedModels, {
 		settings,
 		matchPreferences: preferences,
-		modelRegistry,
 	});
 	if (defaultRoleSpec.model) {
 		return { model: defaultRoleSpec.model, warning: defaultRoleSpec.warning };

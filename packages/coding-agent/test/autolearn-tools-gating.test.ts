@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resetActiveSkillsForTests, type Skill, setActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -10,6 +11,7 @@ import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/stat
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
 function makeSession(
@@ -69,7 +71,7 @@ describe("autolearn tool gating", () => {
 		expect(noBackend).not.toContain("learn");
 	});
 
-	it("excludes the tools from a subagent even with an explicit list", async () => {
+	it("excludes the tools from a subagent when not in the explicit list", async () => {
 		// taskDepth > 0: the controller never runs here, so a subagent's explicit
 		// whitelist must not be silently widened with write-capable tools.
 		const sub = (
@@ -86,6 +88,18 @@ describe("autolearn tool gating", () => {
 		).map(t => t.name);
 		expect(subDiscovered).not.toContain("manage_skill");
 		expect(subDiscovered).not.toContain("learn");
+	});
+
+	it("allows the tools in a subagent when explicitly requested in toolNames", async () => {
+		// Frontmatter tools: list overrides the taskDepth gate.
+		const sub = (
+			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1 }), [
+				"manage_skill",
+				"learn",
+			])
+		).map(t => t.name);
+		expect(sub).toContain("manage_skill");
+		expect(sub).toContain("learn");
 	});
 
 	it("offers learn with the file-based local backend", async () => {
@@ -118,7 +132,7 @@ describe("manage_skill execute", () => {
 		spyOn(os, "homedir").mockRestore();
 		setAgentDir(originalAgentDir);
 		resetActiveSkillsForTests();
-		await fs.rm(tempHome, { recursive: true, force: true });
+		await removeWithRetries(tempHome);
 	});
 
 	const tool = () => ManageSkillTool.createIf(makeSession({ "autolearn.enabled": true }))!;
@@ -141,10 +155,10 @@ describe("manage_skill execute", () => {
 
 	it("schema rejects create/update without description+body but allows delete", () => {
 		const schema = tool().parameters;
-		expect(schema.safeParse({ action: "create", name: "x" }).success).toBe(false);
-		expect(schema.safeParse({ action: "update", name: "x", description: "d" }).success).toBe(false);
-		expect(schema.safeParse({ action: "create", name: "x", description: "d", body: "b" }).success).toBe(true);
-		expect(schema.safeParse({ action: "delete", name: "x" }).success).toBe(true);
+		expect(schema({ action: "create", name: "x" }) instanceof type.errors).toBe(true);
+		expect(schema({ action: "update", name: "x", description: "d" }) instanceof type.errors).toBe(true);
+		expect(schema({ action: "create", name: "x", description: "d", body: "b" }) instanceof type.errors).toBe(false);
+		expect(schema({ action: "delete", name: "x" }) instanceof type.errors).toBe(false);
 	});
 
 	it("refuses to create a managed skill an authored skill of the same name would shadow", async () => {
@@ -211,7 +225,7 @@ describe("learn execute", () => {
 	afterEach(async () => {
 		spyOn(os, "homedir").mockRestore();
 		setAgentDir(originalAgentDir);
-		await fs.rm(tempHome, { recursive: true, force: true });
+		await removeWithRetries(tempHome);
 	});
 
 	it("stores a lesson to memory without writing a skill when no skill payload", async () => {

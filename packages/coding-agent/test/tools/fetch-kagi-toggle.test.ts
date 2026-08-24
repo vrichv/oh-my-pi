@@ -10,7 +10,7 @@ import * as toolsManager from "@oh-my-pi/pi-coding-agent/utils/tools-manager";
 import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import * as scraperUtils from "@oh-my-pi/pi-coding-agent/web/scrapers/utils";
 import * as natives from "@oh-my-pi/pi-natives";
-import { ptree, Snowflake } from "@oh-my-pi/pi-utils";
+import { ptree, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { asGlobalFetch } from "../helpers/fetch-mock";
 
 const withMissingSystemPython = () => {
@@ -32,7 +32,7 @@ describe("read tool URL selector shorthands", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		fs.rmSync(testDir, { recursive: true, force: true });
+		removeSyncWithRetries(testDir);
 	});
 
 	const createSession = (settingsOverrides: Partial<Record<SettingPath, unknown>> = {}): ToolSession => {
@@ -125,7 +125,7 @@ describe("read tool URL handling", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		delete process.env.PARALLEL_API_KEY;
-		fs.rmSync(testDir, { recursive: true, force: true });
+		removeSyncWithRetries(testDir);
 	});
 
 	const createSession = (overrides: Partial<Record<SettingPath, unknown>> = {}): ToolSession => {
@@ -166,11 +166,6 @@ describe("read tool URL handling", () => {
 		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
 			ok: true,
 			buffer: imageBytes,
-		});
-		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
-			ok: false,
-			content: "",
-			error: "markit unavailable",
 		});
 		vi.spyOn(imageResize, "resizeImage").mockResolvedValue({
 			buffer: imageBytes,
@@ -222,11 +217,7 @@ describe("read tool URL handling", () => {
 			ok: true,
 			buffer: new Uint8Array([137, 80, 78, 71]),
 		});
-		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
-			ok: false,
-			content: "",
-			error: "markit unavailable",
-		});
+		const convertSpy = vi.spyOn(scraperUtils, "convertWithMarkit");
 
 		const result = await tool.execute("fetch-image-resized", { path: "https://example.com/image.png" });
 		const imageBlock = result.content.find(
@@ -240,52 +231,9 @@ describe("read tool URL handling", () => {
 		expect(imageBlock?.data).toBe("cmVzaXplZA==");
 		expect(textBlock?.type).toBe("text");
 		expect(textBlock?.text).toContain("displayed at 1000x500");
+		expect(convertSpy).not.toHaveBeenCalled();
 	});
 
-	it("keeps markit extracted text for image responses", async () => {
-		const session = createSession();
-		const tool = new ReadTool(session);
-		const extractedText = "Converted image text content that is definitely longer than fifty characters.";
-		vi.spyOn(imageResize, "resizeImage").mockResolvedValue({
-			buffer: new Uint8Array([1, 2, 3]),
-			mimeType: "image/png",
-			originalWidth: 100,
-			originalHeight: 100,
-			width: 100,
-			height: 100,
-			wasResized: false,
-			get data() {
-				return "aW1hZ2U=";
-			},
-		});
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "image/png",
-			finalUrl: "https://example.com/image.png",
-			content: "",
-		});
-		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
-			ok: true,
-			buffer: new Uint8Array([137, 80, 78, 71]),
-		});
-		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
-			ok: true,
-			content: extractedText,
-		});
-
-		const result = await tool.execute("fetch-image-with-ocr", { path: "https://example.com/image.png" });
-		const textBlock = result.content.find(content => content.type === "text");
-		const imageBlock = result.content.find(
-			(content): content is { type: "image"; data: string; mimeType: string } => content.type === "image",
-		);
-
-		expect(result.details?.method).toBe("image");
-		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain(extractedText);
-		expect(imageBlock?.mimeType).toBe("image/png");
-		expect(imageBlock?.data).toBe("aW1hZ2U=");
-	});
 	it("falls back to text-only output for unsupported image MIME types", async () => {
 		const session = createSession();
 		const tool = new ReadTool(session);
@@ -307,39 +255,6 @@ describe("read tool URL handling", () => {
 		expect(imageBlock).toBeUndefined();
 		expect(textBlock?.type).toBe("text");
 		expect(textBlock?.text).toContain("<svg></svg>");
-	});
-
-	it("uses binary conversion fallback for unsupported image MIME when extension is convertible", async () => {
-		const session = createSession();
-		const tool = new ReadTool(session);
-		const convertedText = "Converted image text from markit fallback with sufficient length to pass threshold.";
-		const fetchBinarySpy = vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
-			ok: true,
-			buffer: new Uint8Array([255, 216, 255, 224]),
-		});
-		const convertSpy = vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
-			ok: true,
-			content: convertedText,
-		});
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "image/jpg",
-			finalUrl: "https://example.com/image.jpg",
-			content: "\u0000\u0001garbage",
-		});
-
-		const result = await tool.execute("fetch-image-jpg-fallback", { path: "https://example.com/image.jpg" });
-		const imageBlock = result.content.find(content => content.type === "image");
-		const textBlock = result.content.find(content => content.type === "text");
-
-		expect(result.details?.method).toBe("markit");
-		expect(fetchBinarySpy).toHaveBeenCalledTimes(1);
-		expect(convertSpy).toHaveBeenCalledTimes(1);
-		expect(result.details?.notes).toContain("Attempting binary conversion fallback for unsupported image MIME type");
-		expect(imageBlock).toBeUndefined();
-		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain(convertedText);
 	});
 
 	it("does not treat text/html at .png paths as inline images", async () => {
@@ -403,11 +318,6 @@ describe("read tool URL handling", () => {
 		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
 			ok: true,
 			buffer: new Uint8Array([60, 104, 116, 109, 108]),
-		});
-		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
-			ok: false,
-			content: "",
-			error: "conversion failed",
 		});
 		vi.spyOn(imageResize, "resizeImage").mockResolvedValue({
 			buffer: new Uint8Array([60, 104, 116, 109, 108]),
@@ -648,35 +558,11 @@ describe("read tool URL handling", () => {
 		expect(htmlToMarkdownSpy).not.toHaveBeenCalled();
 	});
 
-	it("reuses cached output for repeated plain URL reads", async () => {
-		const session = createSession();
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/repeated-read-cache";
-		const loadPageSpy = vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: "Cached line 1\nCached line 2",
-		});
-
-		const firstResult = await tool.execute("fetch-cache-first", { path: pageUrl });
-		const secondResult = await tool.execute("fetch-cache-second", { path: pageUrl });
-		const firstText = firstResult.content.find(content => content.type === "text");
-		const secondText = secondResult.content.find(content => content.type === "text");
-
-		expect(firstText?.type).toBe("text");
-		expect(firstText?.text).toContain("Cached line 1");
-		expect(secondText?.type).toBe("text");
-		expect(secondText?.text).toContain("Cached line 1");
-		expect(loadPageSpy).toHaveBeenCalledTimes(1);
-	});
-
-	it("supports offset and limit for URL reads using cached output", async () => {
+	it("supports offset and limit selectors on URL reads", async () => {
 		const session = createSession();
 		const tool = new ReadTool(session);
 		const pageUrl = "https://example.com/offset-test";
-		const loadPageSpy = vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
 			ok: true,
 			status: 200,
 			contentType: "text/plain",
@@ -684,27 +570,17 @@ describe("read tool URL handling", () => {
 			content: "Line 1\nLine 2\nLine 3\nLine 4",
 		});
 
-		const firstResult = await tool.execute("fetch-offset-prime", { path: pageUrl });
-		const firstText = firstResult.content.find(content => content.type === "text");
-		expect(firstText?.type).toBe("text");
-		expect(firstText?.text).toContain("Line 1");
-		expect(loadPageSpy).toHaveBeenCalledTimes(1);
-
-		loadPageSpy.mockClear();
-		loadPageSpy.mockRejectedValue(new Error("network should not be hit"));
-
 		const pagedResult = await tool.execute("fetch-offset-page", {
 			path: `${pageUrl}:7-8`,
 		});
 		const pagedText = pagedResult.content.find(content => content.type === "text");
 		expect(pagedText?.type).toBe("text");
-		// `:7-8` selects 2 lines starting at offset 7 of the wrapped cached
+		// `:7-8` selects 2 lines starting at offset 7 of the wrapped URL
 		// output. Read tool widens the window by ±3 unanchored context lines
 		// so anchors at the boundary stay fresh, so adjacent content lines are
 		// also visible.
 		expect(pagedText?.text).toContain("Line 1");
 		expect(pagedText?.text).toContain("Line 2");
-		expect(loadPageSpy).not.toHaveBeenCalled();
 		expect(fs.readdirSync(path.join(testDir, "session")).some(file => file.endsWith(".read.log"))).toBe(true);
 	});
 });

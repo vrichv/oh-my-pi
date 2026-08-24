@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import * as skillsModule from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -37,6 +37,7 @@ function createMockSession(
 			appendSessionInit: () => {},
 		},
 		getActiveToolNames: () => ["read", "yield"],
+		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
@@ -51,9 +52,13 @@ function createMockSession(
 		},
 		sendCustomMessage: vi.fn(async () => {}),
 		waitForIdle: async () => {},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
 		abort: async () => {},
 		dispose: async () => {},
+		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
 	} as unknown as AgentSession;
 }
 
@@ -143,7 +148,7 @@ describe("autoloadSkills in executor", () => {
 			autoloadSkills: mockSkills,
 		});
 
-		const sendCustomMessage = session.sendCustomMessage as ReturnType<typeof vi.fn>;
+		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
 		expect(sendCustomMessage).toHaveBeenCalledTimes(2);
 
 		// Verify first skill
@@ -189,7 +194,7 @@ describe("autoloadSkills in executor", () => {
 
 		await runSubprocess(baseOptions);
 
-		const sendCustomMessage = session.sendCustomMessage as ReturnType<typeof vi.fn>;
+		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
 		expect(sendCustomMessage).not.toHaveBeenCalled();
 	});
 
@@ -211,7 +216,7 @@ describe("autoloadSkills in executor", () => {
 
 		await runSubprocess({ ...baseOptions, autoloadSkills: undefined });
 
-		const sendCustomMessage = session.sendCustomMessage as ReturnType<typeof vi.fn>;
+		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
 		expect(sendCustomMessage).not.toHaveBeenCalled();
 	});
 
@@ -231,7 +236,7 @@ describe("autoloadSkills in executor", () => {
 		});
 
 		// Track sendCustomMessage call order
-		(session.sendCustomMessage as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+		(session.sendCustomMessage as Mock<any>).mockImplementation(async () => {
 			callOrder.push("sendCustomMessage");
 		});
 

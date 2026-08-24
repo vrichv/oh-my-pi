@@ -1,4 +1,4 @@
-import { $env, ptree } from "@oh-my-pi/pi-utils";
+import { $env, ptree, USER_AGENT } from "@oh-my-pi/pi-utils";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, formatMediaDuration, loadPage } from "./types";
 
@@ -121,7 +121,7 @@ export async function fetchGitHubApi(
 
 		const headers: Record<string, string> = {
 			Accept: "application/vnd.github.v3+json",
-			"User-Agent": "omp-web-fetch/1.0",
+			"User-Agent": USER_AGENT,
 		};
 
 		// Use GITHUB_TOKEN if available
@@ -468,7 +468,7 @@ async function renderGitHubRepo(
 			md += `${prefix}${item.path}\n`;
 		}
 		if (tree.length > 100) {
-			md += `... and ${tree.length - 100} more files\n`;
+			md += `[…${tree.length - 100} files elided…]\n`;
 		}
 		md += "```\n\n";
 	}

@@ -3,9 +3,10 @@
  */
 
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { Tokenizer } from "../tokenizer";
 import type { AgentMessage, AgentToolCall } from "../types";
-import { estimateTokens } from "./compaction";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
+import { invalidateMessageCache } from "./message-cache";
 import {
 	collectToolCallsById,
 	isProtectedToolResult,
@@ -30,6 +31,24 @@ export interface PruneConfig {
 	supersedeKey?: SupersedeKeyFn;
 	/** Useless-flagged results bypass the protect window (see {@link USELESS_NOTICE}). Default true. */
 	pruneUseless?: boolean;
+	/**
+	 * Compaction boundary: the `firstKeptEntryId` of the latest compaction on
+	 * the branch. Entries at indices BEFORE this id are summarized away and never
+	 * sent to the model, so mutating them only churns persisted history without
+	 * shrinking the prompt — they are skipped. Undefined = no compaction (the
+	 * whole branch is sent).
+	 */
+	keepBoundaryId?: string;
+	/**
+	 * Prompt-cache guard. When set, a tool result whose all-message suffix
+	 * (tokens of every message after it) EXCEEDS this is part of the warm,
+	 * already-sent cache prefix: mutating it forces the provider to re-write the
+	 * whole suffix (cacheWrite premium). Such results — including superseded and
+	 * useless ones, which otherwise bypass {@link protectTokens} — are left for
+	 * compaction/shake (which rebuild the cache anyway) to reclaim. Undefined =
+	 * no cache guard (legacy: superseded/useless prune at any depth).
+	 */
+	cacheWarmSuffixTokens?: number;
 }
 
 export const DEFAULT_PRUNE_CONFIG: PruneConfig = {
@@ -66,10 +85,22 @@ export interface SupersedePruneConfig {
 	pruneUseless?: boolean;
 	/** Prune a candidate now when all messages after it total at most this many estimated tokens. Default 8 000. */
 	suffixTokenLimit?: number;
-	/** Prune all candidates when the last message is at least this old (prompt cache is cold anyway). Default 30 min. */
+	/**
+	 * Prune all candidates when the last message is at least this old: the
+	 * provider prompt cache is then cold, so re-writing it is free. MUST exceed
+	 * the cache retention (Anthropic "long" = 1h) or a still-warm prefix is busted
+	 * by the flush. Default 30 min — callers on long retention override it.
+	 */
 	idleFlushMs?: number;
 	/** Clock override for tests. */
 	now?: number;
+	/**
+	 * Compaction boundary (`firstKeptEntryId` of the latest compaction). Entries
+	 * before it are summarized away and never sent, so they are skipped in every
+	 * path — including the idle flush — to avoid pointless history churn.
+	 * Undefined = no compaction (the whole branch is sent).
+	 */
+	keepBoundaryId?: string;
 	/** Tool-result protection matchers (same contract as {@link PruneConfig.protectedTools}). */
 	protectedTools: ProtectedToolMatcher[];
 }
@@ -103,6 +134,35 @@ function estimatePrunedSavings(tokens: number, notice: string): number {
 	return Math.max(0, tokens - noticeTokens);
 }
 
+/**
+ * For each entry index, the estimated token total of all *message* entries
+ * strictly after it — how much prompt-cache content the provider must re-write
+ * (cacheWrite premium) if that entry is mutated in place. Used to keep prune
+ * mutations inside the cheap-to-recache tail.
+ */
+function computeMessageSuffixTokens(entries: readonly SessionEntry[], tokenizer: Tokenizer): number[] {
+	const suffix = new Array<number>(entries.length);
+	let accumulated = 0;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		suffix[i] = accumulated;
+		const entry = entries[i];
+		if (entry.type === "message") accumulated += tokenizer.countMessage(entry.message as AgentMessage);
+	}
+	return suffix;
+}
+
+/**
+ * Resolve the array index of the compaction boundary (`keepBoundaryId`). Entries
+ * before this index are summarized away by the latest compaction and never sent,
+ * so prune passes must not mutate them. Returns 0 when there is no boundary (no
+ * compaction → whole branch is sent) or the id is absent from `entries`.
+ */
+function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: string | undefined): number {
+	if (keepBoundaryId === undefined) return 0;
+	const index = entries.findIndex(entry => entry.id === keepBoundaryId);
+	return index < 0 ? 0 : index;
+}
+
 interface SupersedeCandidate {
 	entry: SessionMessageEntry;
 	message: ToolResultMessage;
@@ -121,6 +181,7 @@ interface SupersedeCandidate {
  */
 function collectSupersededResults(
 	entries: readonly SessionEntry[],
+	tokenizer: Tokenizer,
 	toolCallsById: ReadonlyMap<string, AgentToolCall>,
 	supersedeKey: SupersedeKeyFn,
 	protectedTools: readonly ProtectedToolMatcher[],
@@ -144,7 +205,7 @@ function collectSupersededResults(
 			entry: entry as SessionMessageEntry,
 			message,
 			index: i,
-			tokens: estimateTokens(message as AgentMessage),
+			tokens: tokenizer.countMessage(message as AgentMessage),
 			notice: SUPERSEDED_NOTICE,
 		});
 	}
@@ -159,6 +220,7 @@ function collectSupersededResults(
  */
 function collectUselessResults(
 	entries: readonly SessionEntry[],
+	tokenizer: Tokenizer,
 	toolCallsById: ReadonlyMap<string, AgentToolCall>,
 	protectedTools: readonly ProtectedToolMatcher[],
 	exclude: ReadonlySet<ToolResultMessage>,
@@ -170,7 +232,7 @@ function collectUselessResults(
 		if (message?.useless !== true || message.prunedAt !== undefined || message.isError === true) continue;
 		if (exclude.has(message)) continue;
 		if (isProtectedToolResult(message, toolCallsById.get(message.toolCallId), protectedTools)) continue;
-		const tokens = estimateTokens(message as AgentMessage);
+		const tokens = tokenizer.countMessage(message as AgentMessage);
 		if (estimatePrunedSavings(tokens, USELESS_NOTICE) <= 0) continue;
 		candidates.push({ entry: entry as SessionMessageEntry, message, index: i, tokens, notice: USELESS_NOTICE });
 	}
@@ -183,16 +245,21 @@ function collectUselessResults(
  * flagged contextually useless. Cheap, incremental, and prompt-cache-aware: a
  * candidate is pruned now only when the suffix after it is small (tail case —
  * the read→edit→read loop) or when the context has been idle long enough that
- * the provider cache is cold anyway (then ALL candidates flush).
+ * the provider cache is cold anyway (then all still-sent candidates flush).
+ * Never mutates entries before `keepBoundaryId` (summarized away — not sent).
  */
-export function pruneSupersededToolResults(entries: SessionEntry[], config: SupersedePruneConfig): PruneResult {
+export function pruneSupersededToolResults(
+	entries: SessionEntry[],
+	tokenizer: Tokenizer,
+	config: SupersedePruneConfig,
+): PruneResult {
 	const toolCallsById = collectToolCallsById(entries);
 	const candidates = config.supersedeKey
-		? collectSupersededResults(entries, toolCallsById, config.supersedeKey, config.protectedTools)
+		? collectSupersededResults(entries, tokenizer, toolCallsById, config.supersedeKey, config.protectedTools)
 		: [];
 	if (config.pruneUseless) {
 		const exclude = new Set(candidates.map(candidate => candidate.message));
-		candidates.push(...collectUselessResults(entries, toolCallsById, config.protectedTools, exclude));
+		candidates.push(...collectUselessResults(entries, tokenizer, toolCallsById, config.protectedTools, exclude));
 		candidates.sort((a, b) => a.index - b.index);
 	}
 	if (candidates.length === 0) return { prunedCount: 0, tokensSaved: 0 };
@@ -209,20 +276,24 @@ export function pruneSupersededToolResults(entries: SessionEntry[], config: Supe
 	const idle =
 		lastMessageTimestamp !== undefined && now - lastMessageTimestamp >= (config.idleFlushMs ?? DEFAULT_IDLE_FLUSH_MS);
 
+	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
+
 	let toPrune: SupersedeCandidate[];
 	if (idle) {
-		toPrune = candidates;
+		// Provider cache is cold (idle exceeds the retention TTL), so re-writing
+		// the sent region costs nothing. Entries before the compaction boundary
+		// are summarized away and never sent — skip them to avoid pointless churn.
+		toPrune = candidates.filter(candidate => candidate.index >= boundaryIndex);
 	} else {
 		const suffixTokenLimit = config.suffixTokenLimit ?? DEFAULT_SUFFIX_TOKEN_LIMIT;
 		// suffixTokens[i] = estimated tokens of all messages strictly after entry i.
-		const suffixTokens = new Array<number>(entries.length);
-		let accumulated = 0;
-		for (let i = entries.length - 1; i >= 0; i--) {
-			suffixTokens[i] = accumulated;
-			const entry = entries[i];
-			if (entry.type === "message") accumulated += estimateTokens(entry.message as AgentMessage);
-		}
-		toPrune = candidates.filter(candidate => suffixTokens[candidate.index] <= suffixTokenLimit);
+		// Mutating a candidate re-writes its suffix in the warm cache, so prune only
+		// when that suffix is small (cheap-to-recache tail) and the candidate sits
+		// at/after the compaction boundary.
+		const suffixTokens = computeMessageSuffixTokens(entries, tokenizer);
+		toPrune = candidates.filter(
+			candidate => candidate.index >= boundaryIndex && suffixTokens[candidate.index] <= suffixTokenLimit,
+		);
 	}
 	if (toPrune.length === 0) return { prunedCount: 0, tokensSaved: 0 };
 
@@ -231,12 +302,17 @@ export function pruneSupersededToolResults(entries: SessionEntry[], config: Supe
 	for (const candidate of toPrune) {
 		candidate.message.content = [{ type: "text", text: candidate.notice }];
 		candidate.message.prunedAt = prunedAt;
+		invalidateMessageCache(candidate.message as AgentMessage);
 		tokensSaved += estimatePrunedSavings(candidate.tokens, candidate.notice);
 	}
 	return { prunedCount: toPrune.length, tokensSaved };
 }
 
-export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {
+export function pruneToolOutputs(
+	entries: SessionEntry[],
+	tokenizer: Tokenizer,
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+): PruneResult {
 	let accumulatedTokens = 0;
 	let tokensSaved = 0;
 	let prunedCount = 0;
@@ -245,7 +321,7 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 	const toolCallsById = collectToolCallsById(entries);
 	const supersededMessages = config.supersedeKey
 		? new Set(
-				collectSupersededResults(entries, toolCallsById, config.supersedeKey, config.protectedTools).map(
+				collectSupersededResults(entries, tokenizer, toolCallsById, config.supersedeKey, config.protectedTools).map(
 					candidate => candidate.message,
 				),
 			)
@@ -255,6 +331,7 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 			? new Set(
 					collectUselessResults(
 						entries,
+						tokenizer,
 						toolCallsById,
 						config.protectedTools,
 						supersededMessages ?? new Set(),
@@ -262,12 +339,18 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 				)
 			: undefined;
 
+	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
+	const cacheWarmSuffixTokens = config.cacheWarmSuffixTokens;
+	// All-message suffix per index, only when the cache guard is armed.
+	const messageSuffix =
+		cacheWarmSuffixTokens === undefined ? undefined : computeMessageSuffixTokens(entries, tokenizer);
+
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getToolResultMessage(entry);
 		if (!message) continue;
 
-		const tokens = estimateTokens(message as AgentMessage);
+		const tokens = tokenizer.countMessage(message as AgentMessage);
 		const isProtected = isProtectedToolResult(message, toolCallsById.get(message.toolCallId), config.protectedTools);
 
 		if (message.prunedAt !== undefined) {
@@ -275,10 +358,23 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 			continue;
 		}
 
-		// Superseded and useless results are pruned first: they bypass the
-		// protect window (a stale copy of re-read content — or a result the
-		// tool itself flagged as carrying no information — is dead weight at
-		// any age).
+		// Prompt-cache guard: a result whose all-message suffix exceeds the
+		// warm-cache window sits in the already-sent cached prefix — mutating it
+		// re-writes the whole suffix (cacheWrite premium). Entries before the
+		// compaction boundary are summarized away (never sent). Both are skipped
+		// before any prune decision, so superseded/useless cannot reach a deep,
+		// still-cached copy; compaction/shake reclaim those when they rebuild.
+		const inWarmPrefix =
+			messageSuffix !== undefined && cacheWarmSuffixTokens !== undefined && messageSuffix[i] > cacheWarmSuffixTokens;
+		if (inWarmPrefix || i < boundaryIndex) {
+			accumulatedTokens += tokens;
+			continue;
+		}
+
+		// Superseded and useless results bypass the age-based protect window
+		// (a stale re-read copy, or a result the tool flagged as uninformative,
+		// is dead weight at any age) — but only within the cache-warm tail: the
+		// guard above already excluded deeper, still-cached copies.
 		const superseded = supersededMessages?.has(message) ?? false;
 		const useless = uselessMessages?.has(message) ?? false;
 		const tooSmall = tokens < MIN_PRUNE_TOKENS;
@@ -316,6 +412,7 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 				: createPrunedNotice(candidate.tokens);
 		message.content = [{ type: "text", text: notice }];
 		message.prunedAt = prunedAt;
+		invalidateMessageCache(message as AgentMessage);
 		prunedCount++;
 	}
 

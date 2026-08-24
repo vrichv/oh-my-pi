@@ -2,6 +2,139 @@
 
 ## [Unreleased]
 
+## [17.4.1] - 2026-08-21
+
+### Added
+
+- Restored `providerFrameBudget()` to allow callers to size archives according to the maximum frame budget the provider will send.
+
+### Fixed
+
+- Fixed an issue where character-based truncation could split inline base64 data URLs into corrupted payloads that were rejected by OpenAI-compatible providers. Data URLs are now replaced atomically with placeholders before truncation, and previously affected archives are healed during re-compaction.
+
+## [17.3.8] - 2026-08-19
+
+### Fixed
+
+- Fixed image-based compaction confusing digit `0` with letter `O` and corrupting compacted identifiers (e.g. Slack IDs): the default frame fonts (X.org `8x13`, `6x12`, `5x8`) drew zero as a bare oval indistinguishable from `O`. Zero now carries a disambiguating interior slash (`8x13`) or bar (`6x12`/`5x8`); unscii-8 already shipped a slashed zero ([#8713](https://github.com/can1357/oh-my-pi/issues/8713)).
+
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed Anthropic model ID parsing to be case-insensitive and extended the high-resolution 1932px frame tier to Claude Opus 5 and later, preventing sessions from falling back to lower-resolution 1568px frames and preserving full history per compaction.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed snapcompact resume guides reporting only the HQ grid width for mixed-width foveated archives ([#6712](https://github.com/can1357/oh-my-pi/issues/6712)).
+
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added an `includeThinking` serialization option (defaulting to `true`) to allow excluding assistant reasoning (`¶think:` sections) from archived transcripts.
+
+## [16.5.0] - 2026-07-13
+
+### Changed
+
+- Updated archived transcript rendering to use a more compact format with `¶user:`, `¶think:`, `¶ai:`, and `¶call:` scopes, omitting repeated adjacent scope headers and appending tool-call intents as comments.
+
+## [16.3.7] - 2026-07-05
+
+### Fixed
+
+- Fixed `resolveShapeForText(..., "auto")` to correctly select the `silver16-bw` shape for CJK-heavy transcript text while preserving explicit shape overrides.
+
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed large snapcompact archives being reconstructed into unbounded per-request image payloads by adding a frame base64 byte budget and omitting over-budget archive frames from prompt blocks. ([#3792](https://github.com/can1357/oh-my-pi/issues/3792))
+
+## [16.2.7] - 2026-06-30
+
+### Added
+
+- Added the `silver16-bw` shape backed by an embedded Silver TrueType font to support CJK and other non-Latin text.
+- Added `resolveShapeForText` to support font-aware shape resolution.
+
+### Changed
+
+- Improved non-ASCII text normalization by folding semantic emojis to ASCII labels (e.g., `[OK]`, `[WARN]`), dropping decorative emojis, and folding box-drawing symbols to ASCII skeletons.
+- Enhanced missing glyph rendering to use the embedded Silver TrueType fallback per-character, including support for East Asian wide characters across two grid cells.
+- Updated text wrapping, pagination, and provider shape geometries to support wide character footprints and updated X.org 8x13 font metrics.
+
+## [16.1.23] - 2026-06-26
+
+### Added
+
+- Added `archiveSourceText(archive)` to extract a persisted frame archive's source text as plain text for LLM summarization. ([#3561](https://github.com/can1357/oh-my-pi/pull/3561) by [@serverinspector](https://github.com/serverinspector))
+- Added `stripPreservedArchive(preserveData)` to drop the persisted frame-archive slot (`PRESERVE_KEY`) and collapse to `undefined` when no other state remains — shared by the agent and coding-agent compaction paths instead of duplicating the strip rule.
+
+## [16.1.13] - 2026-06-22
+
+### Fixed
+
+- Fixed the Umans provider image budget to match its 10-image request cap.
+
+## [16.1.8] - 2026-06-20
+
+### Breaking Changes
+
+- Changed core rendering functions `render` and `renderMany` to be asynchronous
+
+## [16.1.0] - 2026-06-19
+
+### Added
+
+- Added `historyBlocks(archive)` to reconstruct ordered history blocks from archive data
+
+### Changed
+
+- Refactored compaction to be text-sourced, re-rendering from unified `Archive.text` source
+- Implemented foveated archive layout (HQ edges, dense LQ middle) for optimized context usage
+- Raised `MAX_FRAMES_DEFAULT` to 80 and consolidated `PROVIDER_IMAGE_BUDGETS`
+- Updated OpenRouter to use standard 90-image budget
+- Updated prompt instructions to clearly distinguish between plain-text and image history regions
+- `Options.maxFrames` is now an upper limit clamped to `MAX_FRAMES_DEFAULT`, not a per-call default
+- Rewrote the resume summary prompt into a structured reading guide (turn headings, grid/two-column layout, ink notes) and render file operations inline as a `FILES` section instead of a spliced `<files>` tag
+
+### Fixed
+
+- Fixed context budget undercounting by raising `FRAME_TOKEN_ESTIMATE` to 5024
+- Improved file list formatting in compaction summaries
+
+## [16.0.11] - 2026-06-19
+
+### Changed
+
+- Refined elision markers for file operations and truncated text for better display consistency
+- Updated summary text for consistent descriptions of archived tool output
+- Folded a much wider range of Unicode to ASCII in `normalize()` before native rendering: added a per-character Unicode NFKD decomposition fallback (fullwidth forms, super/subscripts, ligatures, circled and math-styled alphanumerics, Roman numerals, vulgar fractions) and expanded the `CHAR_FOLD` punctuation table (more quotes/primes, hyphens, the fraction slash, dot leaders, bullets, and arrows) so undrawable glyphs land on close ASCII equivalents instead of `?`
+
+## [16.0.8] - 2026-06-18
+
+### Added
+
+- Added `<out>` block wrapping for tool results to improve document structure
+- Rendered thinking process as italicized blocks above assistant text
+- Displayed tool call intents as `//` comments in tool call headers
+- Changed conversation role markers to standard Markdown headings
+
+### Changed
+
+- Merged tool results into their corresponding tool call blocks
+- Preserved prose formatting around tool calls to maintain conversation flow
+- Hidden `_i` argument from tool call output when an intent is provided
+- Optimized assistant turn output to group thinking and text blocks efficiently
+
+### Fixed
+
+- Fixed improper splitting of assistant messages around useless tool calls
+
 ## [16.0.1] - 2026-06-15
 
 ### Added

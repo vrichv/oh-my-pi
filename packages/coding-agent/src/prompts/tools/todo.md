@@ -1,43 +1,44 @@
-**Tasks are referenced by their verbatim content string, not by any auto-generated ID. There is no "task-1"/"task-N" identifier — the tool never emits one. Pass the task's content text in the `task` field.**
+**Tasks: verbatim content strings, NEVER auto-generated IDs; no "task-1"/"task-N". Pass content in `task`.**
 
-Manages a phased task list. Pass `ops`: a flat array of operations.
-The next pending task is auto-promoted to `in_progress` after each completion.
-Allowed `op` values are only `init`, `start`, `done`, `drop`, `rm`, `append`, and `view`. `pending` is a task status, not an `op`; leave not-yet-started tasks implicit in `init`/`append` lists.
+After each successful state-changing op: if nothing is `in_progress`, the earliest `pending` task (phase order) auto-promotes to `in_progress`; if several are `in_progress`, only the earliest stays. Blocked tasks NEVER auto-promote—`unblock` first. Out-of-order completion may move pointer back to an earlier phase—expected; completed tasks NEVER revert.
 
 ## Operations
 
-|`op`|Required fields|Effect|
+|`op`|Fields|Effect|
 |---|---|---|
-|`init`|`list: [{phase, items: string[]}]`|Initialize the full list (replaces any existing list)|
+|`init`|`list: [{phase, items: string[]}]`|Initialize full list; replaces existing|
 |`init`|`items: string[]`|Flattened single-phase init|
 |`start`|`task`|Mark in progress|
 |`done`|`task` or `phase`|Mark completed|
 |`drop`|`task` or `phase`|Mark abandoned|
-|`rm`|`task` or `phase` (optional)|Remove task or phase's tasks; omit both to clear the entire list|
-|`append`|`phase`, `items: string[]`|Append tasks to `phase`; lazily creates phase|
-|`view`|—|Read-only: echo the current list without modifying it|
+|`block`|`task` or `phase`; optional `reason`|Mark blocked: awaiting external input; never auto-promotes; excluded from stop-time incomplete-todo reminder|
+|`unblock`|`task` or `phase`|Blocked task → `pending`|
+|`rm`|optional `task` or `phase`|Remove task/phase; omit both → clear|
+|`append`|`phase`; `items: string[]`|Append tasks to phase; lazily creates phase|
+|`view`|—|Read-only; echo list|
 
 ## Anatomy
-- **Task content**: 5–10 words, what is being done, not how. Used as the task identifier — unique.
-- **Phase name**: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`). Used as the phase identifier — unique. Do not add prefixes like `1.`, `A)`, `Phase 1:`, etc.
+
+- Task content: 5–10 words; what, not how; unique identifier.
+- Phase name: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`); unique identifier. NEVER prefix `1.`, `A)`, `Phase 1:`.
 
 ## Rules
-- Mark tasks done immediately after finishing.
-- Complete phases in order.
-- On blockers, `append` a new task to the active phase to unblock yourself, or `drop`.
-- `task` and `phase` fields reference content/name verbatim; keep them stable once introduced.
-- Lost track of exact task text? `view` echoes the full list — NEVER guess content from memory; a mismatched `task` string is an error.
 
-## When to create a list
-- Task requires 3+ distinct steps
-- User explicitly requests one
-- User provides a set of tasks to complete
-- New instructions arrive mid-task — capture before proceeding
+- Mark tasks done immediately after finishing; complete phases in order.
+- NEVER make a todo call the turn's only tool call. Batch with real work: `init` with first reads/edits; each `done`/`start` with next action. Solo todo turns waste a round trip.
+- Waiting on something you can't act on—a user decision, another agent, external service: `block` task (optional `reason`); remains tracked but avoids stop reminder. Blocking the active task hands `in_progress` to the next `pending` task, never back to the blocked one. `unblock` when actionable. If blocker agent-actionable, `append` an unblocking task instead.
+- Keep introduced `task`/`phase` strings stable.
+- Lost exact task text: `view` echoes list; NEVER guess from memory.
+
+## Create a list
+
+- Task requires 3+ distinct steps.
+- User explicitly requests one.
+- User provides a set of tasks.
+- New instructions arrive mid-task: capture before proceeding.
 
 <critical>
-When the user hands you a multi-step plan — a phased todo, a numbered or bulleted checklist, or "N bugs/items/tasks" to work through:
-- You MUST `init` the list with EVERY item as its own task before doing the work.
-- Enumerate all of them;
-- NEVER summarize the plan into fewer tasks, sample "the important ones", drop items, or rely on memory to track the rest.
-The entire point is to remember every one.
+User gives multi-step plan—phased todo, numbered/bulleted checklist, or "N bugs/items/tasks":
+- MUST `init` every item as its own task before working.
+- Enumerate all; NEVER summarize into fewer tasks, sample "the important ones", drop items, or track the rest from memory.
 </critical>

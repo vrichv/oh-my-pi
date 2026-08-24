@@ -36,6 +36,12 @@ function createContext(options: {
 	};
 	const addMessageToChat = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
+	const clearOptimisticUserMessage = vi.fn(() => {
+		ctx.optimisticUserMessageSignature = undefined;
+	});
+	const replaceOptimisticUserMessage = vi.fn(() => {
+		ctx.optimisticUserMessageSignature = undefined;
+	});
 	const ctx = {
 		isInitialized: true,
 		statusLine: { invalidate: vi.fn() },
@@ -53,9 +59,21 @@ function createContext(options: {
 						.join(""),
 		optimisticUserMessageSignature: options.optimisticSignature,
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
+		clearOptimisticUserMessage,
+		replaceOptimisticUserMessage,
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
+		viewSession: { isStreaming: false },
 	} as unknown as InteractiveModeContext;
-	return { ctx, editor, setText, addMessageToChat, updatePendingMessagesDisplay };
+	return {
+		ctx,
+		editor,
+		setText,
+		addMessageToChat,
+		updatePendingMessagesDisplay,
+		clearOptimisticUserMessage,
+		replaceOptimisticUserMessage,
+	};
 }
 
 describe("EventController message_start (user role)", () => {
@@ -205,6 +223,10 @@ describe("EventController IRC expiry", () => {
 		await controller.handleEvent({ type: "irc_message", message });
 
 		expect(chatContainer.children).toHaveLength(2);
+		// One requestRender from the IRC handler mounting the card. The blanket
+		// pre-render that `handleEvent` used to fire before every dispatch was
+		// removed in #4353 (it doubled the paint rate during streaming and did no
+		// visible work beyond what the handlers already trigger).
 		expect(requestRender).toHaveBeenCalledTimes(1);
 
 		vi.advanceTimersByTime(9_999);
@@ -213,23 +235,6 @@ describe("EventController IRC expiry", () => {
 		vi.advanceTimersByTime(1);
 		expect(chatContainer.children).toHaveLength(1);
 		expect(requestRender).toHaveBeenCalledTimes(2);
-	});
-
-	it("keeps a card whose rows may already be committed (no live block above)", async () => {
-		vi.useFakeTimers();
-		const message = createIrcMessage(4);
-		const { ctx, chatContainer } = createIrcContext();
-		const controller = new EventController(ctx);
-
-		await controller.handleEvent({ type: "irc_message", message });
-		expect(chatContainer.children).toHaveLength(1);
-
-		// Everything above the card is finalized, so its rows may already be in
-		// native scrollback. Removing it would be an interior deletion of the
-		// committed prefix — the engine repairs that by recommitting everything
-		// below the gap (the duplicated-block artifact). It must stay.
-		vi.advanceTimersByTime(10_000);
-		expect(chatContainer.children).toHaveLength(1);
 	});
 
 	it("evicts the oldest live-region card beyond the cap", async () => {

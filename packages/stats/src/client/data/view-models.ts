@@ -1,15 +1,80 @@
 import { rangeMeta } from "../components/range-meta";
 import type {
+	AgentType,
+	AgentTypeStats,
 	BehaviorOverallStats,
 	BehaviorTimeSeriesPoint,
 	CostTimeSeriesPoint,
 	FolderStats,
 	ModelPerformancePoint,
 	TimeRange,
+	ToolUsageStats,
 } from "../types";
+
+/** Fixed display order for the agent-token-share breakdown. */
+const AGENT_TYPE_ORDER: AgentType[] = ["main", "subagent", "advisor"];
+
+export interface ConversationTokenStats {
+	totalInputTokens: number;
+	totalOutputTokens: number;
+	totalCacheReadTokens: number;
+	totalCacheWriteTokens: number;
+}
+
+/** Sum every conversation-token bucket shown by the overview. */
+export function sumConversationTokens(stats: ConversationTokenStats): number {
+	return stats.totalInputTokens + stats.totalOutputTokens + stats.totalCacheReadTokens + stats.totalCacheWriteTokens;
+}
+
+export interface AgentTokenSegment {
+	agentType: AgentType;
+	/** input + output + cache read + cache write — the displayed denominator. */
+	tokens: number;
+	requests: number;
+	cost: number;
+	/** Fraction (0-1) of total tokens across all present agent types. */
+	share: number;
+}
+
+export interface AgentTokenShareView {
+	totalTokens: number;
+	totalCost: number;
+	segments: AgentTokenSegment[];
+}
+
+/**
+ * Build the "token usage by agent" breakdown: one segment per agent type that
+ * appears in the data, ordered main -> subagents -> advisor, each carrying its
+ * token total and share of the grand total. Token counts use the same four
+ * conversation-token buckets as the overview total so the two views reconcile.
+ */
+export function buildAgentTokenShare(stats: AgentTypeStats[]): AgentTokenShareView {
+	const byType = new Map<AgentType, AgentTypeStats>();
+	for (const stat of stats) byType.set(stat.agentType, stat);
+
+	const present = AGENT_TYPE_ORDER.map(type => byType.get(type)).filter(
+		(stat): stat is AgentTypeStats => stat !== undefined,
+	);
+	const totalTokens = present.reduce((sum, stat) => sum + sumConversationTokens(stat), 0);
+	const totalCost = present.reduce((sum, stat) => sum + stat.totalCost, 0);
+
+	const segments = present.map(stat => {
+		const tokens = sumConversationTokens(stat);
+		return {
+			agentType: stat.agentType,
+			tokens,
+			requests: stat.totalRequests,
+			cost: stat.totalCost,
+			share: totalTokens > 0 ? tokens / totalTokens : 0,
+		};
+	});
+
+	return { totalTokens, totalCost, segments };
+}
 
 export interface CostSummaryView {
 	totalCost: number;
+	unpricedRequests: number;
 	avgDailyCost: number;
 	topModelName: string;
 	topModelCost: number;
@@ -47,6 +112,7 @@ export interface FolderRowView extends FolderStats {
 
 export function buildCostSummary(costSeries: CostTimeSeriesPoint[]): CostSummaryView {
 	const totalCost = costSeries.reduce((sum, p) => sum + p.cost, 0);
+	const unpricedRequests = costSeries.reduce((sum, point) => sum + point.unpricedRequests, 0);
 	const dayBuckets = new Set(costSeries.map(p => p.timestamp)).size;
 	const avgDailyCost = dayBuckets > 0 ? totalCost / dayBuckets : 0;
 
@@ -66,6 +132,7 @@ export function buildCostSummary(costSeries: CostTimeSeriesPoint[]): CostSummary
 
 	return {
 		totalCost,
+		unpricedRequests,
 		avgDailyCost,
 		topModelName,
 		topModelCost,
@@ -174,5 +241,22 @@ export function buildFolderRows(folders: FolderStats[]): FolderRowView[] {
 		...f,
 		costPercentage: maxCost > 0 ? (f.totalCost / maxCost) * 100 : 0,
 		requestsPercentage: maxRequests > 0 ? (f.totalRequests / maxRequests) * 100 : 0,
+	}));
+}
+
+/** Table row for the Tools route: usage stats plus derived rates/shares. */
+export interface ToolRowView extends ToolUsageStats {
+	/** errors / calls (0 for zero calls). */
+	errorRate: number;
+	/** Calls relative to the busiest tool, 0-100, for the share bar. */
+	callsPercentage: number;
+}
+
+export function buildToolRows(tools: ToolUsageStats[]): ToolRowView[] {
+	const maxCalls = tools.reduce((max, t) => Math.max(max, t.calls), 0);
+	return tools.map(t => ({
+		...t,
+		errorRate: t.calls > 0 ? t.errors / t.calls : 0,
+		callsPercentage: maxCalls > 0 ? (t.calls / maxCalls) * 100 : 0,
 	}));
 }

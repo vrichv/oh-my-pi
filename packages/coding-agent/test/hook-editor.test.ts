@@ -1,10 +1,10 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { HookEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
+import { CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -67,8 +67,8 @@ function createControllerContext() {
 		stop: vi.fn(),
 		terminal: { columns: 120 },
 	} as unknown as TestContext["ui"] & {
-		setFocus: ReturnType<typeof vi.fn>;
-		requestRender: ReturnType<typeof vi.fn>;
+		setFocus: Mock<any>;
+		requestRender: Mock<any>;
 	};
 	const ctx = {
 		editor,
@@ -139,6 +139,41 @@ describe("HookEditorComponent default (hook) mode", () => {
 
 		expect(onSubmit).toHaveBeenCalledTimes(1);
 		expect(onSubmit).toHaveBeenCalledWith("draft");
+		expect(onCancel).not.toHaveBeenCalled();
+	});
+	it("submits the current text on Ctrl+Q (Windows Terminal fallback for #2118)", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "line 1\nline 2", onSubmit, onCancel);
+
+		// Ctrl+Q raw byte (0x11). Windows Terminal cannot deliver a distinct
+		// Ctrl+Enter, so app.message.followUp also binds Ctrl+Q (#1903), and the
+		// hook editor must honor it for the same reason.
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("line 1\nline 2");
+		expect(onCancel).not.toHaveBeenCalled();
+	});
+
+	it("keeps Ctrl+Q working after Enter inserts a newline (Windows Terminal)", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel);
+
+		component.handleInput("a");
+		component.handleInput("b");
+		// Windows Terminal sends bare `\r` for both Enter and Ctrl+Enter; the
+		// hook editor must treat `\r` as a newline and reserve Ctrl+Q for submit.
+		component.handleInput("\r");
+		component.handleInput("c");
+		component.handleInput("d");
+		expect(onSubmit).not.toHaveBeenCalled();
+
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("ab\ncd");
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
@@ -280,7 +315,7 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onSubmit).toHaveBeenCalledWith("a\nb");
 	});
 
-	it("treats Ctrl+Enter as newline in prompt-style mode", () => {
+	it("submits on the Ctrl+Enter chord in prompt-style mode (#3353)", () => {
 		const onSubmit = vi.fn();
 		const onCancel = vi.fn();
 		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
@@ -288,18 +323,32 @@ describe("HookEditorComponent prompt-style mode", () => {
 		});
 
 		component.handleInput("x");
+		component.handleInput("y");
 		component.handleInput("\x1b[13;5u");
 
-		expect(onSubmit).not.toHaveBeenCalled();
-
-		component.handleInput("y");
-		component.handleInput("\r");
-
 		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("x\ny");
+		expect(onSubmit).toHaveBeenCalledWith("xy");
+		expect(onCancel).not.toHaveBeenCalled();
 	});
 
-	it("renders prompt-style editor with legacy ask chrome", () => {
+	it("submits on Ctrl+Q in prompt-style mode (Windows Terminal fallback, #3353)", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "draft", onSubmit, onCancel, {
+			promptStyle: true,
+		});
+
+		// Windows Terminal swallows Ctrl+Enter, so app.message.followUp also binds
+		// Ctrl+Q (#1903). The ask tool's prompt-style editor missed this chord
+		// before #3353 — users hit Ctrl+Enter expecting submit, got nothing.
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("draft");
+		expect(onCancel).not.toHaveBeenCalled();
+	});
+
+	it("renders prompt-style editor with rounded overlay chrome", () => {
 		const component = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), {
 			promptStyle: true,
 		});
@@ -307,12 +356,24 @@ describe("HookEditorComponent prompt-style mode", () => {
 		const rendered = renderText(component);
 		const lines = renderLines(component);
 
-		expect(lines[0]).toMatch(/^─+$/);
-		expect(lines.at(-1)).toMatch(/^─+$/);
-		expect(lines[4]?.startsWith("> ")).toBe(true);
-		expect(rendered).toContain(" enter submit  esc cancel");
+		expect(lines[0]).toMatch(/^╭─ Prompt .*╮$/);
+		expect(lines.at(-1)).toMatch(/^╰.*╯$/);
+		expect(lines.some(line => line.includes("> "))).toBe(true);
+		expect(rendered).toContain("enter or ctrl+q submit  esc cancel");
 		expect(rendered).not.toContain("shift+enter newline");
 		expect(rendered).toContain("ctrl+g external editor");
+	});
+
+	it("anchors the hardware cursor while entering an Other response", () => {
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), {
+			promptStyle: true,
+		});
+		if (!isFocusable(component)) throw new Error("Hook editor must forward focus to its inner editor");
+
+		component.focused = true;
+		component.setUseTerminalCursor?.(true);
+
+		expect(component.render(120).some(line => line.includes(CURSOR_MARKER))).toBe(true);
 	});
 
 	it("keeps the prompt gutter visible after typing in prompt-style mode", () => {
@@ -325,8 +386,9 @@ describe("HookEditorComponent prompt-style mode", () => {
 		}
 
 		const lines = renderLines(component);
-		expect(lines[4]?.startsWith("> hello")).toBe(true);
-		expect(lines[4]?.startsWith("hello")).toBe(false);
+
+		expect(lines.some(line => line.includes("> hello"))).toBe(true);
+		expect(lines.some(line => line.includes("hello") && !line.includes(">"))).toBe(false);
 	});
 
 	it("aligns wrapped prompt-style continuation rows under the text column", () => {
@@ -335,9 +397,11 @@ describe("HookEditorComponent prompt-style mode", () => {
 		});
 
 		const lines = renderLines(component, 12);
-		expect(lines[4]).toBe("> abcdefghij");
-		expect(lines[5]?.startsWith("  klm")).toBe(true);
-		expect(lines[5]?.startsWith(">")).toBe(false);
+
+		expect(lines.some(line => line.includes("> abcdef"))).toBe(true);
+		const continuation = lines.find(line => line.includes("ghijkl"));
+		expect(continuation).toBeDefined();
+		expect(continuation).not.toContain(">");
 	});
 
 	it("cancels on Escape", () => {
@@ -369,6 +433,22 @@ describe("HookEditorComponent prompt-style mode", () => {
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
 		expect(onSubmit).not.toHaveBeenCalled();
+	});
+
+	it("renders the title in the border, detail lines, hint, and prompt gutter", () => {
+		const title = "◆ Other (type your own)\nEnter your response:";
+		const component = new HookEditorComponent(createTui(), title, "不太清楚，", vi.fn(), vi.fn(), {
+			promptStyle: true,
+		});
+		const lines = renderLines(component);
+
+		// First title line insets into the top border row.
+		expect(lines[0]).toContain("Other (type your own)");
+		// Remaining title lines, gutter, and hint are body rows.
+		const content = component.renderContent(80).map(line => Bun.stripANSI(line));
+		expect(content.some(line => line.startsWith("Enter your response:"))).toBe(true);
+		expect(content.some(line => line.startsWith("> "))).toBe(true);
+		expect(content.some(line => line.includes("esc cancel"))).toBe(true);
 	});
 });
 
@@ -503,6 +583,22 @@ describe("ExtensionUiController dialog serialization", () => {
 		abortA.abort();
 		await Bun.sleep(0);
 		expect(await promiseA).toBeUndefined();
+		expect(ctx.hookSelector).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+	});
+	it("dismisses a confirmation and restores the editor when its signal aborts", async () => {
+		const { ctx, editor, editorContainer } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+
+		const result = controller.showHookConfirm("High-risk command", "Allow this command?", {
+			signal: abortController.signal,
+		});
+		expect(ctx.hookSelector).toBeDefined();
+
+		abortController.abort();
+
+		expect(await result).toBe(false);
 		expect(ctx.hookSelector).toBeUndefined();
 		expect(editorContainer.children).toEqual([editor]);
 	});

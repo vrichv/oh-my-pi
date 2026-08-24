@@ -2,6 +2,7 @@
 // High-level API
 // ============================================================================
 
+import * as AIError from "../../error";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "../registry";
 import type {
 	OAuthCredentials,
@@ -11,6 +12,8 @@ import type {
 	OAuthProviderInterface,
 } from "./types";
 
+export * from "./anthropic";
+export * from "./device-code";
 export type * from "./types";
 
 const builtInOAuthProviders: OAuthProviderInfo[] = PROVIDER_REGISTRY.filter(
@@ -19,6 +22,7 @@ const builtInOAuthProviders: OAuthProviderInfo[] = PROVIDER_REGISTRY.filter(
 	id: provider.id,
 	name: provider.name,
 	available: provider.available ?? true,
+	storeCredentialsAs: provider.storeCredentialsAs,
 }));
 
 const customOAuthProviders = new Map<string, OAuthProviderInterface>();
@@ -28,6 +32,13 @@ const customOAuthProviders = new Map<string, OAuthProviderInterface>();
  */
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
 	customOAuthProviders.set(provider.id, provider);
+}
+
+/**
+ * Remove a custom OAuth provider by ID.
+ */
+export function unregisterOAuthProvider(id: string): void {
+	customOAuthProviders.delete(id);
 }
 
 /**
@@ -49,23 +60,29 @@ export function unregisterOAuthProviders(sourceId: string): void {
 }
 
 /**
- * Refresh token for any OAuth provider.
- * Saves the new credentials and returns the new access token.
+ * Refresh a built-in OAuth grant, cancelling provider work when refresh ownership ends.
  */
 export async function refreshOAuthToken(
 	provider: OAuthProvider,
 	credentials: OAuthCredentials,
+	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	if (!credentials) {
-		throw new Error(`No OAuth credentials found for ${provider}`);
+		throw new AIError.OAuthError(`No OAuth credentials found for ${provider}`, {
+			kind: "validation",
+			provider,
+		});
 	}
 	const def = getProviderDefinition(provider);
 	if (!def?.login) {
-		throw new Error(`Unknown OAuth provider: ${provider}`);
+		throw new AIError.OAuthError(`Unknown OAuth provider: ${provider}`, {
+			kind: "validation",
+			provider,
+		});
 	}
 	// Providers without a real refresher (static bearer tokens / API keys that
 	// don't expire) return the credentials unchanged.
-	return def.refreshToken ? def.refreshToken(credentials) : credentials;
+	return def.refreshToken ? def.refreshToken(credentials, signal) : credentials;
 }
 function getPerplexityJwtExpiryMs(token: string): number | undefined {
 	const parts = token.split(".");
@@ -130,8 +147,9 @@ export async function getOAuthApiKey(
 				return { newCredentials: fallbackCredentials, apiKey: fallbackCredentials.access };
 			}
 		}
-		throw new Error(
+		throw new AIError.OAuthError(
 			`OAuth credential for ${provider} is expired and must be refreshed via AuthStorage before getOAuthApiKey is called`,
+			{ kind: "validation", provider },
 		);
 	}
 	// For providers that need request-time credential metadata, return JSON.
@@ -163,6 +181,7 @@ export function getOAuthProviders(): OAuthProviderInfo[] {
 		id: provider.id,
 		name: provider.name,
 		available: true,
+		storeCredentialsAs: provider.storeCredentialsAs,
 	}));
 	return [...builtInOAuthProviders, ...customProviders];
 }

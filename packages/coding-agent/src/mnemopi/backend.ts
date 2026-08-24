@@ -1,8 +1,9 @@
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
-import { type ApiKeyResolver, completeSimple } from "@oh-my-pi/pi-ai";
+import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
+import type { MnemopiLlmCompleteOptions } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
 import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -62,6 +63,41 @@ const STATIC_INSTRUCTIONS = [
 	"",
 ].join("\n");
 
+/** Prompt turns for one Mnemopi completion. */
+export interface MemoryCompletionInput {
+	prompt: string;
+	systemPrompt?: string;
+}
+
+/** Maps a Mnemopi completion into instruction and input turns.
+ *
+ *  Extraction is the only task with its own instructions, and it always supplies
+ *  the raw text, so the instructions become the system turn and the text becomes
+ *  the user turn. Every other task keeps the prompt Mnemopi rendered. */
+export function resolveMemoryCompletionInput(
+	prompt: string,
+	options?: MnemopiLlmCompleteOptions,
+): MemoryCompletionInput {
+	if (options?.task?.kind === "memory-extraction") {
+		return { prompt: options.task.input, systemPrompt: memoryExtractionPrompt };
+	}
+	return { prompt };
+}
+
+async function installMnemopiState(session: AgentSession, config: MnemopiBackendConfig): Promise<MnemopiSessionState> {
+	const state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
+	const previous = setMnemopiSessionState(session, state);
+	await previous?.dispose();
+	try {
+		state.attachSessionListeners();
+		return state;
+	} catch (error) {
+		setMnemopiSessionState(session, undefined);
+		await state.dispose({ consolidate: false });
+		throw error;
+	}
+}
+
 export const mnemopiBackend: MemoryBackend = {
 	id: "mnemopi",
 
@@ -90,10 +126,7 @@ export const mnemopiBackend: MemoryBackend = {
 		try {
 			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			const state = new MnemopiSessionState({ sessionId, config, session });
-			const previous = setMnemopiSessionState(session, state);
-			await previous?.dispose();
-			state.attachSessionListeners();
+			await installMnemopiState(session, config);
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
@@ -120,13 +153,28 @@ export const mnemopiBackend: MemoryBackend = {
 		const config = previous?.config ?? (session ? loadMnemopiConfig(session.settings, agentDir) : undefined);
 		if (!config) return;
 		await loadMnemopiCore();
+		// Close the cached default Mnemopi instance so its SQLite handle doesn't
+		// keep the DB files locked on Windows when removeDbFiles tries to delete.
+		// Use the core module (already awaited via loadMnemopiCore above):
+		// requireMnemopi() throws "module not loaded" when clear() runs before the
+		// fire-and-forget start() has awaited loadMnemopi() (autolearn disabled, or
+		// taskDepth > 0). resetMemoryForTests is re-exported identically from core.
+		requireMnemopiCore().resetMemoryForTests();
+		await Bun.sleep(0);
 		await removeDbFiles(getMnemopiScopedDbPaths(config));
+		if (!session?.sessionId || previous?.aliasOf || session.settings.get("memory.backend") !== "mnemopi") return;
+		try {
+			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
+			await installMnemopiState(session, config);
+		} catch (error) {
+			logger.warn("Mnemopi: clear rehydrate failed; memory backend inert.", { error: String(error) });
+		}
 	},
 
 	async enqueue(agentDir, _cwd, session): Promise<void> {
 		try {
 			let state = getMnemopiSessionState(session);
-			if (!state && session) {
+			if (!state && session?.sessionId) {
 				const config = await loadMnemopiConfigWithProviders(
 					session.settings,
 					agentDir,
@@ -134,10 +182,9 @@ export const mnemopiBackend: MemoryBackend = {
 					session.sessionId,
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-				state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
-				setMnemopiSessionState(session, state);
+				state = await installMnemopiState(session, config);
 			}
-			await state?.consolidate();
+			await state?.consolidate({ full: true });
 		} catch (error) {
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
 		}
@@ -481,8 +528,16 @@ async function resolveMnemopiProviderOptions(
 		return {
 			...base,
 			llm: {
-				complete: (prompt, opts) => tinyModelClient.complete(memoryModel, prompt, { maxTokens: opts?.maxTokens }),
-				extractionPrompt: memoryExtractionPrompt,
+				complete: (prompt, opts) => {
+					const request = resolveMemoryCompletionInput(prompt, opts);
+					return tinyModelClient.complete(memoryModel, request.prompt, {
+						maxTokens: opts?.maxTokens,
+						systemPrompt: request.systemPrompt,
+					});
+				},
+				// No `extractionPrompt`: resolveMemoryCompletionInput supplies the
+				// instructions as a system turn for every extraction call, so anything
+				// rendered here would be built in code and then discarded.
 				consolidationPrompt: memoryConsolidationPrompt,
 			},
 		};
@@ -503,15 +558,16 @@ async function resolveMnemopiProviderOptions(
 	}
 
 	try {
-		const resolved = resolveRoleSelection(["smol"], settings, modelRegistry.getAvailable(), modelRegistry);
+		const resolved = resolveRoleSelection(["tiny", "smol"], settings, modelRegistry.getAvailable());
 		const model = resolved?.model;
 		if (!model) {
-			logger.warn("Mnemopi: llmMode=smol but no smol model resolved; continuing without LLM.");
+			logger.warn("Mnemopi: llmMode=smol but no tiny/smol model resolved; continuing without LLM.");
 			return base;
 		}
 		return {
 			...base,
 			llm: async (prompt, opts) => {
+				const request = resolveMemoryCompletionInput(prompt, opts);
 				const hasApiKey = await modelRegistry.getApiKey(model, sessionId);
 				if (!hasApiKey) {
 					logger.warn("Mnemopi: smol completion requested but no current API key is available.", {
@@ -520,16 +576,19 @@ async function resolveMnemopiProviderOptions(
 					});
 					return null;
 				}
-				const message = await completeSimple(
-					model,
-					{
-						messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-					},
-					{
-						apiKey: modelRegistry.resolver(model, sessionId),
-						maxTokens: opts?.maxTokens,
-						temperature: opts?.temperature,
-					},
+				const message = await retryTransientCompletion(() =>
+					completeSimple(
+						model,
+						{
+							...(request.systemPrompt ? { systemPrompt: [request.systemPrompt] } : {}),
+							messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
+						},
+						{
+							apiKey: modelRegistry.resolver(model, sessionId),
+							maxTokens: opts?.maxTokens,
+							temperature: opts?.temperature,
+						},
+					),
 				);
 				return message.content
 					.filter(
@@ -557,10 +616,48 @@ export function getMnemopiDbDirForTests(session: AgentSession): string | undefin
 	return state ? path.dirname(state.config.dbPath) : undefined;
 }
 
+/**
+ * Best-effort removal of a SQLite DB file and its WAL/SHM sidecars.
+ *
+ * Windows keeps `-wal`/`-shm` busy briefly after the DB handle closes, so a
+ * single `rm` races with EBUSY/EPERM. Retry a handful of times before giving
+ * up; `force: true` already makes "missing" a non-error.
+ */
 async function removeDbFiles(dbPaths: readonly string[]): Promise<void> {
 	for (const dbPath of dbPaths) {
-		await rm(dbPath, { force: true });
-		await rm(`${dbPath}-wal`, { force: true });
-		await rm(`${dbPath}-shm`, { force: true });
+		for (const suffix of ["", "-wal", "-shm"]) {
+			await removeWithRetries(`${dbPath}${suffix}`).catch(error => {
+				// `force: true` already makes ENOENT a non-error; anything else
+				// after the full retry window means the DB is genuinely locked and
+				// the user's "Memory cleared" message would be misleading. Log so
+				// the failure is diagnosable without blocking the clear flow.
+				const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+				if (code !== "ENOENT") {
+					logger.warn("Mnemopi: failed to remove DB file after retries", { path: `${dbPath}${suffix}`, code });
+				}
+			});
+		}
+	}
+}
+
+const kRemoveRetries = 40;
+const kRemoveRetryDelayMs = 25;
+const kRetryableRemoveErrorCodes = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+
+async function removeWithRetries(target: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await rm(target, { force: true });
+			return;
+		} catch (err) {
+			const retryable =
+				typeof err === "object" &&
+				err !== null &&
+				"code" in err &&
+				typeof err.code === "string" &&
+				kRetryableRemoveErrorCodes.has(err.code);
+			if (!retryable || attempt >= kRemoveRetries) throw err;
+			await Bun.sleep(kRemoveRetryDelayMs);
+		}
 	}
 }

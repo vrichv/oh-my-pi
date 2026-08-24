@@ -4,8 +4,10 @@
 
 import { scheduler } from "node:timers/promises";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { extractHttpStatusFromError, readSseJson } from "@oh-my-pi/pi-utils";
-import { ProviderHttpError } from "../errors";
+import { readSseJson } from "@oh-my-pi/pi-utils";
+import { renderDemotedThinking } from "../dialect/demotion";
+import { ThinkingFenceStripper } from "../dialect/thinking-fence-strip";
+import * as AIError from "../error";
 import type {
 	Api,
 	AssistantMessage,
@@ -13,6 +15,7 @@ import type {
 	FetchImpl,
 	ImageContent,
 	Model,
+	ServiceTier,
 	StopReason,
 	StreamOptions,
 	TextContent,
@@ -20,9 +23,10 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
+import { shouldSendServiceTier } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
+import type { RawHttpRequestDump } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import type {
 	Content,
@@ -47,12 +51,16 @@ export type {
 } from "./google-types";
 export { normalizeSchemaForGoogle };
 
-/** Non-2xx response (or in-stream error chunk) from the Google Generative Language / Vertex API. */
-export class GoogleApiError extends ProviderHttpError {
-	override readonly name = "GoogleApiError";
-}
-
 type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
+
+function convertGoogleImagePart(image: ImageContent): Part {
+	if (image.providerFile?.provider === "google" && image.providerFile.uri) {
+		return { fileData: { fileUri: image.providerFile.uri, mimeType: image.mimeType } };
+	}
+	return image.url
+		? { fileData: { fileUri: image.url, mimeType: image.mimeType } }
+		: { inlineData: { mimeType: image.mimeType, data: image.data } };
+}
 
 /**
  * Thinking level for Gemini 3 models. Mirrors Google's `ThinkingLevel` enum values.
@@ -77,6 +85,21 @@ export interface GoogleSharedStreamOptions extends StreamOptions {
 		budgetTokens?: number;
 		level?: GoogleThinkingLevel;
 	};
+	/** Request that Google omit human-readable thought summaries while still allowing internal reasoning. */
+	hideThinkingSummary?: boolean;
+	/** Gemini/Vertex serving tier (`flex`/`priority`); other values are omitted. */
+	serviceTier?: ServiceTier;
+	/**
+	 * Caller-owned Google context-cache resource name for GenerateContent.
+	 * Passed through opaquely as the wire `cachedContent` field on
+	 * `google-generative-ai` and `google-vertex` only. OMP does not create,
+	 * refresh, validate model/project/location compatibility, or delete the
+	 * resource — callers own that lifecycle.
+	 *
+	 * @see https://ai.google.dev/api/generate-content
+	 * @see `@google/genai` `GenerateContentConfig.cachedContent`
+	 */
+	cachedContent?: string;
 }
 
 /**
@@ -130,11 +153,9 @@ function resolveThoughtSignature(isSameProviderAndModel: boolean, signature: str
 	return isSameProviderAndModel && isValidThoughtSignature(signature) ? signature : undefined;
 }
 
-/**
- * Claude models via Google APIs require explicit tool call IDs in function calls/responses.
- */
-export function requiresToolCallId(modelId: string): boolean {
-	return modelId.startsWith("claude-");
+function supportsFunctionPartId<T extends GoogleApiType>(model: Model<T>): boolean {
+	if (model.api === "google-vertex") return false;
+	return model.id.startsWith("claude-") || (model.api === "google-generative-ai" && isGemini3Model(model.id));
 }
 
 function getGeminiMajorVersion(modelId: string): number | undefined {
@@ -160,8 +181,9 @@ function isGemini3Model(modelId: string): boolean {
  */
 export function convertMessages<T extends GoogleApiType>(model: Model<T>, context: Context): Content[] {
 	const contents: Content[] = [];
+	const emittedToolCallNames = new Map<string, string>();
+
 	const normalizeToolCallId = (id: string): string => {
-		if (!requiresToolCallId(model.id)) return id;
 		return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 	};
 
@@ -198,12 +220,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						if (text.trim().length === 0) continue;
 						parts.push({ text });
 					} else if (supportsImages) {
-						parts.push({
-							inlineData: {
-								mimeType: item.mimeType,
-								data: item.data,
-							},
-						});
+						parts.push(convertGoogleImagePart(item));
 					} else {
 						omittedImages = true;
 					}
@@ -221,6 +238,8 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 			const parts: Part[] = [];
 			// Check if message is from same provider and model - only then keep thinking blocks
 			const isSameProviderAndModel = msg.provider === model.provider && msg.model === model.id;
+			const dropsUnsignedThinking =
+				model.provider === "google-antigravity" && model.id.toLowerCase().includes("claude");
 
 			for (const block of msg.content) {
 				if (block.type === "text") {
@@ -234,21 +253,21 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				} else if (block.type === "thinking") {
 					// Skip empty thinking blocks
 					if (!block.thinking || block.thinking.trim() === "") continue;
-					// Only keep as thinking block if same provider AND same model
-					// Otherwise convert to plain text (no tags to avoid model mimicking them)
-					if (isSameProviderAndModel) {
-						const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thinkingSignature);
+					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thinkingSignature);
+					if (dropsUnsignedThinking && !thoughtSignature) continue;
+					if (thoughtSignature) {
 						parts.push({
 							thought: true,
 							text: block.thinking.toWellFormed(),
-							...(thoughtSignature && { thoughtSignature }),
+							thoughtSignature,
 						});
 					} else {
 						parts.push({
-							text: block.thinking.toWellFormed(),
+							text: renderDemotedThinking(model.id, block.thinking),
 						});
 					}
 				} else if (block.type === "toolCall") {
+					emittedToolCallNames.set(block.id, block.name);
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thoughtSignature);
 					const effectiveSignature =
 						thoughtSignature || (isGemini3Model(model.id) ? SKIP_THOUGHT_SIGNATURE : undefined);
@@ -257,11 +276,11 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						functionCall: {
 							name: block.name,
 							args: block.arguments ?? {},
-							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+							...(supportsFunctionPartId(model) ? { id: block.id } : {}),
 						},
 					};
 					if (model.provider === "google-vertex" && part?.functionCall?.id) {
-						delete part.functionCall.id; // Vertex AI does not support 'id' in functionCall
+						delete part.functionCall.id; // Vertex AI GenerateContent rejects 'id' in functionCall parts.
 					}
 					if (effectiveSignature) {
 						part.thoughtSignature = effectiveSignature;
@@ -300,17 +319,13 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						? "(see attached image)"
 						: "";
 
-			const imageParts: Part[] = imageContent.map(imageBlock => ({
-				inlineData: {
-					mimeType: imageBlock.mimeType,
-					data: imageBlock.data,
-				},
-			}));
+			const imageParts = imageContent.map(convertGoogleImagePart);
 
-			const includeId = requiresToolCallId(model.id);
+			const includeId = supportsFunctionPartId(model);
+			const emittedName = emittedToolCallNames.get(msg.toolCallId);
 			const functionResponsePart: Part = {
 				functionResponse: {
-					name: msg.toolName,
+					name: emittedName ?? msg.toolName,
 					response: msg.isError ? { error: responseValue } : { output: responseValue },
 					...(hasImages && modelSupportsMultimodalFunctionResponse && { parts: imageParts }),
 					...(includeId ? { id: msg.toolCallId } : {}),
@@ -318,7 +333,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 			};
 
 			if (model.provider === "google-vertex" && functionResponsePart.functionResponse?.id) {
-				delete functionResponsePart.functionResponse.id; // Vertex AI does not support 'id' in functionResponse
+				delete functionResponsePart.functionResponse.id; // Vertex AI GenerateContent rejects 'id' in functionResponse parts.
 			}
 
 			// Cloud Code Assist API requires all function responses to be in a single user turn.
@@ -420,7 +435,7 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case "NO_IMAGE":
 			return "error";
 		default: {
-			throw new Error(`Unhandled stop reason: ${reason satisfies never}`);
+			throw new AIError.ConfigurationError(`Unhandled stop reason: ${reason satisfies never}`);
 		}
 	}
 }
@@ -536,6 +551,24 @@ export function pushToolCallEvents(
  * inject its `ensureStarted()` first-token side effect into the canonical event order.
  */
 export function startTextOrThinkingBlock(
+	isThinking: true,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): ThinkingContent;
+export function startTextOrThinkingBlock(
+	isThinking: false,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): TextContent;
+export function startTextOrThinkingBlock(
+	isThinking: boolean,
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	onBeforeStartEvent?: () => void,
+): TextContent | ThinkingContent;
+export function startTextOrThinkingBlock(
 	isThinking: boolean,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -584,11 +617,23 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	let currentBlock: TextContent | ThinkingContent | null = null;
+	// Heals a leaked reasoning-fence opener (```thinking / ``````thinking) that some
+	// Gemini thought summaries emit as a between-summary delimiter (#8719). One
+	// stripper per thinking block; created lazily on first thinking delta.
+	let thinkingStripper: ThinkingFenceStripper | null = null;
 	let firstTokenSeen = false;
 	let sawFinishReason = false;
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
+		if (currentBlock.type === "thinking" && thinkingStripper) {
+			const tail = thinkingStripper.flush();
+			if (tail) {
+				currentBlock.thinking += tail;
+				stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: tail, partial: output });
+			}
+		}
+		thinkingStripper = null;
 		pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
 	};
 
@@ -597,13 +642,14 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 			const detail = chunk.error.message || chunk.error.status || "unknown error";
 			const message = `Google API stream error: ${detail}`;
 			throw typeof chunk.error.code === "number" && chunk.error.code >= 400
-				? new GoogleApiError(message, chunk.error.code)
-				: new Error(message);
+				? new AIError.GoogleApiError(message, chunk.error.code)
+				: new AIError.ProviderResponseError(message, { provider: model.provider, kind: "output" });
 		}
 		if (!chunk.candidates?.length && chunk.promptFeedback?.blockReason) {
 			const detail = chunk.promptFeedback.blockReasonMessage;
-			throw new Error(
+			throw new AIError.ProviderResponseError(
 				`Request blocked by Google (${chunk.promptFeedback.blockReason})${detail ? `: ${detail}` : ""}`,
+				{ provider: model.provider, kind: "content-blocked" },
 			);
 		}
 		const candidate = chunk.candidates?.[0];
@@ -624,17 +670,21 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 						currentBlock = startTextOrThinkingBlock(isThinking, output, stream);
 					}
 					if (currentBlock.type === "thinking") {
-						currentBlock.thinking += part.text;
+						thinkingStripper ??= new ThinkingFenceStripper();
+						const cleaned = thinkingStripper.push(part.text);
+						currentBlock.thinking += cleaned;
 						currentBlock.thinkingSignature = retainThoughtSignature(
 							currentBlock.thinkingSignature,
 							part.thoughtSignature,
 						);
-						stream.push({
-							type: "thinking_delta",
-							contentIndex: blockIndex(),
-							delta: part.text,
-							partial: output,
-						});
+						if (cleaned) {
+							stream.push({
+								type: "thinking_delta",
+								contentIndex: blockIndex(),
+								delta: cleaned,
+								partial: output,
+							});
+						}
 					} else {
 						currentBlock.text += part.text;
 						if (retainTextSignature) {
@@ -734,15 +784,21 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	flushCurrent();
 
 	if (options?.signal?.aborted) {
-		throw new Error("Request was aborted");
+		throw new AIError.AbortError();
 	}
 
 	if (!sawFinishReason) {
-		throw new Error("Google API stream ended without a finish reason (connection dropped or response truncated)");
+		throw new AIError.ProviderResponseError(
+			"Google API stream ended without a finish reason (connection dropped or response truncated)",
+			{ provider: model.provider, kind: "incomplete-stream" },
+		);
 	}
 
 	if (output.stopReason === "aborted" || output.stopReason === "error") {
-		throw new Error(output.errorMessage ?? "An unknown error occurred");
+		throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
+			provider: model.provider,
+			kind: "output",
+		});
 	}
 }
 
@@ -790,6 +846,14 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools, model) }),
 	};
 
+	// Gemini API (google-generative-ai) reads the tier from the request body;
+	// Vertex AI ignores a body field and requires the
+	// `X-Vertex-AI-LLM-Shared-Request-Type` header instead (added in
+	// streamGoogleVertex), so only emit the body field for the direct API.
+	if (model.provider === "google" && shouldSendServiceTier(options.serviceTier, model.provider)) {
+		config.serviceTier = options.serviceTier;
+	}
+
 	if (context.tools && context.tools.length > 0 && options.toolChoice) {
 		const choice = options.toolChoice;
 		if (typeof choice === "string") {
@@ -813,22 +877,46 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 		config.toolConfig = undefined;
 	}
 
-	if (options.thinking?.enabled && model.reasoning) {
-		const cfg: ThinkingConfig = { includeThoughts: true };
-		if (options.thinking.level !== undefined) {
-			// GoogleThinkingLevel mirrors the SDK's `ThinkingLevel` string enum values 1:1.
-			cfg.thinkingLevel = options.thinking.level as ThinkingLevel;
-		} else if (options.thinking.budgetTokens !== undefined) {
-			cfg.thinkingBudget = options.thinking.budgetTokens;
+	const thinking = options.thinking;
+	if (
+		thinking &&
+		model.reasoning &&
+		(thinking.enabled || thinking.level !== undefined || thinking.budgetTokens !== undefined)
+	) {
+		const cfg: ThinkingConfig = { includeThoughts: thinking.enabled && !options.hideThinkingSummary };
+		if (thinking.level !== undefined) {
+			// GoogleThinkingLevel mirrors the SDK's ThinkingLevel string enum values 1:1.
+			cfg.thinkingLevel = thinking.level as ThinkingLevel;
+		} else if (thinking.budgetTokens !== undefined) {
+			cfg.thinkingBudget = thinking.budgetTokens;
 		}
 		config.thinkingConfig = cfg;
 	}
 
 	if (options.signal) {
 		if (options.signal.aborted) {
-			throw new Error("Request aborted");
+			throw new AIError.AbortError("Request aborted");
 		}
 		config.abortSignal = options.signal;
+	}
+
+	if (options.cachedContent !== undefined) {
+		// Blank names are never valid resource references; anything else stays
+		// opaque so we do not invent format/model/project checks here.
+		if (options.cachedContent.trim().length === 0) {
+			throw new AIError.ValidationError("cachedContent must not be blank");
+		}
+		const incompatibleFields = [
+			config.systemInstruction !== undefined && "systemInstruction",
+			config.tools !== undefined && "tools",
+			config.toolConfig !== undefined && "toolConfig",
+		].filter((field): field is string => Boolean(field));
+		if (incompatibleFields.length > 0) {
+			throw new AIError.ValidationError(
+				`cachedContent cannot be combined with request-level ${incompatibleFields.join(", ")}`,
+			);
+		}
+		config.cachedContent = options.cachedContent;
 	}
 
 	return {
@@ -851,6 +939,8 @@ export interface GoogleGenAIRequestPlan {
 	url: string;
 	headers: Record<string, string>;
 	fetch?: FetchImpl;
+	/** Optional URL retried once when {@link url} returns 404 (regional Vertex endpoint missing a global-only model). */
+	fallbackUrl?: string;
 }
 
 export function streamGoogleGenAI<T extends "google-generative-ai" | "google-vertex">(args: {
@@ -864,7 +954,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -905,8 +995,8 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 
 			const bodyJson = JSON.stringify(paramsToWireBody(params));
 			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
-			const openStream = async (): Promise<ReadableStream<Uint8Array>> => {
-				const response = await fetchImpl(plan.url, {
+			const openStreamAt = async (requestUrl: string): Promise<ReadableStream<Uint8Array>> => {
+				const response = await fetchImpl(requestUrl, {
 					method: "POST",
 					headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
 					body: bodyJson,
@@ -914,16 +1004,33 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				});
 				if (!response.ok) {
 					const errorText = await response.text().catch(() => "");
-					throw new GoogleApiError(
+					throw new AIError.GoogleApiError(
 						`Google API error (${response.status}): ${extractGoogleErrorMessage(errorText)}`,
 						response.status,
 						{ headers: response.headers },
 					);
 				}
 				if (!response.body) {
-					throw new Error("Google API returned an empty response body");
+					throw new AIError.ProviderResponseError("Google API returned an empty response body", {
+						provider: model.provider,
+						kind: "empty-body",
+					});
 				}
 				return response.body as ReadableStream<Uint8Array>;
+			};
+			// A regional Vertex endpoint 404s for models published only on the
+			// global endpoint; retry global once so a stale/ambient region never
+			// breaks a request that worked before regional routing existed.
+			const openStream = async (): Promise<ReadableStream<Uint8Array>> => {
+				if (!plan.fallbackUrl) return openStreamAt(plan.url);
+				try {
+					return await openStreamAt(plan.url);
+				} catch (error) {
+					if (error instanceof AIError.GoogleApiError && error.status === 404) {
+						return openStreamAt(plan.fallbackUrl);
+					}
+					throw error;
+				}
 			};
 
 			let body = await openStream();
@@ -944,39 +1051,43 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					options,
 					retainTextSignature,
 					onFirstToken: () => {
-						firstTokenTime = Date.now();
+						firstTokenTime = performance.now();
 					},
 				});
 
-				if (output.stopReason !== "stop" || hasMeaningfulGoogleContent(output)) break;
+				if (
+					output.stopReason !== "stop" ||
+					hasMeaningfulGoogleContent(output) ||
+					options?.acceptEmptyResponse === true
+				) {
+					break;
+				}
 				if (emptyAttempt >= MAX_EMPTY_STREAM_RETRIES) {
-					throw new Error(
+					throw new AIError.ProviderResponseError(
 						`Google API returned an empty response (finishReason STOP with no content) after ${MAX_EMPTY_STREAM_RETRIES + 1} attempts`,
+						{ provider: model.provider, kind: "empty-body" },
 					);
 				}
 				try {
 					await scheduler.wait(EMPTY_STREAM_BASE_DELAY_MS * 2 ** emptyAttempt, { signal: options?.signal });
 				} catch {
-					throw new Error("Request was aborted");
+					throw new AIError.AbortError();
 				}
 				resetGoogleStreamOutputForRetry(output);
 				body = await openStream();
 			}
 
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason as "length" | "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) {
-				if ("index" in block) {
-					delete (block as { index?: number }).index;
-				}
-			}
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal, rawRequestDump });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -1005,6 +1116,7 @@ function paramsToWireBody(params: GenerateContentParameters): Record<string, unk
 	if (config.toolConfig !== undefined) body.toolConfig = config.toolConfig;
 	if (config.safetySettings !== undefined) body.safetySettings = config.safetySettings;
 	if (config.cachedContent !== undefined) body.cachedContent = config.cachedContent;
+	if (config.serviceTier !== undefined) body.serviceTier = config.serviceTier;
 
 	const gen: Record<string, unknown> = {};
 	if (config.temperature !== undefined) gen.temperature = config.temperature;

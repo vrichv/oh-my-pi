@@ -1,9 +1,9 @@
-import { z } from "zod/v4";
+import { type } from "@oh-my-pi/omptype";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import * as git from "../../../utils/git";
 
-const recentCommitsSchema = z.object({
-	count: z.number().min(1).max(50).describe("commit count").optional(),
+const recentCommitsSchema = type({
+	"count?": type("1 <= number <= 50").describe("commit count"),
 });
 
 interface RecentCommitStats {

@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
-import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
+import { KeybindingsManager, setKeyHintPlatform } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { getThemeByName, initTheme, type Theme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
 	dedupeParseErrors,
@@ -12,6 +12,7 @@ import {
 	formatExpandHint,
 	formatParseErrors,
 	formatScreenshot,
+	shortenPath,
 	truncateDiffByHunk,
 } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { getKeybindings, setKeybindings, type KeybindingsManager as TuiKeybindingsManager } from "@oh-my-pi/pi-tui";
@@ -56,6 +57,7 @@ describe("formatScreenshot", () => {
 			wasResized: boolean;
 			buffer: Uint8Array;
 			mimeType: string;
+			decodeFailed: boolean;
 		}>,
 	): {
 		buffer: Uint8Array;
@@ -65,6 +67,7 @@ describe("formatScreenshot", () => {
 		width: number;
 		height: number;
 		wasResized: boolean;
+		decodeFailed?: boolean;
 		get data(): string;
 	} {
 		const buf = overrides?.buffer ?? new Uint8Array(2048);
@@ -76,6 +79,7 @@ describe("formatScreenshot", () => {
 			width: overrides?.width ?? 800,
 			height: overrides?.height ?? 600,
 			wasResized: overrides?.wasResized ?? false,
+			decodeFailed: overrides?.decodeFailed,
 			get data() {
 				return Buffer.from(buf).toString("base64");
 			},
@@ -101,7 +105,19 @@ describe("formatScreenshot", () => {
 		]);
 	});
 
+	it("uses forward slashes after a shortened Windows home", () => {
+		const home = String.raw`C:\Users\me`;
+		expect(shortenPath(String.raw`C:\Users\me\projects\demo`, home)).toBe("~/projects/demo");
+	});
+
+	it("does not shorten paths outside the home boundary", () => {
+		const home = String.raw`C:\Users\me`;
+		const sibling = String.raw`C:\Users\me2\projects\demo`;
+		expect(shortenPath(sibling, home)).toBe(sibling);
+	});
+
 	it("formats non-home path without tilde", () => {
+		const filePath = path.join(path.parse(os.homedir()).root, "omp-render-utils", "capture.png");
 		const resized = fakeResized({ mimeType: "image/webp", buffer: new Uint8Array(1024) });
 
 		expect(
@@ -109,12 +125,12 @@ describe("formatScreenshot", () => {
 				saveFullRes: true,
 				savedMimeType: "image/png",
 				savedByteLength: 2048,
-				dest: "/tmp/capture.png",
+				dest: filePath,
 				resized,
 			}),
 		).toEqual([
 			"Screenshot captured",
-			"Saved: image/png (2.00 KB) to /tmp/capture.png",
+			`Saved: image/png (2.00 KB) to ${filePath}`,
 			"Model: image/webp (1.00 KB, 800x600)",
 		]);
 	});
@@ -127,10 +143,24 @@ describe("formatScreenshot", () => {
 				saveFullRes: false,
 				savedMimeType: "image/webp",
 				savedByteLength: 3072,
-				dest: "/tmp/omp-sshots-123.png",
+				dest: path.join(os.tmpdir(), "omp-sshots-123.png"),
 				resized,
 			}),
 		).toEqual(["Screenshot captured", "Format: image/webp (3.00 KB)", "Dimensions: 800x600"]);
+	});
+
+	it("surfaces screenshots that could not be resized", () => {
+		const resized = fakeResized({ decodeFailed: true, mimeType: "image/png", buffer: new Uint8Array(4096) });
+
+		expect(
+			formatScreenshot({
+				saveFullRes: false,
+				savedMimeType: "image/png",
+				savedByteLength: 4096,
+				dest: path.join(os.tmpdir(), "omp-sshots-123.png"),
+				resized,
+			}),
+		).toContain("Resize: image decoder failed; using original image bytes");
 	});
 
 	it("appends dimension note when image was resized", () => {
@@ -146,7 +176,7 @@ describe("formatScreenshot", () => {
 			saveFullRes: false,
 			savedMimeType: "image/webp",
 			savedByteLength: 2048,
-			dest: "/tmp/shot.png",
+			dest: path.join(os.tmpdir(), "shot.png"),
 			resized,
 		});
 
@@ -256,6 +286,75 @@ describe("truncateDiffByHunk", () => {
 		expect(idxOld).toBeLessThan(idxNew);
 		expect(idxNew).toBeLessThan(idxTrailing);
 	});
+	it("caps one oversized change hunk at the line budget", () => {
+		const diff = makeHunk("+", 0, 1_000).join("\n");
+		const head = truncateDiffByHunk(diff, 4, 32);
+		const tail = truncateDiffByHunk(diff, 4, 32, { fromTail: true });
+
+		expect(head.text.split("\n")).toHaveLength(32);
+		expect(head.text).toStartWith("+ new 0\n");
+		expect(head.text).toEndWith("+ new 31");
+		expect(head.hiddenLines).toBe(968);
+		expect(head.hiddenHunks).toBe(0);
+
+		expect(tail.text.split("\n")).toHaveLength(32);
+		expect(tail.text).toStartWith("+ new 968\n");
+		expect(tail.text).toEndWith("+ new 999");
+		expect(tail.hiddenLines).toBe(968);
+		expect(tail.hiddenHunks).toBe(0);
+	});
+
+	it("keeps an exact-size change hunk unchanged", () => {
+		const diff = makeHunk("-", 0, 32).join("\n");
+		expect(truncateDiffByHunk(diff, 4, 32)).toEqual({
+			text: diff,
+			hiddenHunks: 0,
+			hiddenLines: 0,
+		});
+	});
+	it("drops surrounding context when changes exactly fill the line budget", () => {
+		const diff = [" leading context", ...makeHunk("+", 0, 32), " trailing context"].join("\n");
+
+		for (const result of [truncateDiffByHunk(diff, 4, 32), truncateDiffByHunk(diff, 4, 32, { fromTail: true })]) {
+			expect(result.text.split("\n")).toHaveLength(32);
+			expect(result.text).not.toContain("context");
+			expect(result.hiddenLines).toBe(2);
+			expect(result.hiddenHunks).toBe(0);
+		}
+	});
+
+	it("does not exceed the line budget when context rounding spans multiple hunks", () => {
+		const diff = [
+			" leading context",
+			...makeHunk("+", 0, 15),
+			" middle context a",
+			" middle context b",
+			...makeHunk("-", 100, 15),
+			" trailing context",
+		].join("\n");
+
+		for (const result of [truncateDiffByHunk(diff, 4, 32), truncateDiffByHunk(diff, 4, 32, { fromTail: true })]) {
+			expect(result.text.split("\n")).toHaveLength(32);
+			expect(result.hiddenLines).toBe(2);
+			expect(result.hiddenHunks).toBe(0);
+		}
+	});
+	it("does not count a removed separator as a hidden hunk", () => {
+		const diff = [...makeHunk("+", 0, 16), " hunk separator", ...makeHunk("-", 100, 16)].join("\n");
+
+		for (const result of [truncateDiffByHunk(diff, 4, 32), truncateDiffByHunk(diff, 4, 32, { fromTail: true })]) {
+			expect(result.text.split("\n")).toHaveLength(32);
+			expect(result.hiddenLines).toBe(1);
+			expect(result.hiddenHunks).toBe(0);
+		}
+	});
+	it("reports every hunk excluded by the hunk limit", () => {
+		const diff = buildDiff(6, 1);
+
+		for (const result of [truncateDiffByHunk(diff, 2, 100), truncateDiffByHunk(diff, 2, 100, { fromTail: true })]) {
+			expect(result.hiddenHunks).toBe(4);
+		}
+	});
 });
 
 describe("formatErrorMessage (F4 sanitization)", () => {
@@ -298,9 +397,11 @@ describe("formatExpandHint / expandKeyHint", () => {
 	let previous: TuiKeybindingsManager;
 	beforeEach(() => {
 		previous = getKeybindings();
+		setKeyHintPlatform("linux");
 	});
 	afterEach(() => {
 		setKeybindings(previous);
+		setKeyHintPlatform(undefined);
 	});
 
 	it("reports the default tool-output expand key", () => {

@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AuthStorage, type OAuthCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { AuthStorage, type FetchImpl, type OAuthCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { removeWithRetries } from "../../utils/src/temp";
+import { registerOAuthProvider, unregisterOAuthProviders } from "../src/registry/oauth";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
 
@@ -121,7 +123,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		authStorage = null;
 		dbPath = "";
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 			tempDir = "";
 		}
 	});
@@ -360,7 +362,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 			const legacyDbPath = path.join(tempDir, "legacy-v1-anthropic-agent.db");
 			const legacyDb = new Database(legacyDbPath);
-			legacyDb.exec(`
+			legacyDb.run(`
 				CREATE TABLE auth_schema_version (
 					id INTEGER PRIMARY KEY CHECK (id = 1),
 					version INTEGER NOT NULL
@@ -429,7 +431,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		const freshDbPath = path.join(tempDir, "fresh-schema-agent.db");
 		const freshStore = await SqliteAuthCredentialStore.open(freshDbPath);
 		try {
-			expect(readAuthSchemaVersion(freshDbPath)).toBe(4);
+			expect(readAuthSchemaVersion(freshDbPath)).toBe(7);
 			expect(readTableSql(freshDbPath, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(freshDbPath, "auth_credentials")).toContain("strftime('%s','now')");
 		} finally {
@@ -442,12 +444,12 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const futureDbPath = path.join(tempDir, "future-schema-agent.db");
 		const futureDb = new Database(futureDbPath);
-		futureDb.exec(`
+		futureDb.run(`
 			CREATE TABLE auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
 			);
-			INSERT INTO auth_schema_version(id, version) VALUES (1, 5);
+			INSERT INTO auth_schema_version(id, version) VALUES (1, 8);
 			CREATE TABLE auth_credentials (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				provider TEXT NOT NULL,
@@ -463,7 +465,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const reopenedStore = await SqliteAuthCredentialStore.open(futureDbPath);
 		try {
-			expect(readAuthSchemaVersion(futureDbPath)).toBe(5);
+			expect(readAuthSchemaVersion(futureDbPath)).toBe(8);
 		} finally {
 			reopenedStore.close();
 		}
@@ -489,7 +491,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 			const reopened = await SqliteAuthCredentialStore.open(reopenDbPath);
 			try {
 				expect(reopened.listAuthCredentials("openai")).toHaveLength(1);
-				expect(readAuthSchemaVersion(reopenDbPath)).toBe(4);
+				expect(readAuthSchemaVersion(reopenDbPath)).toBe(7);
 			} finally {
 				reopened.close();
 			}
@@ -505,7 +507,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const legacyDbPath = path.join(tempDir, "legacy-v3-agent.db");
 		const legacyDb = new Database(legacyDbPath);
-		legacyDb.exec(`
+		legacyDb.run(`
 			CREATE TABLE auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
@@ -545,7 +547,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const migratedStore = await SqliteAuthCredentialStore.open(legacyDbPath);
 		try {
-			expect(readAuthSchemaVersion(legacyDbPath)).toBe(4);
+			expect(readAuthSchemaVersion(legacyDbPath)).toBe(7);
 			expect(readTableSql(legacyDbPath, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(legacyDbPath, "auth_credentials")).toContain("strftime('%s','now')");
 			expect(readStoredIdentityRows(legacyDbPath, "openai-codex")).toEqual([
@@ -561,7 +563,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const legacyDbPath = path.join(tempDir, "legacy-v1-agent.db");
 		const legacyDb = new Database(legacyDbPath);
-		legacyDb.exec(`
+		legacyDb.run(`
 			CREATE TABLE auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
@@ -612,7 +614,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const legacyDbPath = path.join(tempDir, "legacy-agent.db");
 		const legacyDb = new Database(legacyDbPath);
-		legacyDb.exec(`
+		legacyDb.run(`
 			CREATE TABLE auth_credentials (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				provider TEXT NOT NULL,
@@ -648,5 +650,256 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		} finally {
 			migratedStore.close();
 		}
+	});
+});
+
+describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => {
+	let tempDir = "";
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auth-login-test-"));
+	});
+
+	afterEach(async () => {
+		unregisterOAuthProviders("auth-storage-login-upgrade-test");
+		if (tempDir) {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("allows multiple OAuth accounts to coexist and replaces legacy api_key rows on OAuth login", async () => {
+		if (!tempDir) throw new Error("test setup failed");
+
+		const dbPath = path.join(tempDir, "login-upgrade.db");
+		const authStorage = await AuthStorage.create(dbPath);
+
+		try {
+			// 1. Setup a legacy api_key credential
+			await authStorage.set("unit-login-upgrade", { type: "api_key", key: "sk-legacy-key" });
+			expect(await authStorage.getApiKey("unit-login-upgrade")).toBe("sk-legacy-key");
+
+			// 2. Register custom oauth provider
+			let loginReturns: (Omit<OAuthCredential, "type"> & { type?: string }) | null = null;
+			registerOAuthProvider({
+				id: "unit-login-upgrade",
+				name: "Unit Login Upgrade",
+				sourceId: "auth-storage-login-upgrade-test",
+				login: async () => {
+					if (!loginReturns) throw new Error("no credentials");
+					const { type, ...rest } = loginReturns;
+					return rest;
+				},
+				refreshToken: async () => {
+					if (!loginReturns) throw new Error("no credentials");
+					const { type, ...rest } = loginReturns;
+					return rest;
+				},
+			});
+
+			// 3. Login first OAuth account
+			loginReturns = {
+				refresh: "refresh-token-1",
+				access: "access-token-1",
+				expires: Date.now() + 60_000,
+				projectId: "project-1",
+				email: "user-1@example.com",
+			};
+			await authStorage.login("unit-login-upgrade", {
+				onAuth: () => {},
+				onPrompt: async () => "",
+			});
+
+			// Legacy api_key should be gone/replaced, and first oauth account is active.
+			// getApiKey should now return the first OAuth access token (since the api_key is gone).
+			expect(await authStorage.getApiKey("unit-login-upgrade")).toBe("access-token-1");
+			const firstRows = readStoredIdentityRows(dbPath, "unit-login-upgrade");
+			expect(firstRows).toEqual([
+				{ identity_key: null, disabled_cause: "replaced by oauth login" },
+				{ identity_key: "email:user-1@example.com", disabled_cause: null },
+			]);
+
+			// 4. Login second OAuth account
+			loginReturns = {
+				refresh: "refresh-token-2",
+				access: "access-token-2",
+				expires: Date.now() + 60_000,
+				projectId: "project-2",
+				email: "user-2@example.com",
+			};
+			await authStorage.login("unit-login-upgrade", {
+				onAuth: () => {},
+				onPrompt: async () => "",
+			});
+
+			// Both OAuth accounts should coexist! No accounts should be disabled
+			const secondRows = readStoredIdentityRows(dbPath, "unit-login-upgrade");
+			expect(secondRows).toEqual([
+				{ identity_key: null, disabled_cause: "replaced by oauth login" },
+				{ identity_key: "email:user-1@example.com", disabled_cause: null },
+				{ identity_key: "email:user-2@example.com", disabled_cause: null },
+			]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("keeps existing NVIDIA API keys active when login adds another key", async () => {
+		if (!tempDir) throw new Error("test setup failed");
+
+		const dbPath = path.join(tempDir, "api-key-rotation.db");
+		const authStorage = await AuthStorage.create(dbPath);
+		const prompts = ["nvapi-first", "nvapi-second"];
+		const fetchMock: FetchImpl = async () =>
+			new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+
+		try {
+			await authStorage.login("nvidia", {
+				onAuth: () => {},
+				onPrompt: async () => prompts.shift() ?? "",
+				fetch: fetchMock,
+			});
+			await authStorage.login("nvidia", {
+				onAuth: () => {},
+				onPrompt: async () => prompts.shift() ?? "",
+				fetch: fetchMock,
+			});
+
+			expect(authStorage.listStoredCredentials("nvidia").map(entry => entry.credential)).toEqual([
+				{ type: "api_key", key: "nvapi-first", source: "login" },
+				{ type: "api_key", key: "nvapi-second", source: "login" },
+			]);
+
+			const selectedKeys = new Set<string>();
+			for (let index = 0; index < 64; index += 1) {
+				const key = await authStorage.getApiKey("nvidia", `session-${index}`);
+				if (key) selectedKeys.add(key);
+			}
+			expect(selectedKeys).toEqual(new Set(["nvapi-first", "nvapi-second"]));
+		} finally {
+			authStorage.close();
+		}
+	});
+});
+
+describe("AuthStorage persistent session stickiness", () => {
+	let tempDir = "";
+	let dbPath = "";
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auth-test-"));
+		dbPath = path.join(tempDir, "auth.db");
+	});
+
+	afterEach(async () => {
+		await removeWithRetries(tempDir);
+	});
+
+	it("persists session-sticky credentials across AuthStorage restarts", async () => {
+		// 1. Initialize AuthStorage and log in two accounts
+		let authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
+
+		try {
+			const credential1: OAuthCredential = {
+				type: "oauth",
+				refresh: "refresh-token-1",
+				access: "access-token-1",
+				expires: Date.now() + 3600_000,
+				projectId: "project-1",
+				email: "user-1@example.com",
+			};
+			const credential2: OAuthCredential = {
+				type: "oauth",
+				refresh: "refresh-token-2",
+				access: "access-token-2",
+				expires: Date.now() + 3600_000,
+				projectId: "project-2",
+				email: "user-2@example.com",
+			};
+			await authStorage.set("unit-session-stickiness", [credential1, credential2]);
+
+			// 2. Resolve initial key for session-1
+			const key1 = await authStorage.getApiKey("unit-session-stickiness", "session-1");
+			expect(key1).toBe("access-token-2");
+
+			// 3. Rotate session-1's sticky credential to the sibling
+			await authStorage.rotateSessionCredential("unit-session-stickiness", "session-1");
+			const key2 = await authStorage.getApiKey("unit-session-stickiness", "session-1");
+			expect(key2).toBe("access-token-1");
+
+			// 4. Close AuthStorage to simulate process restart
+			authStorage.close();
+
+			// 5. Re-instantiate AuthStorage using the same DB
+			authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
+			await authStorage.reload();
+
+			// 6. Retrieve the sticky key again for session-1 (should still be access-token-1)
+			const key3 = await authStorage.getApiKey("unit-session-stickiness", "session-1");
+			expect(key3).toBe("access-token-1");
+
+			authStorage.close();
+		} finally {
+			// No-op
+		}
+	});
+
+	it("drops persisted session stickiness after a lower-index credential is removed", async () => {
+		const provider = "unit-sticky-invalidation";
+		const mk = (suffix: string): OAuthCredential => ({
+			type: "oauth",
+			refresh: `refresh-${suffix}`,
+			access: `access-${suffix}`,
+			expires: Date.now() + 3600_000,
+			projectId: `project-${suffix}`,
+			email: `user-${suffix}@example.com`,
+		});
+		const initialCredentials = [mk("a"), mk("b"), mk("c"), mk("d")];
+		const remainingCredentials = initialCredentials.slice(1);
+
+		let authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
+		await authStorage.set(provider, initialCredentials);
+		let rows = authStorage.listStoredCredentials(provider);
+
+		const control = new AuthStorage(
+			new SqliteAuthCredentialStore(new Database(path.join(tempDir, "sticky-control.db"))),
+		);
+		await control.set(provider, remainingCredentials);
+		let session: string | undefined;
+		let stuckId = -1;
+		let stuckIndex = -1;
+		let stuckToken: string | undefined;
+		let freshToken: string | undefined;
+		try {
+			for (let i = 0; i < 256 && session === undefined; i++) {
+				const candidate = `sticky-probe-${i}`;
+				const token = await authStorage.getApiKey(provider, candidate);
+				const expectedFreshToken = await control.getApiKey(provider, candidate);
+				const index = rows.findIndex(row => (row.credential as OAuthCredential).access === token);
+				if (index >= 1 && index <= rows.length - 2 && token !== expectedFreshToken) {
+					session = candidate;
+					stuckIndex = index;
+					stuckId = rows[index].id;
+					stuckToken = token;
+					freshToken = expectedFreshToken;
+				}
+			}
+		} finally {
+			control.close();
+		}
+		expect(session).toBeDefined();
+		expect(freshToken).toBeDefined();
+
+		expect(await authStorage.removeCredential(provider, rows[0].id)).toBe(true);
+		authStorage.close();
+
+		authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(dbPath)));
+		await authStorage.reload();
+		rows = authStorage.listStoredCredentials(provider);
+		expect(rows.findIndex(row => row.id === stuckId)).toBe(stuckIndex - 1);
+
+		const resolved = await authStorage.getApiKey(provider, session);
+		authStorage.close();
+		expect(resolved).toBe(freshToken);
+		expect(resolved).not.toBe(stuckToken);
 	});
 });

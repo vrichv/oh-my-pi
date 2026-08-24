@@ -10,7 +10,7 @@
  * The relay repo's build script runs this and embeds the output via go:embed.
  */
 import * as path from "node:path";
-import { generateThemeVars, getTemplate } from "../src/export/html";
+import { generateThemeStyles, getTemplate } from "../src/export/html";
 
 const outPath = process.argv[2];
 if (!outPath) {
@@ -19,11 +19,11 @@ if (!outPath) {
 }
 
 const loaderJs = await Bun.file(new URL("../src/export/html/share-loader.js", import.meta.url).pathname).text();
-// Pin a built-in theme: the viewer is a public artifact, not a per-user export.
-const themeVars = await generateThemeVars("dark");
+// Public artifacts use the bundled omp web themes rather than TUI themes.
+const themeStyles = await generateThemeStyles("web");
 
 const html = getTemplate()
-	.replace("<theme-vars/>", () => `<style>:root { ${themeVars} }</style>`)
+	.replace("<theme-vars/>", () => `<style>${themeStyles}</style>`)
 	.replace("<title>Session Export</title>", () => "<title>omp session</title>")
 	.replace("{{SESSION_DATA}}</script>", () => `</script>\n  <script>${loaderJs}</script>`);
 

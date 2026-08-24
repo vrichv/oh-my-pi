@@ -3,11 +3,33 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { buildDocsIndexPayload } from "./generate-docs-index";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outDir = path.join(packageDir, "dist");
 const cliPath = path.join(outDir, "cli.js");
 const shebang = "#!/usr/bin/env bun\n";
+const legacyHtmlExportAssetPattern = /^(?:template-[^.]+\.(?:css|html|js)|tool-views\.generated-[^.]+\.js)$/;
+
+// Native / optional / platform-specific deps are loaded from installed files.
+// `omp-legacy-pi-modules` exists only in compiled binaries via the build plugin;
+// the npm bundle never executes that `isCompiledBinary()` branch.
+const ALWAYS_EXTERNAL = [
+	"@oh-my-pi/pi-natives",
+	"@huggingface/transformers",
+	"fastembed",
+	"onnxruntime-node",
+	"omp-legacy-pi-modules",
+];
+
+// Heavy, lazily-used third-party leaf deps. Each is a declared `dependency`, so the
+// published package resolves it from node_modules at runtime; bundling only embeds a
+// redundant copy that bloats dist/cli.js. NEVER add a patched dependency here — the
+// bundle is where a root `patchedDependencies` patch is baked in, so an externalized
+// import would load the unpatched npm package in users' installs (currently
+// @ark/schema is patched, so it — and arktype, which pulls @ark/schema — stay
+// bundled).
+const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
 
 async function runCommand(command: string[]): Promise<void> {
 	const proc = Bun.spawn(command, {
@@ -32,8 +54,8 @@ function formatBytes(bytes: number): string {
 }
 
 async function cleanBundleOutputs(): Promise<void> {
-	// dist/ is shared with the dev binary (dist/omp); only remove this
-	// script's own outputs (entry bundle + copied native assets).
+	// dist/ is shared with the dev binary (dist/omp); only remove assets
+	// emitted by this script.
 	let entries: string[];
 	try {
 		entries = await fs.readdir(outDir);
@@ -43,7 +65,15 @@ async function cleanBundleOutputs(): Promise<void> {
 	}
 	await Promise.all(
 		entries
-			.filter(entry => entry === "cli.js" || entry.endsWith(".node") || entry.endsWith(".js.map"))
+			.filter(
+				entry =>
+					entry === "cli.js" ||
+					entry === "docs-index.generated.txt" ||
+					entry.endsWith(".node") ||
+					entry.endsWith(".js.map") ||
+					(entry.startsWith("CHANGELOG-") && entry.endsWith(".md")) ||
+					legacyHtmlExportAssetPattern.test(entry),
+			)
 			.map(entry => fs.rm(path.join(outDir, entry), { force: true })),
 	);
 }
@@ -51,39 +81,44 @@ async function cleanBundleOutputs(): Promise<void> {
 async function main(): Promise<void> {
 	const start = Bun.nanoseconds();
 	await cleanBundleOutputs();
-	// The npm bundle ships no stats dashboard sources or prebuilt dist/client,
-	// so embed the dashboard archive the same way compiled binaries do
-	// (scripts/build-binary.ts). Reset afterwards to keep the checked-in
-	// placeholder empty.
-	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
+	// The npm bundle ships no stats dashboard sources, so embed the dashboard
+	// archive the same way compiled binaries do (scripts/build-binary.ts). Reset
+	// afterwards to keep the checked-in placeholder empty.
+	await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+	// One payload for both consumers: inlined into dist/cli.js via `--define` for
+	// the bundled CLI entrypoint, and written to dist/docs-index.generated.txt so
+	// SDK consumers importing `@oh-my-pi/pi-coding-agent/*` (TypeScript source, no
+	// build-time embed) can still resolve omp:// docs (see src/internal-urls/docs-index.ts).
 	try {
-		await runCommand([
-			"bun",
-			"build",
-			"--target=bun",
-			"--outdir",
-			"dist",
-			"--minify-whitespace",
-			"--minify-syntax",
-			"--keep-names",
-			"--external",
-			"mupdf",
-			"--external",
-			"@oh-my-pi/pi-natives",
-			"--external",
-			"@huggingface/transformers",
-			"--external",
-			"fastembed",
-			"--external",
-			"onnxruntime-node",
-			"--define",
-			'process.env.PI_BUNDLED="true"',
-			"./src/cli.ts",
-		]);
+		const docsPayload = await buildDocsIndexPayload();
+		// Build in-process: the docs embed payload is far larger than Linux's
+		// 128KiB per-argv-string cap, so it can never be passed as a CLI
+		// `--define` (posix_spawn fails with E2BIG).
+		const output = await Bun.build({
+			entrypoints: [path.join(packageDir, "src/cli.ts")],
+			outdir: outDir,
+			target: "bun",
+			external: [...ALWAYS_EXTERNAL, ...RUNTIME_EXTERNAL],
+			define: {
+				"process.env.PI_BUNDLED": JSON.stringify("true"),
+				"process.env.PI_DOCS_EMBED": JSON.stringify(docsPayload.payload),
+			},
+			minify: {
+				whitespace: true,
+				syntax: true,
+				identifiers: true,
+				keepNames: true,
+			},
+			throw: false,
+		});
+		if (!output.success) {
+			throw new Error(`CLI bundle failed:\n${output.logs.map(log => log.message).join("\n")}`);
+		}
+		await ensureShebang();
+		await Bun.write(path.join(outDir, "docs-index.generated.txt"), docsPayload.payload);
 	} finally {
-		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
+		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
 	}
-	await ensureShebang();
 	const stat = await fs.stat(cliPath);
 	const elapsedMs = (Bun.nanoseconds() - start) / 1_000_000;
 	process.stdout.write(

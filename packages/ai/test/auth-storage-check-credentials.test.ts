@@ -15,10 +15,12 @@
  *   5. Providers with no registered `UsageProvider` report `ok: null` with
  *      "no usage probe configured" — the credential's status is unknown,
  *      not failed.
- *   6. When a `completionProbe` is supplied, it receives the post-refresh
+ *   6. Local-only usage providers opt out of health validation and leave
+ *      `ok: null` unless a separate completion probe is supplied.
+ *   7. When a `completionProbe` is supplied, it receives the post-refresh
  *      bearer for every row, runs independently of the usage probe (i.e. it
- *      still runs for providers without a `UsageProvider`), but is skipped
- *      when OAuth refresh fails.
+ *      still runs for providers without a validating `UsageProvider`), but is
+ *      skipped when OAuth refresh fails.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
@@ -32,6 +34,7 @@ import {
 } from "@oh-my-pi/pi-ai/auth-storage";
 import type { UsageProvider } from "@oh-my-pi/pi-ai/usage";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
+import { ollamaCloudUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 
 function oauthRow(id: number, email: string, opts?: { expired?: boolean }): StoredAuthCredential {
 	const credential: AuthCredential = {
@@ -396,6 +399,33 @@ describe("AuthStorage.checkCredentials", () => {
 		}
 	});
 
+	it("does not mark local-only usage providers healthy without upstream validation", async () => {
+		const apiKeyRow: StoredAuthCredential = {
+			id: 12,
+			provider: "ollama-cloud",
+			credential: { type: "api_key", key: "sk-ollama-cloud" },
+			disabledCause: null,
+		};
+		const store = makeStore([apiKeyRow]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "ollama-cloud" ? ollamaCloudUsageProvider : undefined),
+		});
+		await storage.reload();
+
+		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: false, reason: "401 invalid_api_key" });
+
+		try {
+			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			expect(result.ok).toBeNull();
+			expect(result.reason).toMatch(/does not validate credentials/);
+			expect(result.report).toBeUndefined();
+			expect(probe).toHaveBeenCalledTimes(1);
+			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("skips the completionProbe when OAuth refresh fails", async () => {
 		const refreshSpy = vi
 			.fn<NonNullable<AuthCredentialStore["refreshOAuthCredential"]>>()
@@ -488,6 +518,40 @@ describe("AuthStorage.checkCredentials", () => {
 				expect(input.credential.refreshToken).toBe(REMOTE_REFRESH_SENTINEL);
 				expect(input.credential.accessToken).toBe("oat-13");
 			}
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("probes reference-stored API keys with the resolved secret", async () => {
+		// Keys stored as references (env var name, "!command") must reach the
+		// usage probe as the resolved secret — probing with the literal
+		// reference string would 401 and flag a working credential as bad.
+		const apiKeyRow: StoredAuthCredential = {
+			id: 21,
+			provider: "opencode-go",
+			credential: { type: "api_key", key: "ref:opencode" },
+			disabledCause: null,
+		};
+		const seenKeys: Array<string | undefined> = [];
+		const probeProvider: UsageProvider = {
+			id: "opencode-go",
+			validatesCredentials: true,
+			async fetchUsage(params) {
+				seenKeys.push(params.credential.type === "api_key" ? params.credential.apiKey : undefined);
+				return { provider: "opencode-go", fetchedAt: Date.now(), limits: [] };
+			},
+		};
+		const storage = new AuthStorage(makeStore([apiKeyRow]), {
+			usageProviderResolver: provider => (provider === "opencode-go" ? probeProvider : undefined),
+			configValueResolver: async config => (config === "ref:opencode" ? "sk-resolved-secret" : config),
+		});
+		await storage.reload();
+
+		try {
+			const [result] = await storage.checkCredentials();
+			expect(seenKeys).toEqual(["sk-resolved-secret"]);
+			expect(result.ok).toBe(true);
 		} finally {
 			storage.close();
 		}

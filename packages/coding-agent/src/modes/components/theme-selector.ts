@@ -1,12 +1,13 @@
-import { Container, type SelectItem, SelectList } from "@oh-my-pi/pi-tui";
+import { type SelectItem, SelectList, type SgrMouseEvent } from "@oh-my-pi/pi-tui";
 import { getSelectListTheme } from "../../modes/theme/theme";
-import { DynamicBorder } from "./dynamic-border";
+import { OverlayPanel } from "./overlay-box";
+import { routeSelectListMouseWithTopBorder } from "./select-list-mouse-routing";
 
 /**
  * Component that renders a theme selector.
  * Themes must be pre-loaded and passed to the constructor.
  */
-export class ThemeSelectorComponent extends Container {
+export class ThemeSelectorComponent extends OverlayPanel {
 	#selectList: SelectList;
 	#onPreview: (themeName: string) => void;
 
@@ -17,7 +18,7 @@ export class ThemeSelectorComponent extends Container {
 		onCancel: () => void,
 		onPreview: (themeName: string) => void,
 	) {
-		super();
+		super("Theme");
 		this.#onPreview = onPreview;
 
 		// Create select items from provided themes
@@ -26,9 +27,6 @@ export class ThemeSelectorComponent extends Container {
 			label: name,
 			description: name === currentTheme ? "(current)" : undefined,
 		}));
-
-		// Add top border
-		this.addChild(new DynamicBorder());
 
 		// Create selector
 		this.#selectList = new SelectList(themeItems, 10, getSelectListTheme());
@@ -52,12 +50,13 @@ export class ThemeSelectorComponent extends Container {
 		};
 
 		this.addChild(this.#selectList);
-
-		// Add bottom border
-		this.addChild(new DynamicBorder());
 	}
 
 	getSelectList(): SelectList {
 		return this.#selectList;
+	}
+
+	routeMouse(event: SgrMouseEvent, line: number, col: number): void {
+		routeSelectListMouseWithTopBorder(this.#selectList, event, line, col);
 	}
 }

@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -153,6 +154,20 @@ describe("SQLite tool support", () => {
 		await fs.writeFile(dbPath, fixtureBytes);
 		return dbPath;
 	}
+	async function stampCleanWalDb(name: string): Promise<string> {
+		const dbPath = path.join(tmpDir, name);
+		const db = new Database(`${dbPath}.source`);
+		try {
+			db.run("PRAGMA journal_mode = WAL");
+			db.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+			db.prepare("INSERT INTO entries (value) VALUES (?)").run("persisted");
+			db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+		} finally {
+			db.close();
+		}
+		await fs.copyFile(`${dbPath}.source`, dbPath);
+		return dbPath;
+	}
 
 	beforeAll(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqlite-tool-test-"));
@@ -178,7 +193,7 @@ describe("SQLite tool support", () => {
 		} else {
 			Bun.env.PI_EDIT_VARIANT = originalEditVariant;
 		}
-		await fs.rm(tmpDir, { recursive: true, force: true });
+		await removeWithRetries(tmpDir);
 	});
 
 	it("parses SQLite path candidates at the extension boundary", () => {
@@ -219,6 +234,29 @@ describe("SQLite tool support", () => {
 		expect(text).toContain("slugs (2 rows)");
 		expect(text).toContain("notes (3 rows)");
 		expect(text).not.toContain("sqlite_sequence");
+	});
+
+	it("reads a clean WAL database after its writer removes the sidecar files", async () => {
+		const walPath = await stampCleanWalDb("clean-wal.sqlite");
+
+		const result = await readTool.execute("sqlite-clean-wal", { path: walPath });
+
+		expect(getText(result)).toContain("entries (1 rows)");
+	});
+
+	it("keeps the clean-WAL fallback query-only", async () => {
+		const walPath = await stampCleanWalDb("query-only-wal.sqlite");
+
+		await expect(
+			readTool.execute("sqlite-clean-wal-write", {
+				path: `${walPath}?q=INSERT+INTO+entries+(value)+VALUES+('mutated')`,
+			}),
+		).rejects.toThrow();
+		const result = await readTool.execute("sqlite-clean-wal-count", {
+			path: `${walPath}?q=SELECT+COUNT(*)+AS+count+FROM+entries`,
+		});
+
+		expect(getText(result)).toContain("| 1");
 	});
 
 	it("lists tables for a .db database when the magic bytes match SQLite", async () => {
@@ -364,6 +402,36 @@ describe("SQLite tool support", () => {
 			table: "wide_rows",
 			dbPath: sqlitePath,
 		});
+
+		for (const line of rendered.split("\n")) {
+			expect(Bun.stringWidth(line)).toBeLessThanOrEqual(120);
+		}
+	});
+
+	it("falls back to vertical row blocks when the column count exceeds the horizontal budget (#3107)", () => {
+		const columns = ["_id", ...Array.from({ length: 32 }, (_, i) => `col_${i + 1}`)];
+		const row: Record<string, unknown> = { _id: 7 };
+		for (let i = 1; i <= 32; i++) row[`col_${i}`] = `value_${i}`;
+
+		const rendered = renderTable(columns, [row], {
+			totalCount: 1,
+			offset: 0,
+			limit: 20,
+			table: "wide_columns",
+			dbPath: sqlitePath,
+		});
+
+		// Horizontal layout would shrink every column to width 1 and chop the
+		// right edge — i.e., the line would look like `| … | … | … | …` (>=2
+		// ellipses chained by ` | `). Vertical mode renders one `col: value`
+		// per line, so that signature must NOT be present.
+		expect(rendered).not.toMatch(/…(?: \| …){2,}/);
+
+		// Each declared column must appear with its real value on its own line.
+		expect(rendered).toContain("── Row 1 ──");
+		expect(rendered).toContain("_id   : 7");
+		expect(rendered).toContain("col_1 : value_1");
+		expect(rendered).toContain("col_32: value_32");
 
 		for (const line of rendered.split("\n")) {
 			expect(Bun.stringWidth(line)).toBeLessThanOrEqual(120);

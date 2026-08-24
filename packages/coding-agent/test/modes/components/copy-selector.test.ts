@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import { stripVTControlCharacters } from "node:util";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { CopySelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/copy-selector";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { CopyTarget } from "@oh-my-pi/pi-coding-agent/modes/utils/copy-targets";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
 
@@ -77,7 +77,7 @@ describe("CopySelectorComponent", () => {
 
 	it("renders an outlined tree with code blocks nested under their message", () => {
 		const out = render(new CopySelectorComponent(makeRoots(), { onPick: vi.fn(), onCancel: vi.fn() }));
-		expect(out).toContain("┌");
+		expect(out).toContain(theme.boxRound.topLeft);
 		expect(out).toContain("│");
 		expect(out).toContain("Copy to clipboard");
 		// Messages and their nested blocks are all visible (always expanded),
@@ -87,6 +87,13 @@ describe("CopySelectorComponent", () => {
 		expect(out).toContain("Block 2");
 		expect(out).toContain("Older message");
 		expect(out).toMatch(/[├└]/);
+	});
+
+	it("renders human-readable keybinding hints in the footer", () => {
+		const out = render(new CopySelectorComponent(makeRoots(), { onPick: vi.fn(), onCancel: vi.fn() }));
+
+		expect(out).toContain("Enter copy");
+		expect(out).toContain("Ctrl+G quit");
 	});
 
 	it("copies the message node itself on Enter", () => {
@@ -122,6 +129,19 @@ describe("CopySelectorComponent", () => {
 
 		component.handleInput(UP); // back onto Block 2
 		expect(render(component)).toContain("beta()");
+	});
+
+	it("drops cached preview content when invalidated", () => {
+		const roots = makeRoots();
+		const component = new CopySelectorComponent(roots, { onPick: vi.fn(), onCancel: vi.fn() });
+
+		expect(render(component)).toContain("newest-preview-text");
+
+		roots[0]!.preview = "updated-preview-text";
+		component.invalidate();
+
+		expect(render(component)).toContain("updated-preview-text");
+		expect(render(component)).not.toContain("newest-preview-text");
 	});
 
 	it("quits on the cancel key", () => {

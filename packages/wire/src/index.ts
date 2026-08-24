@@ -298,6 +298,29 @@ export interface SubagentLifecyclePayload {
 // Frames (JSON inside the AES-GCM seal)
 // ═══════════════════════════════════════════════════════════════════════════
 
+export type CollabUiSelectItem = string | { label: string; description?: string };
+
+export type CollabUiResponseValue = string | undefined;
+
+export type CollabUiRequestDraft =
+	| {
+			kind: "select";
+			title: string;
+			options: CollabUiSelectItem[];
+			initialIndex?: number;
+			selectionMarker?: "radio" | "checkbox";
+			checkedIndices?: number[];
+			markableCount?: number;
+			helpText?: string;
+	  }
+	| {
+			kind: "editor";
+			title: string;
+			prefill?: string;
+	  };
+
+export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
+
 export type GuestFrame =
 	| {
 			t: "hello";
@@ -311,6 +334,7 @@ export type GuestFrame =
 			writeToken?: string;
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
@@ -323,18 +347,33 @@ export type HostFrame =
 			t: "welcome";
 			proto: number;
 			header: SessionHeader;
-			entries: SessionEntry[];
 			state: SessionState;
 			agents: AgentSnapshot[];
+			/**
+			 * Total number of `SessionEntry` items the host will deliver in the
+			 * `snapshot-chunk` frames that follow. Guests stay in the loading
+			 * phase until they have accumulated all of them (or a chunk arrives
+			 * with `final: true`).
+			 */
+			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
+	/**
+	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
+	 * transcript into chunks bounded by byte size so a multi-MB session is not
+	 * forced through one giant frame the relay may stall on. The last chunk
+	 * carries `final: true`; guests finalize the replica on that frame.
+	 */
+	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	| { t: "agents"; agents: AgentSnapshot[] }
+	| { t: "ui-request"; request: CollabUiRequest }
+	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
@@ -342,8 +381,23 @@ export type HostFrame =
 
 export type WireFrame = GuestFrame | HostFrame;
 
-/** Wire protocol version carried in `hello`; the host rejects mismatches. */
-export const COLLAB_PROTO = 1;
+/**
+ * Wire protocol version carried in `hello`; the host rejects mismatches.
+ *
+ * - `1` (legacy): `welcome` carried the full `entries` array inline.
+ * - `2`: `welcome` carries only metadata (header/state/agents/entryCount);
+ *   transcript entries follow in `snapshot-chunk` frames, so multi-MB
+ *   sessions are not gated on a single welcome frame fitting under the
+ *   guest's first-welcome timeout.
+ * - `3`: host asks guests through `ui-request`/`ui-request-end` host frames
+ *   answered by the `ui-response` guest frame. Guests that predate the
+ *   grammar would silently drop `ui-request` (asks hang forever on the
+ *   host), so they must be rejected at hello.
+ */
+export const COLLAB_PROTO = 3;
+
+/** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
+export const INTENT_FIELD = "i";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Envelope & link constants

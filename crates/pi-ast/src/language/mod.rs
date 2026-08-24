@@ -112,6 +112,7 @@ impl_lang_expando!(Css, language_css, '_');
 impl_lang_expando!(Dockerfile, language_dockerfile, 'µ');
 impl_lang_expando!(Elixir, language_elixir, 'µ');
 impl_lang_expando!(Erlang, language_erlang, 'µ');
+impl_lang_expando!(Fortran, language_fortran, '𐀀');
 impl_lang_expando!(Go, language_go, 'µ');
 impl_lang!(Graphql, language_graphql);
 impl_lang_expando!(Haskell, language_haskell, 'µ');
@@ -121,7 +122,6 @@ impl_lang_expando!(Just, language_just, 'µ');
 impl_lang_expando!(Kotlin, language_kotlin, 'µ');
 impl_lang_expando!(Nix, language_nix, '_');
 impl_lang_expando!(Ocaml, language_ocaml, 'µ');
-impl_lang_expando!(Perl, language_perl, 'µ');
 impl_lang_expando!(Php, language_php, 'µ');
 impl_lang_expando!(Powershell, language_powershell, 'µ');
 impl_lang_expando!(Proto, language_proto, 'µ');
@@ -282,6 +282,7 @@ pub enum SupportLang {
 	EmacsLisp,
 	Elixir,
 	Erlang,
+	Fortran,
 	Go,
 	Graphql,
 	Haskell,
@@ -301,7 +302,6 @@ pub enum SupportLang {
 	ObjC,
 	Ocaml,
 	Odin,
-	Perl,
 	Php,
 	Powershell,
 	Proto,
@@ -338,10 +338,10 @@ impl SupportLang {
 		use SupportLang::*;
 		&[
 			Astro, Bash, C, Cmake, Cpp, CSharp, Dart, Clojure, Css, Diff, Dockerfile, EmacsLisp,
-			Elixir, Erlang, Go, Graphql, Haskell, Hcl, Html, Ini, Java, JavaScript, Json, Just, Julia,
-			Kotlin, Lua, Make, Markdown, Nix, ObjC, Ocaml, Odin, Perl, Php, Powershell, Proto, Python,
-			R, Regex, Ruby, Rust, Scala, Solidity, Sql, Starlark, Svelte, Swift, Toml, Tlaplus, Tsx,
-			TypeScript, Verilog, Vue, Xml, Yaml, Zig,
+			Elixir, Erlang, Fortran, Go, Graphql, Haskell, Hcl, Html, Ini, Java, JavaScript, Json,
+			Just, Julia, Kotlin, Lua, Make, Markdown, Nix, ObjC, Ocaml, Odin, Php, Powershell, Proto,
+			Python, R, Regex, Ruby, Rust, Scala, Solidity, Sql, Starlark, Svelte, Swift, Toml,
+			Tlaplus, Tsx, TypeScript, Verilog, Vue, Xml, Yaml, Zig,
 		]
 	}
 
@@ -363,6 +363,7 @@ impl SupportLang {
 			Self::EmacsLisp => "emacs-lisp",
 			Self::Elixir => "elixir",
 			Self::Erlang => "erlang",
+			Self::Fortran => "fortran",
 			Self::Go => "go",
 			Self::Graphql => "graphql",
 			Self::Haskell => "haskell",
@@ -382,7 +383,6 @@ impl SupportLang {
 			Self::ObjC => "objc",
 			Self::Ocaml => "ocaml",
 			Self::Odin => "odin",
-			Self::Perl => "perl",
 			Self::Php => "php",
 			Self::Powershell => "powershell",
 			Self::Proto => "protobuf",
@@ -449,6 +449,7 @@ macro_rules! execute_lang_method {
 			S::EmacsLisp => EmacsLisp.$method($($pname,)*),
 			S::Elixir => Elixir.$method($($pname,)*),
 			S::Erlang => Erlang.$method($($pname,)*),
+			S::Fortran => Fortran.$method($($pname,)*),
 			S::Go => Go.$method($($pname,)*),
 			S::Graphql => Graphql.$method($($pname,)*),
 			S::Haskell => Haskell.$method($($pname,)*),
@@ -468,7 +469,6 @@ macro_rules! execute_lang_method {
 			S::ObjC => ObjC.$method($($pname,)*),
 			S::Ocaml => Ocaml.$method($($pname,)*),
 			S::Odin => Odin.$method($($pname,)*),
-			S::Perl => Perl.$method($($pname,)*),
 			S::Php => Php.$method($($pname,)*),
 			S::Powershell => Powershell.$method($($pname,)*),
 			S::Proto => Proto.$method($($pname,)*),
@@ -564,6 +564,7 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 		EmacsLisp => &["el"],
 		Elixir => &["ex", "exs"],
 		Erlang => &["erl", "hrl"],
+		Fortran => &["f90", "F90", "f95", "F95", "f03", "F03", "f08", "F08"],
 		Go => &["go"],
 		Graphql => &["graphql", "gql"],
 		Haskell => &["hs"],
@@ -583,7 +584,6 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 		ObjC => &["m"],
 		Ocaml => &["ml"],
 		Odin => &["odin"],
-		Perl => &["pl", "pm"],
 		Php => &["php"],
 		Powershell => &["ps1", "psm1"],
 		Proto => &["proto"],
@@ -711,6 +711,11 @@ static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "erlang"         => SupportLang::Erlang,
 "erl"            => SupportLang::Erlang,
 "hrl"            => SupportLang::Erlang,
+"fortran"        => SupportLang::Fortran,
+"f90"            => SupportLang::Fortran,
+"f95"            => SupportLang::Fortran,
+"f03"            => SupportLang::Fortran,
+"f08"            => SupportLang::Fortran,
 "go"             => SupportLang::Go,
 "golang"         => SupportLang::Go,
 "graphql"        => SupportLang::Graphql,
@@ -762,9 +767,6 @@ static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "ocaml"          => SupportLang::Ocaml,
 "ml"             => SupportLang::Ocaml,
 "odin"           => SupportLang::Odin,
-"perl"           => SupportLang::Perl,
-"pl"             => SupportLang::Perl,
-"pm"             => SupportLang::Perl,
 "php"            => SupportLang::Php,
 "powershell"     => SupportLang::Powershell,
 "ps1"            => SupportLang::Powershell,

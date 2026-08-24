@@ -14,13 +14,14 @@ from fastapi import Body, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from robomp import github_events
+from robomp import github_events, issue_index
 from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings, get_settings
 from robomp.dashboard import render_index, static_dir, tail_jsonl
 from robomp.db import (
     INACTIVE_EVENT_STATES,
     Database,
+    ReleaseRow,
     get_database,
     iso_seconds_ago,
 )
@@ -29,6 +30,7 @@ from robomp.db import (
 )
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueSummary
+from robomp.issue_index import IssueIndexSync
 from robomp.manual_triage import (
     InvalidIssueRef,
     ManualTriageConflict,
@@ -42,6 +44,23 @@ from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
+
+
+def _release_payload(row: ReleaseRow) -> dict[str, Any]:
+    return {
+        "key": row.key,
+        "repo": row.repo,
+        "tag": row.tag,
+        "version": row.version,
+        "state": row.state,
+        "current_sha": row.current_sha,
+        "last_failed_sha": row.last_failed_sha,
+        "rounds": row.rounds,
+        "last_error": row.last_error,
+        "session_dir": row.session_dir,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
 
 
 @dataclass(slots=True)
@@ -252,6 +271,7 @@ def _build_state(settings: Settings) -> dict[str, Any]:
     )
     pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
     autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
+    index_sync = IssueIndexSync(settings=settings, db=db, github=github)
     return {
         "settings": settings,
         "db": db,
@@ -262,6 +282,7 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         "pool": pool,
         "issue_browse_cache": _IssueBrowseCache(),
         "autoclose": autoclose,
+        "issue_index_sync": index_sync,
     }
 
 
@@ -278,9 +299,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await pool.start()
         autoclose: AutocloseScheduler = app.state.bag["autoclose"]
         await autoclose.start()
+        index_sync: IssueIndexSync = app.state.bag["issue_index_sync"]
+        await index_sync.start()
         try:
             yield
         finally:
+            await index_sync.stop()
             await autoclose.stop()
             await pool.stop(
                 drain_timeout=cfg.shutdown_drain_timeout_seconds,
@@ -328,6 +352,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload=payload,
             allowlist=cfg.repo_allowlist,
         )
+        # Keep the local search index fresh from every delivery that carries an
+        # issue/PR object — including ones the router will skip.
+        if x_github_event in ("issues", "issue_comment") or x_github_event.startswith("pull_request"):
+            repo_full = str((payload.get("repository") or {}).get("full_name") or "")
+            if repo_full and repo_full in cfg.repo_allowlist:
+                try:
+                    issue_index.ingest_webhook_payload(db, repo_full, x_github_event, payload)
+                except Exception:
+                    log.exception("issue index webhook ingest failed", extra={"repo": repo_full})
 
         def _resolve(repo_full: str, pr_number: int) -> str | None:
             row = db.find_issue_by_pr(repo_full, pr_number)
@@ -341,6 +374,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             maintainers=cfg.maintainer_logins,
             reviewer_bots=cfg.reviewer_bots,
             pr_review_enabled=cfg.pr_review_enabled,
+            release_sentinel_enabled=cfg.release_sentinel_enabled,
+            release_commit_prefix=cfg.release_commit_prefix,
             resolve_issue_from_pr=_resolve,
         )
 
@@ -652,6 +687,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         event = db.get_event(delivery_id)
         if event is None:
             raise HTTPException(404, f"unknown delivery {delivery_id}")
+        if event.state != "running":
+            raise HTTPException(
+                409, f"delivery {delivery_id} is {event.state}; only running deliveries can be cancelled"
+            )
 
         pool: WorkerPool = bag["pool"]
         fired = await pool.cancel_event(delivery_id)
@@ -702,6 +741,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         }
 
+    @app.get("/releases")
+    async def releases(request: Request, limit: int = 50) -> dict[str, Any]:
+        capped = max(1, min(int(limit), 500))
+        rows = request.app.state.bag["db"].list_releases(limit=capped)
+        return {"releases": [_release_payload(row) for row in rows]}
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         cfg: Settings = request.app.state.bag["settings"]
@@ -723,6 +768,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # would block the loop and stall every other endpoint — including
             # /healthz — which is how the dashboard ends up "never loading".
             issues_rows = db.list_issues(limit=200)
+            release_rows = db.list_releases(limit=50)
             latest_events = db.latest_events_for_issues(r.key for r in issues_rows)
 
             def _latest_event_payload(key: str) -> dict[str, Any] | None:
@@ -739,6 +785,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 }
 
             events_rows = db.list_events(limit=25)
+
+            # Recent events can reference issues outside the capped 200-issue
+            # `issues` window above. Surface each event's current DB issue state
+            # so the dashboard can suppress failures for issues that have since
+            # gone terminal (merged/closed/abandoned) without a row to consult.
+            # Reuse the already-loaded issue states; fall back to a per-key
+            # lookup (bounded by the 25-event cap) for keys outside the window.
+            issue_state_by_key: dict[str, str | None] = {r.key: r.state for r in issues_rows}
+
+            def _recent_issue_state(issue_key: str | None) -> str | None:
+                if not issue_key:
+                    return None
+                if issue_key not in issue_state_by_key:
+                    row = db.get_issue(issue_key)
+                    issue_state_by_key[issue_key] = row.state if row is not None else None
+                return issue_state_by_key[issue_key]
+
             return {
                 "event_counts": db.event_state_counts(),
                 "issue_event_counts": db.latest_issue_event_state_counts(),
@@ -757,6 +820,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                     for r in issues_rows
                 ],
+                "releases": [_release_payload(row) for row in release_rows],
                 "recent_events": [
                     {
                         "delivery_id": r.delivery_id,
@@ -767,6 +831,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "attempts": r.attempts,
                         "received_at": r.received_at,
                         "last_error": r.last_error,
+                        "issue_state": _recent_issue_state(r.issue_key),
                     }
                     for r in events_rows
                 ],

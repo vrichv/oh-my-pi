@@ -30,26 +30,32 @@ function createCtx(): SuspendCtx {
 }
 
 const originalPlatform = process.platform;
+let sigcontListener: (() => void) | undefined;
 
 function setPlatform(value: NodeJS.Platform): void {
 	Object.defineProperty(process, "platform", { value, configurable: true, writable: true });
 }
 
+function spyOnProcessOnce(): Mock<(event: NodeJS.Signals | string, listener: () => void) => NodeJS.Process> {
+	return vi.spyOn(process, "once") as unknown as Mock<
+		(event: NodeJS.Signals | string, listener: () => void) => NodeJS.Process
+	>;
+}
+
 afterEach(() => {
 	Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true, writable: true });
+	if (sigcontListener) process.removeListener("SIGCONT", sigcontListener);
+	sigcontListener = undefined;
 	vi.restoreAllMocks();
-	// Drop any SIGCONT listener a passing test left behind so a later test
-	// (or the next file) doesn't get spurious callbacks.
-	process.removeAllListeners("SIGCONT");
 });
 
 describe("InputController.handleCtrlZ", () => {
-	it("no-ops on Windows so the unsupported SIGTSTP signal can't crash the process (#2036)", () => {
+	it("no-ops on Windows so the unsupported SIGSTOP signal can't crash the process (#2036)", () => {
 		setPlatform("win32");
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
 			throw new Error("process.kill must not be called on win32");
 		});
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const { ctx, ui, showStatus, showError } = createCtx();
 
 		const controller = new InputController(ctx);
@@ -64,10 +70,10 @@ describe("InputController.handleCtrlZ", () => {
 		expect(showError).not.toHaveBeenCalled();
 	});
 
-	it("sends SIGTSTP to the process group and registers a SIGCONT resume hook on POSIX", () => {
+	it("SIGSTOPs the foreground process group and registers a SIGCONT resume hook on POSIX (#3461)", () => {
 		setPlatform("linux");
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const { ctx, ui, showError } = createCtx();
 
 		const controller = new InputController(ctx);
@@ -83,14 +89,14 @@ describe("InputController.handleCtrlZ", () => {
 		expect(stopOrder).toBeLessThan(killOrder);
 
 		expect(killSpy).toHaveBeenCalledTimes(1);
-		expect(killSpy).toHaveBeenCalledWith(0, "SIGTSTP");
+		expect(killSpy).toHaveBeenCalledWith(0, "SIGSTOP");
 		expect(ui.start).not.toHaveBeenCalled();
 		expect(showError).not.toHaveBeenCalled();
 
 		// Simulating the kernel-delivered SIGCONT drives the TUI back up.
-		const resume = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1] as (() => void) | undefined;
-		expect(resume).toBeDefined();
-		resume?.();
+		sigcontListener = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1];
+		expect(sigcontListener).toBeDefined();
+		sigcontListener?.();
 		expect(ui.start).toHaveBeenCalledTimes(1);
 		expect(ui.requestRender).toHaveBeenCalledWith(true);
 	});
@@ -98,9 +104,9 @@ describe("InputController.handleCtrlZ", () => {
 	it("restores the TUI and drops the SIGCONT listener when process.kill rejects the signal", () => {
 		setPlatform("linux");
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
-			throw new Error("Unknown signal: SIGTSTP");
+			throw new Error("Unknown signal: SIGSTOP");
 		});
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const removeSpy = vi.spyOn(process, "removeListener");
 		const { ctx, ui, showError, showStatus } = createCtx();
 
@@ -113,9 +119,9 @@ describe("InputController.handleCtrlZ", () => {
 		// The exact listener we registered for SIGCONT is the one we
 		// remove; otherwise a leaked handler would fire on the next
 		// unrelated continue and re-`start()` an already-running TUI.
-		const registered = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1];
-		expect(registered).toBeDefined();
-		expect(removeSpy).toHaveBeenCalledWith("SIGCONT", registered);
+		sigcontListener = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1];
+		expect(sigcontListener).toBeDefined();
+		expect(removeSpy).toHaveBeenCalledWith("SIGCONT", sigcontListener);
 
 		expect(killSpy).toHaveBeenCalledTimes(1);
 		expect(ui.stop).toHaveBeenCalledTimes(1);

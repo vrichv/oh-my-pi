@@ -2,13 +2,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AuthBrokerServerHandle, AuthStorage, SqliteAuthCredentialStore, startAuthBroker } from "@oh-my-pi/pi-ai";
-import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
+	type AuthBrokerServerHandle,
 	readAuthBrokerSnapshotCache,
 	type SnapshotResponse,
+	startAuthBroker,
 	writeAuthBrokerSnapshotCache,
-} from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+} from "@oh-my-pi/pi-ai/auth-broker";
+import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const ENV_KEYS = [
 	"OMP_AUTH_BROKER_URL",
@@ -66,7 +69,7 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
 		}
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 	});
 
 	test("boots from a fresh encrypted cache when the broker is down", async () => {
@@ -135,6 +138,34 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			await handle?.close();
 			brokerStorage.close();
 			brokerStore.close();
+		}
+	});
+
+	test("boots from a fresh cache when revalidation returns a server error", async () => {
+		const cachePath = path.join(tempDir, "snapshot.enc");
+		const server = Bun.serve({
+			port: 0,
+			fetch: () => new Response("temporarily unavailable", { status: 503 }),
+		});
+		const url = server.url.toString();
+		let storage: AuthStorage | undefined;
+		try {
+			process.env.OMP_AUTH_BROKER_URL = url;
+			process.env.OMP_AUTH_BROKER_TOKEN = TOKEN;
+			process.env.OMP_AUTH_BROKER_SNAPSHOT_CACHE = cachePath;
+			process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS = "3600000";
+			await writeAuthBrokerSnapshotCache({
+				path: cachePath,
+				token: TOKEN,
+				url,
+				snapshot: makeSnapshot(Date.now()),
+			});
+
+			storage = await discoverAuthStorage(tempDir);
+			expect(await storage.getApiKey(PROVIDER)).toBe("cached-api-key");
+		} finally {
+			storage?.close();
+			server.stop(true);
 		}
 	});
 });

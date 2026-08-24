@@ -4,28 +4,33 @@
  * Custom tools are TypeScript modules that define additional tools for the agent.
  * They can provide custom rendering for tool calls and results in the TUI.
  */
+
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApproval,
 	ToolApprovalDecision,
+	ToolLoadMode,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { FetchImpl, Model, Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import type * as PiCodingAgent from "../../index";
+import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { Theme } from "../../modes/theme/theme";
 import type { ReadonlySessionManager } from "../../session/session-manager";
 import type { TodoItem } from "../../tools/todo";
-import type * as TypeBox from "../typebox";
+import type { RetryErrorUpdate } from "../shared-events";
 
 /** Alias for clarity */
 export type CustomToolUIContext = HookUIContext;
@@ -61,10 +66,12 @@ export interface CustomToolAPI {
 	hasUI: boolean;
 	/** File logger for error/warning/debug messages */
 	logger: typeof PiLogger;
-	/** Injected zod-backed typebox shim (legacy/compat — Zod-authored tools are preferred). */
+	/** Injected typebox shim (legacy/compat — arktype-authored tools are preferred). */
 	typebox: typeof TypeBox;
-	/** Injected zod module for Zod-authored custom tools. */
-	zod: typeof z;
+	/** Injected arktype module for arktype-authored custom tools. */
+	arktype: typeof ArkType;
+	/** Injected Zod-compatible omptype builder for custom tools. */
+	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
 	pi: typeof PiCodingAgent;
 	/** Push a preview action that can later be resolved with the hidden resolve tool */
@@ -92,6 +99,8 @@ export interface CustomToolContext {
 	settings?: Settings;
 	/** Fetch implementation for outbound HTTP; defaults to global fetch when omitted. */
 	fetch?: FetchImpl;
+	/** Calling session's `local://` root mapping for tools that bridge out of the OMP process. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Whether to auto-approve all destructive tool operations (--auto-approve CLI flag) */
 	autoApprove?: boolean;
 }
@@ -107,11 +116,11 @@ export type CustomToolSessionEvent =
 	| {
 			reason: "auto_compaction_start";
 			trigger: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 	  }
 	| {
 			reason: "auto_compaction_end";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -123,12 +132,14 @@ export type CustomToolSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			errorId?: number;
 	  }
 	| {
 			reason: "auto_retry_end";
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			retryErrors?: RetryErrorUpdate[];
 	  }
 	| {
 			reason: "ttsr_triggered";
@@ -149,6 +160,16 @@ export interface RenderResultOptions {
 	isPartial: boolean;
 	/** Current spinner frame index for animated elements (0-9, only provided during partial results) */
 	spinnerFrame?: number;
+	/**
+	 * True once arguments are final (`message_end` / `setArgsComplete`).
+	 * Exclusive tools can sit here while an earlier call still runs.
+	 */
+	argsComplete?: boolean;
+	/**
+	 * True once this specific call has begun executing (`tool_execution_start`).
+	 * Streamed `xd://` previews stay queued until this is set.
+	 */
+	executionStarted?: boolean;
 }
 
 export type CustomToolResult<TDetails = any> = AgentToolResult<TDetails>;
@@ -195,10 +216,12 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	strict?: boolean;
 	/** Description for LLM */
 	description: string;
-	/** Parameter schema (Zod or TypeBox; TypeBox is auto-lifted to Zod at registration). */
+	/** Parameter schema (arktype, TypeBox, or legacy formats). */
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** How this tool is presented when enabled. See {@link ToolLoadMode}. Custom tools default to `"discoverable"`; set `"essential"` to stay top-level. */
+	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */

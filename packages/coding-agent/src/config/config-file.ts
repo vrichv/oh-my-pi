@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { OmpErrors, type Type } from "@oh-my-pi/omptype";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { JSONC, YAML } from "bun";
-import type { ZodType } from "zod/v4";
 
 /** Minimal subset of the AJV ConfigSchemaError shape this module actually relies on. */
 interface ConfigSchemaError {
@@ -11,9 +11,9 @@ interface ConfigSchemaError {
 }
 
 /**
- * Module-private cache of (jsonPath, ymlPath) pairs we already migrated this
- * process. Prevents `ConfigFile.relocate()` / repeated `tryLoad()` calls from
- * re-running the migration over and over on the boot path.
+ * Module-private cache of JSON → YAML migrations this process already ran.
+ * Prevents `ConfigFile.relocate()` / repeated `tryLoad()` calls from re-running
+ * the migration over and over on the boot path.
  */
 const migratedPaths = new Set<string>();
 
@@ -40,7 +40,7 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 		}
 
 		const content = fs.readFileSync(jsonPath, "utf-8");
-		const parsed = JSON.parse(content);
+		const parsed = JSONC.parse(content);
 		if (!parsed) {
 			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
 			migratedPaths.add(key);
@@ -53,9 +53,13 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 	}
 }
 
+export type ConfigSchemaSource =
+	| { readonly kind: "eager"; readonly schema: Type }
+	| { readonly kind: "deferred"; readonly resolve: () => Type };
+
 export interface IConfigFile<T> {
 	readonly id: string;
-	readonly schema: ZodType<T>;
+	readonly schema: Type;
 	path?(): string;
 	load(): T | null;
 	invalidate?(): void;
@@ -105,11 +109,11 @@ export class ConfigError extends Error {
 		this.#message = message;
 	}
 
-	get message(): string {
+	override get message(): string {
 		return this.#message;
 	}
 
-	toString(): string {
+	override toString(): string {
 		return this.message;
 	}
 }
@@ -123,26 +127,40 @@ export type LoadResult<T> =
 
 export class ConfigFile<T> implements IConfigFile<T> {
 	readonly #basePath: string;
+	readonly #yamlFallbackPath: string | null;
 	readonly #jsonMigrationPath: string | null;
+	readonly #schemaSource: ConfigSchemaSource;
+	#resolvedSchema?: Type;
 	#cache?: LoadResult<T>;
 	#auxValidate?: (value: T) => void;
 
 	constructor(
 		readonly id: string,
-		readonly schema: ZodType<T>,
+		schema: Type | ConfigSchemaSource,
 		configPath: string = path.join(getAgentDir(), `${id}.yml`),
 	) {
+		this.#schemaSource = typeof schema === "function" ? { kind: "eager", schema } : schema;
 		this.#basePath = configPath;
 		if (configPath.endsWith(".yml")) {
+			this.#yamlFallbackPath = `${configPath.slice(0, -4)}.yaml`;
 			this.#jsonMigrationPath = `${configPath.slice(0, -4)}.json`;
 		} else if (configPath.endsWith(".yaml")) {
+			this.#yamlFallbackPath = null;
 			this.#jsonMigrationPath = `${configPath.slice(0, -5)}.json`;
 		} else if (configPath.endsWith(".json") || configPath.endsWith(".jsonc")) {
+			this.#yamlFallbackPath = null;
 			// JSON configs are still supported without migration.
 			this.#jsonMigrationPath = null;
 		} else {
+			this.#yamlFallbackPath = null;
 			throw new Error(`Invalid config file path: ${configPath}`);
 		}
+	}
+
+	get schema(): Type {
+		if (this.#schemaSource.kind === "eager") return this.#schemaSource.schema;
+		if (!this.#resolvedSchema) this.#resolvedSchema = this.#schemaSource.resolve();
+		return this.#resolvedSchema;
 	}
 
 	/**
@@ -150,22 +168,35 @@ export class ConfigFile<T> implements IConfigFile<T> {
 	 * Sync callers (tests, settings init) hit this implicitly via {@link tryLoad}.
 	 */
 	#ensureMigrated(): void {
-		if (this.#jsonMigrationPath) {
-			migrateJsonToYml(this.#jsonMigrationPath, this.#basePath);
+		if (!this.#jsonMigrationPath) return;
+		if (this.#yamlFallbackPath && !fs.existsSync(this.#basePath) && fs.existsSync(this.#yamlFallbackPath)) {
+			return;
 		}
+		migrateJsonToYml(this.#jsonMigrationPath, this.#basePath);
 	}
 
 	relocate(configPath?: string): ConfigFile<T> {
 		if (!configPath || configPath === this.#basePath) return this;
-		const result = new ConfigFile<T>(this.id, this.schema, configPath);
+		const result = new ConfigFile<T>(this.id, this.#schemaSource, configPath);
 		result.#auxValidate = this.#auxValidate;
+		result.#resolvedSchema = this.#resolvedSchema;
 		result.#ensureMigrated();
 		return result;
 	}
 
+	#resolveReadPath(): string {
+		if (fs.existsSync(this.#basePath)) {
+			return this.#basePath;
+		}
+		if (this.#yamlFallbackPath && fs.existsSync(this.#yamlFallbackPath)) {
+			return this.#yamlFallbackPath;
+		}
+		return this.#basePath;
+	}
+
 	getMtimeMs(): number | null {
 		try {
-			return fs.statSync(this.path()).mtimeMs;
+			return fs.statSync(this.#resolveReadPath()).mtimeMs;
 		} catch (err) {
 			if (isEnoent(err)) return null;
 			throw err;
@@ -193,10 +224,10 @@ export class ConfigFile<T> implements IConfigFile<T> {
 	}
 
 	createDefault(): T {
-		const parsed = this.schema.safeParse({});
-		if (parsed.success) return parsed.data;
-		const fallback = this.schema.safeParse(undefined);
-		if (fallback.success) return fallback.data;
+		const parsed = this.schema({});
+		if (!(parsed instanceof Error)) return parsed as T;
+		const fallback = this.schema(undefined);
+		if (!(fallback instanceof Error)) return fallback as T;
 		throw new ConfigError(this.id, undefined, {
 			err: new Error("Schema produced no default value"),
 			stage: "createDefault",
@@ -211,27 +242,26 @@ export class ConfigFile<T> implements IConfigFile<T> {
 	#parseContent(content: string): LoadResult<T> {
 		try {
 			let parsed: unknown;
-			if (this.#basePath.endsWith(".json") || this.#basePath.endsWith(".jsonc")) {
+			const readPath = this.#resolveReadPath();
+			if (readPath.endsWith(".json") || readPath.endsWith(".jsonc")) {
 				parsed = JSONC.parse(content);
-			} else if (this.#basePath.endsWith(".yml") || this.#basePath.endsWith(".yaml")) {
+			} else if (readPath.endsWith(".yml") || readPath.endsWith(".yaml")) {
 				parsed = YAML.parse(content);
 			} else {
-				throw new Error(`Invalid config file path: ${this.#basePath}`);
+				throw new Error(`Invalid config file path: ${readPath}`);
 			}
 
-			const checked = this.schema.safeParse(parsed);
-			if (!checked.success) {
-				const schemaErrors: ConfigSchemaError[] = [];
-				for (const issue of checked.error.issues) {
-					const instancePath = issue.path.length === 0 ? "" : `/${issue.path.map(String).join("/")}`;
-					schemaErrors.push({ instancePath, message: issue.message });
-					if (schemaErrors.length >= 50) break;
-				}
+			const checked = this.schema(parsed);
+			if (checked instanceof OmpErrors) {
+				const schemaErrors: ConfigSchemaError[] = checked.map(error => ({
+					instancePath: error.path.length === 0 ? "root" : error.path.join("."),
+					message: error.problem,
+				}));
 				const error = new ConfigError(this.id, schemaErrors);
 				logger.warn("Failed to parse config file", { path: this.path(), error });
 				return this.#storeCache({ error, status: "error" });
 			}
-			const value = checked.data;
+			const value = checked as T;
 			try {
 				this.#auxValidate?.(value);
 			} catch (error) {
@@ -257,7 +287,7 @@ export class ConfigFile<T> implements IConfigFile<T> {
 
 		let content: string;
 		try {
-			content = fs.readFileSync(this.path(), "utf-8").trim();
+			content = fs.readFileSync(this.#resolveReadPath(), "utf-8").trim();
 		} catch (error) {
 			if (isEnoent(error)) {
 				return this.#storeCache({ status: "not-found" });
@@ -277,7 +307,7 @@ export class ConfigFile<T> implements IConfigFile<T> {
 
 		let content: string;
 		try {
-			content = (await Bun.file(this.path()).text()).trim();
+			content = (await Bun.file(this.#resolveReadPath()).text()).trim();
 		} catch (error) {
 			if (isEnoent(error)) {
 				return this.#storeCache({ status: "not-found" });
@@ -308,7 +338,7 @@ export class ConfigFile<T> implements IConfigFile<T> {
 	}
 
 	path(): string {
-		return this.#basePath;
+		return this.#resolveReadPath();
 	}
 
 	invalidate() {

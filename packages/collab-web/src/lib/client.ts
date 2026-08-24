@@ -11,6 +11,8 @@
 import type {
 	AgentSnapshot,
 	AssistantMessage,
+	CollabUiRequest,
+	CollabUiResponseValue,
 	HostFrame,
 	SessionEntry,
 	SessionHeader,
@@ -59,6 +61,8 @@ export interface GuestSnapshot {
 	working: boolean;
 	/** True when this guest joined through a read-only (view) link. */
 	readOnly: boolean;
+	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
+	uiRequest: CollabUiRequest | null;
 	/** Capped at 50, newest last. */
 	notices: readonly Notice[];
 }
@@ -67,9 +71,20 @@ const MAX_NOTICES = 50;
 const TRANSCRIPT_TIMEOUT_MS = 10_000;
 /** Mirrors the TUI guest's WELCOME_TIMEOUT_MS: a host that never answers hello ends the join. */
 const WELCOME_TIMEOUT_MS = 30_000;
+/** Mirrors the TUI guest's SNAPSHOT_PROGRESS_TIMEOUT_MS: every snapshot chunk must make progress. */
+const SNAPSHOT_PROGRESS_TIMEOUT_MS = 30_000;
+
+/**
+ * One fetch-transcript round trip.
+ * - `rows`: decoded JSONL from `fromByte`; `newSize` is the next offset base.
+ * - `error`: terminal read failure reported by the host (unchanged cursor);
+ *   callers must surface it and stop polling instead of hot retrying.
+ * Transient failures (timeout, session end) resolve `null` and are retryable.
+ */
+export type TranscriptResult = { kind: "rows"; text: string; newSize: number } | { kind: "error"; message: string };
 
 interface PendingTranscript {
-	resolve: (result: { text: string; newSize: number } | null) => void;
+	resolve: (result: TranscriptResult | null) => void;
 	timer: Timer;
 }
 
@@ -85,6 +100,7 @@ export class GuestClient {
 	#everConnected = false;
 	#welcomed = false;
 	#welcomeTimer: Timer | null = null;
+	#snapshotProgressTimer: Timer | null = null;
 
 	#phase: ConnectionPhase = "connecting";
 	#endedReason: string | null = null;
@@ -99,6 +115,8 @@ export class GuestClient {
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
 	#readOnly = false;
+	#uiRequest: CollabUiRequest | null = null;
+	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
 	#snapshot: GuestSnapshot;
 
@@ -135,6 +153,7 @@ export class GuestClient {
 
 	close(): void {
 		this.#clearWelcomeTimer();
+		this.#clearSnapshotProgressTimer();
 		this.#socket.close();
 	}
 
@@ -154,6 +173,14 @@ export class GuestClient {
 		this.#socket.send({ t: "prompt", text });
 	}
 
+	sendUiResponse(reqId: number, value?: CollabUiResponseValue): void {
+		this.#socket.send({ t: "ui-response", reqId, value });
+		if (this.#uiRequest?.reqId === reqId) {
+			this.#showNextUiRequest();
+			this.#commit();
+		}
+	}
+
 	sendAbort(): void {
 		this.#socket.send({ t: "abort" });
 	}
@@ -162,10 +189,14 @@ export class GuestClient {
 		this.#socket.send({ t: "agent-cmd", cmd, agentId, text });
 	}
 
-	/** Incremental subagent-transcript read. Resolves null on error reply or 10s timeout. */
-	fetchTranscript(agentId: string, fromByte: number): Promise<{ text: string; newSize: number } | null> {
+	/**
+	 * Incremental subagent-transcript read. Resolves a {@link TranscriptResult}
+	 * (`rows` or terminal `error`), or `null` on transient failure (10s timeout,
+	 * session end) where re-polling from the same cursor is correct.
+	 */
+	fetchTranscript(agentId: string, fromByte: number): Promise<TranscriptResult | null> {
 		const reqId = ++this.#reqSeq;
-		const { promise, resolve } = Promise.withResolvers<{ text: string; newSize: number } | null>();
+		const { promise, resolve } = Promise.withResolvers<TranscriptResult | null>();
 		const timer = setTimeout(() => {
 			this.#pendingTranscripts.delete(reqId);
 			resolve(null);
@@ -188,6 +219,7 @@ export class GuestClient {
 	}
 
 	#handleClose(reason: string, willReconnect: boolean): void {
+		this.#clearSnapshotProgressTimer();
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
 			this.#phase = "reconnecting";
@@ -200,6 +232,7 @@ export class GuestClient {
 	#end(reason: string): void {
 		if (this.#phase === "ended") return;
 		this.#clearWelcomeTimer();
+		this.#clearSnapshotProgressTimer();
 		this.#phase = "ended";
 		this.#endedReason = reason;
 		for (const [, pending] of this.#pendingTranscripts) {
@@ -207,6 +240,7 @@ export class GuestClient {
 			pending.resolve(null);
 		}
 		this.#pendingTranscripts.clear();
+		this.#clearUiRequests();
 		this.#commit();
 		this.#socket.close();
 	}
@@ -215,6 +249,21 @@ export class GuestClient {
 		if (this.#welcomeTimer !== null) {
 			clearTimeout(this.#welcomeTimer);
 			this.#welcomeTimer = null;
+		}
+	}
+
+	#armSnapshotProgressTimer(): void {
+		this.#clearSnapshotProgressTimer();
+		this.#snapshotProgressTimer = setTimeout(() => {
+			this.#snapshotProgressTimer = null;
+			this.#end("timed out waiting for the host's session snapshot");
+		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
+	}
+
+	#clearSnapshotProgressTimer(): void {
+		if (this.#snapshotProgressTimer !== null) {
+			clearTimeout(this.#snapshotProgressTimer);
+			this.#snapshotProgressTimer = null;
 		}
 	}
 
@@ -236,8 +285,10 @@ export class GuestClient {
 	#applyFrame(frame: HostFrame): void {
 		switch (frame.t) {
 			case "welcome":
+				// Reset accumulator: a fresh welcome arriving mid-load (reconnect)
+				// supersedes any partially-streamed snapshot from the prior session.
 				this.#header = frame.header;
-				this.#entries = [...frame.entries];
+				this.#entries = [];
 				this.#state = frame.state;
 				this.#agents = [...frame.agents];
 				this.#stream = null;
@@ -246,12 +297,31 @@ export class GuestClient {
 				this.#progress = new Map();
 				this.#lifecycle = new Map();
 				this.#working = frame.state.isStreaming;
-				this.#phase = "live";
-				this.#endedReason = null;
 				this.#readOnly = frame.readOnly === true;
+				this.#clearUiRequests();
 				this.#welcomed = true;
 				this.#clearWelcomeTimer();
+				if (frame.entryCount === 0) {
+					this.#clearSnapshotProgressTimer();
+					this.#phase = "live";
+				} else {
+					this.#armSnapshotProgressTimer();
+				}
+				this.#endedReason = null;
 				break;
+			case "snapshot-chunk": {
+				// Stream transcript fragments into the live snapshot. The host
+				// always closes the train with `final: true`; that flip is what
+				// moves the guest from "waiting" to "live".
+				this.#entries = [...this.#entries, ...frame.entries];
+				if (frame.final) {
+					this.#clearSnapshotProgressTimer();
+					this.#phase = "live";
+				} else {
+					this.#armSnapshotProgressTimer();
+				}
+				break;
+			}
 			case "entry":
 				this.#entries = [...this.#entries, frame.entry];
 				if (this.#streamDone && frame.entry.type === "message" && frame.entry.message.role === "assistant") {
@@ -264,8 +334,15 @@ export class GuestClient {
 				break;
 			case "state":
 				this.#state = frame.state;
+				// Host state is authoritative for liveness in both directions: the
+				// payload is built at fire time, so `isStreaming` is never stale.
+				// This covers a connected guest that misses the discrete `agent_start`
+				// without receiving a new `welcome` (for example, mid-stream).
+				this.#working = frame.state.isStreaming;
 				if (!frame.state.isStreaming) {
-					this.#working = false;
+					// Host idle implies no tool can be running, so clear any card
+					// pinned by a dropped `tool_execution_end` off this signal.
+					this.#activeTools = new Map();
 					if (this.#streamDone) {
 						this.#stream = null;
 						this.#streamDone = false;
@@ -284,12 +361,24 @@ export class GuestClient {
 					this.#lifecycle = new Map(this.#lifecycle).set(payload.id, payload);
 				}
 				break;
+			case "ui-request":
+				if (this.#uiRequest) this.#uiRequestQueue = [...this.#uiRequestQueue, frame.request];
+				else this.#uiRequest = frame.request;
+				break;
+			case "ui-request-end":
+				if (this.#uiRequest?.reqId === frame.reqId) this.#showNextUiRequest();
+				else this.#uiRequestQueue = this.#uiRequestQueue.filter(request => request.reqId !== frame.reqId);
+				break;
 			case "transcript": {
 				const pending = this.#pendingTranscripts.get(frame.reqId);
 				if (pending) {
 					this.#pendingTranscripts.delete(frame.reqId);
 					clearTimeout(pending.timer);
-					pending.resolve(frame.error !== undefined ? null : { text: frame.text, newSize: frame.newSize });
+					pending.resolve(
+						frame.error !== undefined
+							? { kind: "error", message: frame.error }
+							: { kind: "rows", text: frame.text, newSize: frame.newSize },
+					);
 				}
 				break;
 			}
@@ -297,6 +386,14 @@ export class GuestClient {
 				this.#end(frame.reason);
 				return; // #end already committed
 			case "error":
+				if (!this.#welcomed) {
+					// Pre-welcome errors are the host's targeted reply to our
+					// hello (e.g. protocol mismatch): no welcome will follow.
+					// End with the host's reason instead of waiting out the
+					// welcome timeout.
+					this.#end(frame.message);
+					return; // #end already committed
+				}
 				this.#pushNotice("error", frame.message);
 				break;
 			default:
@@ -364,6 +461,9 @@ export class GuestClient {
 			case "auto_retry_start":
 				this.#pushNotice("info", `retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`);
 				break;
+			case "auto_retry_end":
+				if (!event.success) this.#pushNotice("error", event.finalError ?? "retry failed");
+				break;
 			case "auto_compaction_start":
 				this.#pushNotice("info", `compacting context (${event.reason})`);
 				break;
@@ -392,6 +492,17 @@ export class GuestClient {
 		this.#notices = next;
 	}
 
+	#clearUiRequests(): void {
+		this.#uiRequest = null;
+		this.#uiRequestQueue = [];
+	}
+
+	#showNextUiRequest(): void {
+		const [next, ...rest] = this.#uiRequestQueue;
+		this.#uiRequest = next ?? null;
+		this.#uiRequestQueue = rest;
+	}
+
 	#buildSnapshot(): GuestSnapshot {
 		return {
 			phase: this.#phase,
@@ -407,6 +518,7 @@ export class GuestClient {
 			activeTools: this.#activeTools,
 			working: this.#working,
 			readOnly: this.#readOnly,
+			uiRequest: this.#uiRequest,
 			notices: this.#notices,
 		};
 	}

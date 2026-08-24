@@ -1,6 +1,6 @@
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { z } from "zod/v4";
 import {
 	deleteManagedSkill,
 	getManagedSkillsDir,
@@ -11,29 +11,25 @@ import { isNameClaimedByAuthoredSkill } from "../extensibility/skills";
 import manageSkillDescription from "../prompts/tools/manage-skill.md" with { type: "text" };
 import type { ToolSession } from ".";
 
-const manageSkillSchema = z
-	.object({
-		action: z.enum(["create", "update", "delete"]),
-		name: z.string().describe("kebab-case skill name"),
-		description: z
-			.string()
-			.describe("one-line description of when to use the skill (required for create/update)")
-			.optional(),
-		body: z
-			.string()
-			.describe("the SKILL.md body in markdown, no frontmatter (required for create/update)")
-			.optional(),
-	})
-	// Enforce the action/field contract at validation time rather than only in
-	// execute. Kept as a cross-field refine (not a discriminated union) so the
-	// wire schema stays a single root object — strict structured-output mode and
-	// the Anthropic tool-schema builder both require that.
-	.refine(p => p.action === "delete" || (p.description !== undefined && p.body !== undefined), {
-		message: '"create" and "update" require both "description" and "body".',
-		path: ["description"],
-	});
+const manageSkillSchema = type({
+	action: "'create' | 'update' | 'delete'",
+	name: type("string").describe("kebab-case skill name"),
+	"description?": type("string").describe(
+		"one-line description of when to use the skill (required for create/update)",
+	),
+	"body?": type("string").describe("the SKILL.md body in markdown, no frontmatter (required for create/update)"),
+}).narrow(
+	(p, ctx) =>
+		p.action === "delete" ||
+		(p.description !== undefined && p.body !== undefined) ||
+		// Enforce the action/field contract at validation time rather than only in
+		// execute. Kept as a cross-field narrow (not a discriminated union) so the
+		// wire schema stays a single root object — strict structured-output mode and
+		// the Anthropic tool-schema builder both require that.
+		ctx.mustBe('used with both "description" and "body" for "create" and "update"'),
+);
 
-export type ManageSkillParams = z.infer<typeof manageSkillSchema>;
+export type ManageSkillParams = typeof manageSkillSchema.infer;
 
 /**
  * Direct create/update/delete of isolated managed skills. Gated behind
@@ -49,16 +45,17 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	readonly loadMode = "essential" as const;
 	readonly summary = "Create, update, or delete an isolated managed skill";
 
-	// No session state needed: createIf reads settings; writes target the
-	// home-based managed-skills dir directly.
+	constructor(private readonly refreshSkills?: () => Promise<void>) {}
+
 	static createIf(session: ToolSession): ManageSkillTool | null {
 		if (!session.settings.get("autolearn.enabled")) return null;
-		return new ManageSkillTool();
+		return new ManageSkillTool(session.refreshSkills);
 	}
 
 	async execute(_id: string, params: ManageSkillParams): Promise<AgentToolResult> {
 		if (params.action === "delete") {
 			await deleteManagedSkill(params.name);
+			await this.refreshSkills?.();
 			return {
 				content: [{ type: "text", text: `Deleted managed skill "${params.name}".` }],
 				details: { action: "delete", name: params.name },
@@ -94,6 +91,7 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 			description: params.description,
 			body: params.body,
 		});
+		await this.refreshSkills?.();
 		const relativePath = path.relative(getManagedSkillsDir(), skillPath);
 		const verb = params.action === "create" ? "Created" : "Updated";
 		return {

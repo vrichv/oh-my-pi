@@ -36,9 +36,9 @@ Color values accept:
 - variable reference string (resolved through `vars`)
 - empty string (`""`) meaning terminal default (`\x1b[39m` fg, `\x1b[49m` bg)
 
-## Required color tokens (current)
+## Required and optional color tokens
 
-All tokens below are required in `colors`.
+All tokens below are required in `colors` except `thinkingMax`, which is optional for compatibility and falls back to `thinkingXhigh`.
 
 ### Core text and borders (11)
 
@@ -61,9 +61,9 @@ All tokens below are required in `colors`.
 `toolDiffAdded`, `toolDiffRemoved`, `toolDiffContext`,
 `syntaxComment`, `syntaxKeyword`, `syntaxFunction`, `syntaxVariable`, `syntaxString`, `syntaxNumber`, `syntaxType`, `syntaxOperator`, `syntaxPunctuation`
 
-### Mode/thinking borders (8)
+### Mode/thinking borders (8 required, 1 optional)
 
-`thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, `bashMode`, `pythonMode`
+`thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, optional `thinkingMax`, `bashMode`, `pythonMode`
 
 ### Status line segment colors (13)
 
@@ -94,6 +94,16 @@ Runtime precedence:
 3. fallback `"unicode"`
 
 Invalid override keys are ignored and logged (`logger.debug`).
+
+#### Box-drawing borders
+
+All outlined chrome — tool-result frames, overlays, code fences, the editor, the welcome banner — draws with the `boxRound.*` tokens: rounded corners (`╭╮╰╯`) plus tee/cross junctions (`├┤┬┴┼`, which have no rounded Unicode form, so they are sourced from the `boxSharp.*` tokens). Markdown tables are the sole exception and keep the fully sharp `boxSharp.*` set (`┌┐└┘`).
+
+Override behavior follows from that split:
+
+- `boxRound.{topLeft,topRight,bottomLeft,bottomRight,horizontal,vertical}` restyle every border's corners and edges.
+- `boxSharp.{cross,teeDown,teeUp,teeRight,teeLeft}` restyle dividers/junctions everywhere (rounded frames and tables alike).
+- `boxSharp.{topLeft,topRight,bottomLeft,bottomRight}` now affect markdown table corners only.
 
 ## Built-in vs custom theme sources
 
@@ -300,6 +310,7 @@ Minimal skeleton:
     "thinkingMedium": "#2ac3de",
     "thinkingHigh": "#bb9af7",
     "thinkingXhigh": "#f7768e",
+    "thinkingMax": "#ff007c",
 
     "bashMode": "#2ac3de",
     "pythonMode": "#bb9af7",
@@ -340,8 +351,8 @@ Use this workflow:
 
 ## Real constraints and caveats
 
-- All `colors` tokens are required for custom themes.
+- All `colors` tokens are required for custom themes except optional `thinkingMax`, which falls back to `thinkingXhigh`.
 - `export` and `symbols` are optional.
-- `$schema` in theme JSON is informational; runtime validation is enforced by a Zod schema in code.
+- `$schema` in theme JSON is informational; runtime validation is enforced by the ArkType schema in code.
 - `setTheme` failure falls back to `dark`; `previewTheme` failure does not replace current theme.
 - File watcher reload errors or temporary missing files keep the current loaded theme until a successful reload or explicit theme switch.

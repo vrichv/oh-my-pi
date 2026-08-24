@@ -10,7 +10,7 @@ import {
 	formatStatusIcon,
 	replaceTabs,
 } from "../tools/render-utils";
-import { renderOutputBlock } from "./output-block";
+import { outputBlockContentWidth, renderOutputBlock } from "./output-block";
 import type { State } from "./types";
 
 export interface CodeCellOptions {
@@ -32,6 +32,13 @@ export interface CodeCellOptions {
 	 */
 	codeTail?: boolean;
 	expanded?: boolean;
+	/**
+	 * Prefix the header with the cell's language icon (resolved through the
+	 * active symbol preset: nerd-font devicon, unicode emoji, or ascii
+	 * shorthand). Opt-in so only the eval kernel renderer labels each cell;
+	 * read/write/browser code cells stay icon-free.
+	 */
+	showLanguage?: boolean;
 	width: number;
 	codeStartLine?: number;
 	codeLineNumbers?: Array<number | null>;
@@ -47,8 +54,12 @@ function getState(status?: CodeCellOptions["status"]): State | undefined {
 }
 
 function formatHeader(options: CodeCellOptions, theme: Theme): { title: string; meta?: string } {
-	const { index, total, title, status, spinnerFrame, duration } = options;
+	const { index, total, title, status, spinnerFrame, duration, language, showLanguage } = options;
 	const parts: string[] = [];
+	if (showLanguage && language) {
+		const langIcon = theme.getLangIconStyled(language);
+		if (langIcon) parts.push(langIcon);
+	}
 	if (status) {
 		const icon = formatStatusIcon(
 			status === "complete"
@@ -69,7 +80,7 @@ function formatHeader(options: CodeCellOptions, theme: Theme): { title: string; 
 			parts.push(icon);
 		}
 	}
-	if (index !== undefined && total !== undefined) {
+	if (index !== undefined && total !== undefined && total > 1) {
 		parts.push(theme.fg("accent", `[${index + 1}/${total}]`));
 	}
 	if (title) {
@@ -219,9 +230,9 @@ export function renderMarkdownCell(options: MarkdownCellOptions, theme: Theme): 
 	const { title, meta } = formatHeader(codeOptions, theme);
 	const state = getState(options.status);
 
-	// Markdown component manages its own wrapping at the inner content width.
-	// `renderOutputBlock` adds a `│ ` prefix + `│` suffix → 3 visible columns.
-	const innerWidth = Math.max(20, width - 3);
+	// Markdown component manages its own wrapping at the same inner width as
+	// `renderOutputBlock`, so collapsed row caps are applied after final wrapping.
+	const innerWidth = Math.max(20, outputBlockContentWidth(width));
 	const allLines = content.trim() ? new Markdown(content, 0, 0, getMarkdownTheme()).render(innerWidth) : [];
 	const maxContentLines = expanded ? allLines.length : Math.min(allLines.length, contentMaxLines);
 	const contentLines = allLines.slice(0, maxContentLines);

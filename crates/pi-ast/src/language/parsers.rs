@@ -44,6 +44,9 @@ pub fn language_elisp() -> TSLanguage {
 pub fn language_erlang() -> TSLanguage {
 	tree_sitter_erlang::LANGUAGE.into()
 }
+pub fn language_fortran() -> TSLanguage {
+	tree_sitter_fortran::LANGUAGE.into()
+}
 pub fn language_go() -> TSLanguage {
 	tree_sitter_go::LANGUAGE.into()
 }
@@ -100,9 +103,6 @@ pub fn language_ocaml() -> TSLanguage {
 }
 pub fn language_odin() -> TSLanguage {
 	tree_sitter_odin::LANGUAGE.into()
-}
-pub fn language_perl() -> TSLanguage {
-	tree_sitter_perl::LANGUAGE.into()
 }
 pub fn language_php() -> TSLanguage {
 	tree_sitter_php::LANGUAGE_PHP_ONLY.into()

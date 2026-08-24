@@ -8,6 +8,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -20,14 +21,13 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { AutocompleteProvider } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
 
 function makeTool(name: string): AgentTool {
 	return {
 		name,
 		label: name,
 		description: `Fake ${name}`,
-		parameters: z.object({}),
+		parameters: type({}),
 		async execute() {
 			return { content: [{ type: "text" as const, text: "ok" }] };
 		},
@@ -137,6 +137,11 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 		return result.items.map(item => item.value);
 	}
 
+	async function fetchSlashItems(provider: AutocompleteProvider, query: string) {
+		const result = await provider.getSuggestions([query], 0, query.length);
+		return result?.items ?? [];
+	}
+
 	it("includes discovered prompt templates in slash-command autocomplete", async () => {
 		const created = createHarness([
 			{
@@ -160,6 +165,19 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 		// Fuzzy prefix `/rev` also surfaces the template.
 		const prefixMatches = await fetchSlashSuggestions(provider!, "/rev");
 		expect(prefixMatches).toContain("review");
+	});
+
+	it("shows session-backed builtin status descriptions in slash-command autocomplete", async () => {
+		const created = createHarness([]);
+		const providerSlot = captureAutocompleteProvider(created.mode);
+
+		await created.mode.refreshSlashCommandState(tempDir.path());
+		const offFast = (await fetchSlashItems(providerSlot.current!, "/fast")).find(item => item.value === "fast");
+		expect(offFast?.description).toBe("Fast: off");
+
+		created.session.setFastMode(true);
+		const onFast = (await fetchSlashItems(providerSlot.current!, "/fast")).find(item => item.value === "fast");
+		expect(onFast?.description).toBe("Fast: on");
 	});
 
 	it("does not duplicate templates whose names collide with builtin slash commands", async () => {
