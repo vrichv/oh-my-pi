@@ -123,6 +123,32 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(candidates.indexOf(versionedModern)).toBeLessThan(candidates.indexOf(buildHostModern));
 	});
 
+	it("resolves unsuffixed win32-arm64 addon filenames for compiled binaries", () => {
+		expect(getAddonFilenames({ tag: "win32-arm64", arch: "arm64", variant: null })).toEqual([
+			"pi_natives.win32-arm64.node",
+		]);
+
+		const versionedDir = "C:\\Users\\u\\.omp\\natives\\18.0.4";
+		const userDataDir = "C:\\Users\\u\\AppData\\Local\\omp";
+		const nativeDir = "C:\\build-host\\packages\\natives\\native";
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: getAddonFilenames({ tag: "win32-arm64", arch: "arm64", variant: null }),
+			isCompiledBinary: true,
+			nativeDir,
+			execDir: "C:\\Users\\u\\AppData\\Local\\omp",
+			versionedDir,
+			userDataDir,
+		});
+
+		const versioned = path.join(versionedDir, "pi_natives.win32-arm64.node");
+		const userData = path.join(userDataDir, "pi_natives.win32-arm64.node");
+		expect(candidates).toContain(versioned);
+		expect(candidates).toContain(userData);
+		expect(candidates.indexOf(versioned)).toBeLessThan(
+			candidates.indexOf(path.join(nativeDir, "pi_natives.win32-arm64.node")),
+		);
+	});
+
 	it("does not probe user-data candidates when running outside a standalone binary", () => {
 		const versionedDir = "/home/u/.omp/natives/14.5.2";
 		const userDataDir = "/home/u/.local/bin";

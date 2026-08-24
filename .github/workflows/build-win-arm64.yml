@@ -23,8 +23,10 @@ on:
         type: string
       source_ref:
         description: >-
-          Git ref to check out (defaults to the triggering ref). Useful when
-          recovering a release after a failed run.
+          Git ref to check out (defaults to the triggering SHA). Useful when
+          recovering a release after a failed run. Do not default this to
+          `tag`: that rebuilds an old tagged commit without the win32-arm64
+          loader allowlist.
         required: false
         type: string
 
@@ -43,7 +45,7 @@ jobs:
       contents: write        # gh release upload
       id-token: write        # npm trusted publishing (optional)
     env:
-      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
