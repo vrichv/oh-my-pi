@@ -265,6 +265,7 @@ smallvec = { version = "1.15.1", features = [
 # Hashing
 # ──────────────────────────────────────────────────────────────────────────────
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+blake3 = { version = "1.8.7", features = ["no_neon"] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Audio & Realtime Media

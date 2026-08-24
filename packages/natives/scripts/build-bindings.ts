@@ -8,8 +8,10 @@
  * Cross-compilation is limited to the cargo-xwin path used by the standalone
  * win32-arm64 workflow (`CROSS_TARGET` + `TARGET_PLATFORM`/`TARGET_ARCH`).
  * Bazel still owns every other shipped addon. aarch64 Windows keeps clang-cl
- * for C/C++ (cmake/zstd NEON) and shims GNU `clang` so ring's `.S` units
- * accept cargo-xwin's `/imsvc` CFLAGS.
+ * for C/C++ (cmake; zstd disables ASM on Windows) and shims GNU `clang` so
+ * ring's `.S` units accept cargo-xwin's `/imsvc` CFLAGS. blake3's C NEON
+ * path is disabled: clang-cl + MSVC `arm64_neon.h` rejects
+ * `__builtin_shufflevector`.
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.

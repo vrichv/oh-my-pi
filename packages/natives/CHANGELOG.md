@@ -6,7 +6,7 @@
 
 - Added asynchronous, size-bounded SVG-to-PNG rasterization for terminal media previews.
 - Added `DiffStream` for incremental text/byte ingestion, direct asynchronous file opening, stable-prefix progress, off-thread exact Myers runs/unified hunks, and asynchronous syntax-grammar warmup.
-- Added `win32-arm64` to the published native leaf target list, the compiled-binary loader allowlist, and restored napi `CROSS_TARGET` cargo-xwin builds for that addon, including a GNU clang shim that rewrites clang-cl `/imsvc` flags for ring's aarch64 `.S` units.
+- Added `win32-arm64` to the published native leaf target list, the compiled-binary loader allowlist, and restored napi `CROSS_TARGET` cargo-xwin builds for that addon: GNU clang `/imsvc` shim for ring `.S` units, and blake3 `no_neon` so clang-cl plus MSVC `arm64_neon.h` does not reject `__builtin_shufflevector`.
 
 ## [18.0.3] - 2026-08-23
 
