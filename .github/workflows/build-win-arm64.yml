@@ -58,6 +58,7 @@ jobs:
         with:
           toolchain: nightly-2026-08-08
           targets: aarch64-pc-windows-msvc
+          components: llvm-tools
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -95,7 +96,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev ninja-build cmake
 
       - run: bun install --frozen-lockfile
 

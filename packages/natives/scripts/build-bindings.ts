@@ -7,7 +7,9 @@
  *
  * Cross-compilation is limited to the cargo-xwin path used by the standalone
  * win32-arm64 workflow (`CROSS_TARGET` + `TARGET_PLATFORM`/`TARGET_ARCH`).
- * Bazel still owns every other shipped addon.
+ * Bazel still owns every other shipped addon. aarch64 Windows keeps clang-cl
+ * for C/C++ (cmake/zstd NEON) and shims GNU `clang` so ring's `.S` units
+ * accept cargo-xwin's `/imsvc` CFLAGS.
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
@@ -237,6 +239,16 @@ const napiArgs = [
 	cargoProfile,
 ];
 if (crossTarget) {
+	if (crossTarget === "aarch64-pc-windows-msvc") {
+		// ring 0.17 force-switches aarch64-windows units to GNU clang for `.S`
+		// assembly while cargo-xwin's clang-cl CFLAGS still carry `/imsvc`.
+		const shimDir = path.join(nativeDir, ".build", "xwin-clang-shim");
+		await fs.mkdir(shimDir, { recursive: true });
+		const shimPath = path.join(shimDir, "clang");
+		await fs.copyFile(path.join(import.meta.dir, "xwin-clang-shim.sh"), shimPath);
+		await fs.chmod(shimPath, 0o755);
+		process.env.PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`;
+	}
 	napiArgs.push("--target", crossTarget, "--cross-compile");
 }
 
