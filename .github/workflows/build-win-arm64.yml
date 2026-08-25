@@ -116,19 +116,6 @@ jobs:
             ~/.cargo/git/db
           key: upstream-cargo-win-arm64-${{ steps.release.outputs.tag }}-${{ hashFiles('source/Cargo.lock') }}
 
-      - name: Setup Rust compiler cache
-        if: steps.release.outputs.should_build == 'true'
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Enable Rust compiler cache
-        if: steps.release.outputs.should_build == 'true'
-        shell: pwsh
-        run: |
-          @(
-            "SCCACHE_GHA_ENABLED=true"
-            "RUSTC_WRAPPER=sccache"
-            "CARGO_INCREMENTAL=0"
-          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Enable native ARM64 MSVC environment
         if: steps.release.outputs.should_build == 'true'
