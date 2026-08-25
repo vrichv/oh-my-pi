@@ -92,10 +92,40 @@ jobs:
           ) | Set-Content -Path $toolchain -Encoding utf8
           @(
             "CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc=$toolchain"
-            "CFLAGS=/MT"
-            "CXXFLAGS=/MT"
+            # `ring` deliberately invokes GNU clang for its ARM64 assembly;
+            # `/MT` is only valid for MSVC cl.exe. Clear ambient CFLAGS so
+            # they cannot leak into ring, while CL configures cl.exe calls.
+            "CFLAGS="
+            "CXXFLAGS="
+            "CL=/MT"
             "RUSTFLAGS=-C target-feature=+crt-static"
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify ARM64 C toolchain
+        shell: pwsh
+        run: |
+          $probeDir = Join-Path $env:RUNNER_TEMP "omp-arm64-toolchain-probe"
+          New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+          $source = Join-Path $probeDir "probe.c"
+          "int main(void) { return 0; }" | Set-Content -Path $source -Encoding ascii
+          & cl.exe /nologo /MT "/Fe$probeDir\msvc.exe" $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$probeDir\msvc.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & clang.exe --target=aarch64-pc-windows-msvc -c $source -o "$probeDir\clang.obj"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @(
+            "cmake_minimum_required(VERSION 3.15)"
+            "project(omp_arm64_probe C)"
+            "add_executable(omp_arm64_probe probe.c)"
+          ) | Set-Content -Path (Join-Path $probeDir "CMakeLists.txt") -Encoding ascii
+          $cmakeBuild = Join-Path $probeDir "cmake"
+          & cmake.exe -S $probeDir -B $cmakeBuild -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cmake.exe --build $cmakeBuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $cmakeBuild "omp_arm64_probe.exe")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: bun install --frozen-lockfile
 
       - name: Build native addon (win32-arm64)
@@ -108,11 +138,31 @@ jobs:
         shell: pwsh
         run: if (-not (Test-Path packages/natives/native/pi_natives.win32-arm64.node)) { throw "Native addon was not built" }
 
+      - name: Assert native addon targets ARM64
+        shell: pwsh
+        run: |
+          $path = "packages/natives/native/pi_natives.win32-arm64.node"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $offset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          if ($bytes[$offset] -ne 0x50 -or $bytes[$offset + 1] -ne 0x45 -or [System.BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0xAA64) {
+            throw "Native addon is not a Windows ARM64 PE binary"
+          }
+
       - name: Build release binary (win32-arm64)
         shell: pwsh
         env:
           RELEASE_TARGETS: win32-arm64
         run: bun run ci:release:build-binaries
+
+      - name: Assert release binary targets ARM64
+        shell: pwsh
+        run: |
+          $path = "packages/coding-agent/binaries/omp-windows-arm64.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $offset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          if ($bytes[$offset] -ne 0x50 -or $bytes[$offset + 1] -ne 0x45 -or [System.BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0xAA64) {
+            throw "Release binary is not a Windows ARM64 PE binary"
+          }
 
       - name: Smoke release binary
         shell: pwsh
