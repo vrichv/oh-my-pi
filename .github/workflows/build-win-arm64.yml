@@ -267,12 +267,13 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
           UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
         run: |
           $binary = "source/packages/coding-agent/binaries/omp-windows-arm64.exe"
-          gh release view $env:UPSTREAM_TAG *> $null
+          gh release view $env:UPSTREAM_TAG --repo $env:RELEASE_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:UPSTREAM_TAG $binary --clobber
+            gh release upload $env:UPSTREAM_TAG $binary --repo $env:RELEASE_REPOSITORY --clobber
           } else {
-            gh release create $env:UPSTREAM_TAG --title $env:UPSTREAM_TAG --notes "Native Windows ARM64 build from can1357/oh-my-pi $env:UPSTREAM_TAG." $binary
+            gh release create $env:UPSTREAM_TAG --repo $env:RELEASE_REPOSITORY --title $env:UPSTREAM_TAG --notes "Native Windows ARM64 build from can1357/oh-my-pi $env:UPSTREAM_TAG." $binary
           }
