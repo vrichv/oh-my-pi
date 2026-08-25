@@ -6,11 +6,11 @@
 
 - Added asynchronous, size-bounded SVG-to-PNG rasterization for terminal media previews.
 - Added `DiffStream` for incremental text/byte ingestion, direct asynchronous file opening, stable-prefix progress, off-thread exact Myers runs/unified hunks, and asynchronous syntax-grammar warmup.
-- Added `win32-arm64` to the published native leaf target list, the compiled-binary loader allowlist, and restored napi `CROSS_TARGET` cargo-xwin builds for that addon: GNU clang `/imsvc` shim for ring `.S` units, and blake3 `no_neon` so clang-cl plus MSVC `arm64_neon.h` does not reject `__builtin_shufflevector`.
+- Added `win32-arm64` to the published native leaf target list, the compiled-binary loader allowlist, and native Windows ARM64 release builds.
 
 ### Fixed
 
-- Windows arm64 native addons now cross-compile with cargo-xwin’s CMake manifest compatibility shim and static MSVC CRT, and are included in release binaries and native leaf packages.
+- Windows arm64 native addons now build with the native MSVC ARM64 toolchain and static CRT, and are included in release binaries and native leaf packages.
 
 ## [18.0.3] - 2026-08-23
 

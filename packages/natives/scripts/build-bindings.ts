@@ -5,13 +5,9 @@
  * scripts/bazel-natives.ts); release addons build through Bazel with explicit
  * //:natives-* targets.
  *
- * Cross-compilation is limited to the cargo-xwin path used by the standalone
- * win32-arm64 workflow (`CROSS_TARGET` + `TARGET_PLATFORM`/`TARGET_ARCH`).
- * Bazel still owns every other shipped addon. aarch64 Windows keeps clang-cl
- * for C/C++ (cmake; zstd disables ASM on Windows) and shims GNU `clang` so
- * ring's `.S` units accept cargo-xwin's `/imsvc` CFLAGS. blake3's C NEON
- * path is disabled: clang-cl + MSVC `arm64_neon.h` rejects
- * `__builtin_shufflevector`.
+ * Windows arm64 release builds run natively on Windows ARM64 runners. Bazel
+ * owns the other shipped release addons, while this script owns local native
+ * builds and TypeScript binding regeneration.
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
@@ -72,15 +68,13 @@ const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
-const crossTarget = Bun.env.CROSS_TARGET?.trim() || undefined;
-const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
-const targetArch = Bun.env.TARGET_ARCH || process.arch;
-const isCrossCompile = Boolean(crossTarget) || targetPlatform !== process.platform || targetArch !== process.arch;
+const targetPlatform = process.platform;
+const targetArch = process.arch;
 
 const localAddon = resolveLocalHostAddon({
 	platform: targetPlatform,
 	arch: targetArch,
-	avx2: isCrossCompile ? false : detectHostAvx2Support(),
+	avx2: detectHostAvx2Support(),
 });
 const effectiveVariant = localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
@@ -89,9 +83,8 @@ const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 // instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
 // the target's default CPU features: `-C target-cpu=native` would bake the build
 // host's CPU features into the addon and trips ring 0.17's aarch64-apple
-// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES). Cross builds inherit
-// the target triple's default CPU.
-if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
+// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES).
+if (!Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
 	} else if (effectiveVariant === "baseline") {
@@ -187,7 +180,7 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 
 const canonicalAddonFilename = localAddon.filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
-const buildKind = isCrossCompile ? "cross" : "local";
+const buildKind = "local";
 
 console.log(`Building pi-natives bindings for ${targetPlatform}-${targetArch}${variantSuffix} (${buildKind})…`);
 
@@ -223,7 +216,7 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
-const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || (isCrossCompile ? "ci" : "local");
+const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
 
 const napiArgs = [
 	"build",
@@ -240,27 +233,6 @@ const napiArgs = [
 	"--profile",
 	cargoProfile,
 ];
-if (crossTarget) {
-	if (crossTarget === "aarch64-pc-windows-msvc") {
-		// cargo-xwin generates CMake flags for a newer clang-cl than Ubuntu
-		// 22.04 supplies. Keep its `/manifest:no` linker flag out of the GNU
-		// driver and force C dependencies onto the static CRT, matching the
-		// shipped win32-x64 addon. ring's `.S` units also need GNU `clang`
-		// instead of cargo-xwin's clang-cl flags.
-		const shimDir = path.join(nativeDir, ".build", "xwin-clang-shims");
-		await fs.mkdir(shimDir, { recursive: true });
-		await Promise.all([
-			fs.copyFile(path.join(import.meta.dir, "xwin-clang-shim.sh"), path.join(shimDir, "clang")),
-			fs.copyFile(path.join(import.meta.dir, "xwin-clang-cl-shim.sh"), path.join(shimDir, "clang-cl")),
-		]);
-		await Promise.all([
-			fs.chmod(path.join(shimDir, "clang"), 0o755),
-			fs.chmod(path.join(shimDir, "clang-cl"), 0o755),
-		]);
-		process.env.PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`;
-	}
-	napiArgs.push("--target", crossTarget, "--cross-compile");
-}
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

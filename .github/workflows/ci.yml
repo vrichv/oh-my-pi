@@ -553,14 +553,13 @@ jobs:
               name: omp-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
-   # Bazel's MSVC cross toolchain currently supports only x86_64. Build the
-   # arm64 addon with the cargo-xwin path, then feed the resulting binary and
-   # leaf payload through the same release assembly as every other platform.
+   # Bazel's MSVC toolchain is x86_64-only. Build arm64 on a native Windows
+   # ARM64 runner, using the same MSVC/CRT contract as build-win-arm64.yml.
    release_binary_win_arm64:
       name: "Release binary: win32-arm64"
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() }}
       needs: [release_metadata]
-      runs-on: ubuntu-22.04
+      runs-on: windows-11-arm
       permissions:
          contents: read
       steps:
@@ -571,53 +570,59 @@ jobs:
          - uses: dtolnay/rust-toolchain@nightly
            with:
               toolchain: nightly-2026-08-08
-              targets: aarch64-pc-windows-msvc
-              components: llvm-tools
-         - name: Setup sccache
-           uses: mozilla-actions/sccache-action@v0.0.10
-         - name: Enable sccache for cargo
-           shell: bash
+         - name: Enable native ARM64 MSVC build environment
+           shell: pwsh
            run: |
-              {
-                echo "SCCACHE_GHA_ENABLED=true"
-                echo "RUSTC_WRAPPER=sccache"
-                echo "CARGO_INCREMENTAL=0"
-              } >> "$GITHUB_ENV"
-         - name: Install LLVM tooling
-           run: |
-              sudo apt-get update
-              sudo apt-get install -y clang lld llvm
-         - name: Install cargo-xwin
-           uses: taiki-e/install-action@v2
-           with:
-              tool: cargo-xwin@0.23.1
-              fallback: none
-         - name: Cache cargo-xwin Windows SDK
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-           with:
-              path: ~/.cache/cargo-xwin
-              key: cargo-xwin-v0.23.1-win-arm64-v3
-         - name: Accept xwin license
-           run: echo "XWIN_ACCEPT_LICENSE=1" >> "$GITHUB_ENV"
-         - name: Install system dependencies
-           run: |
-              sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev ninja-build cmake
+              $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+              $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+              if (-not $vsRoot) {
+                throw "Visual Studio ARM64 C++ tools are not installed"
+              }
+              $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
+              $environment = & cmd.exe /d /s /c "call `"$devCmd`" -arch=arm64 -host_arch=arm64 >nul && set"
+              foreach ($entry in $environment) {
+                if ($entry -match "^[^=]+=.*$") {
+                  $entry | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                }
+              }
+              $toolchain = Join-Path $env:RUNNER_TEMP "omp-arm64-msvc.cmake"
+              @(
+                "set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)"
+                "set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)"
+              ) | Set-Content -Path $toolchain -Encoding utf8
+              @(
+                "CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc=$toolchain"
+                "CFLAGS=/MT"
+                "CXXFLAGS=/MT"
+                "RUSTFLAGS=-C target-feature=+crt-static"
+              ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
          - run: bun install --frozen-lockfile
          - name: Build native addon
+           shell: pwsh
            env:
-              CROSS_TARGET: aarch64-pc-windows-msvc
-              TARGET_PLATFORM: win32
-              TARGET_ARCH: arm64
-              RUSTFLAGS: -C target-feature=+crt-static
               OMP_NATIVE_CARGO_PROFILE: ci
            run: bun --cwd=packages/natives run build:bindings
          - name: Assert win32-arm64 native addon is present
-           run: test -f packages/natives/native/pi_natives.win32-arm64.node
+           shell: pwsh
+           run: if (-not (Test-Path packages/natives/native/pi_natives.win32-arm64.node)) { throw "Native addon was not built" }
          - name: Build release binary
+           shell: pwsh
            env:
               RELEASE_TARGETS: win32-arm64
            run: bun run ci:release:build-binaries
+
+         - name: Smoke release binary
+           shell: pwsh
+           run: |
+              $runtimeDir = Join-Path $env:RUNNER_TEMP "omp-win-arm64-smoke"
+              New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+              $env:HOME = Join-Path $runtimeDir "home"
+              $env:XDG_DATA_HOME = Join-Path $runtimeDir "xdg"
+              $binary = (Resolve-Path "packages/coding-agent/binaries/omp-windows-arm64.exe").Path
+              & $binary --version
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              & $binary --smoke-test
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
          - name: Upload native addon artifact
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
