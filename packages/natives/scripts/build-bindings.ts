@@ -242,13 +242,21 @@ const napiArgs = [
 ];
 if (crossTarget) {
 	if (crossTarget === "aarch64-pc-windows-msvc") {
-		// ring 0.17 force-switches aarch64-windows units to GNU clang for `.S`
-		// assembly while cargo-xwin's clang-cl CFLAGS still carry `/imsvc`.
-		const shimDir = path.join(nativeDir, ".build", "xwin-clang-shim");
+		// cargo-xwin generates CMake flags for a newer clang-cl than Ubuntu
+		// 22.04 supplies. Keep its `/manifest:no` linker flag out of the GNU
+		// driver and force C dependencies onto the static CRT, matching the
+		// shipped win32-x64 addon. ring's `.S` units also need GNU `clang`
+		// instead of cargo-xwin's clang-cl flags.
+		const shimDir = path.join(nativeDir, ".build", "xwin-clang-shims");
 		await fs.mkdir(shimDir, { recursive: true });
-		const shimPath = path.join(shimDir, "clang");
-		await fs.copyFile(path.join(import.meta.dir, "xwin-clang-shim.sh"), shimPath);
-		await fs.chmod(shimPath, 0o755);
+		await Promise.all([
+			fs.copyFile(path.join(import.meta.dir, "xwin-clang-shim.sh"), path.join(shimDir, "clang")),
+			fs.copyFile(path.join(import.meta.dir, "xwin-clang-cl-shim.sh"), path.join(shimDir, "clang-cl")),
+		]);
+		await Promise.all([
+			fs.chmod(path.join(shimDir, "clang"), 0o755),
+			fs.chmod(path.join(shimDir, "clang-cl"), 0o755),
+		]);
 		process.env.PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`;
 	}
 	napiArgs.push("--target", crossTarget, "--cross-compile");
