@@ -1,0 +1,278 @@
+# Build and publish a native Windows ARM64 omp binary from the latest upstream
+# release source. This repository intentionally contains no upstream source:
+# every build checks out can1357/oh-my-pi at an immutable release tag.
+
+name: Build upstream win-arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build; blank selects the latest release.
+        required: false
+        type: string
+      force:
+        description: Rebuild even when this repository already publishes the tag's ARM64 asset.
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Friday 00:00 UTC. GitHub schedules always use UTC.
+    - cron: "0 0 * * 5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-win-arm64-${{ github.event.inputs.tag || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build upstream win32-arm64
+    runs-on: windows-11-arm
+    steps:
+      - name: Resolve upstream release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          if ($env:REQUESTED_TAG) {
+            $tag = $env:REQUESTED_TAG
+          } else {
+            $tag = (Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/can1357/oh-my-pi/releases/latest").tag_name
+          }
+          if (-not $tag -or $tag -notmatch '^v[0-9A-Za-z.+-]+$') {
+            throw "Upstream latest release returned an invalid tag: $tag"
+          }
+          $existing = $null
+          try {
+            $existing = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
+          }
+          $hasAsset = $existing -and $existing.assets.name -contains "omp-windows-arm64.exe"
+          $shouldBuild = $env:FORCE_BUILD -eq "true" -or -not $hasAsset
+          @(
+            "tag=$tag"
+            "should_build=$($shouldBuild.ToString().ToLowerInvariant())"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Checkout upstream release source
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: can1357/oh-my-pi
+          ref: ${{ steps.release.outputs.tag }}
+          path: source
+          fetch-depth: 1
+
+
+      - name: Read upstream tool versions safely
+        if: steps.release.outputs.should_build == 'true'
+        id: toolchain
+        shell: pwsh
+        run: |
+          $package = Get-Content source/package.json -Raw | ConvertFrom-Json
+          $bunVersion = if ($package.packageManager -match '^bun@(.+)$') { $Matches[1] } else { throw "Upstream package.json has no Bun packageManager version" }
+          $rustToolchain = Get-Content source/rust-toolchain.toml -Raw
+          $rustVersion = if ($rustToolchain -match '(?m)^channel\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "Upstream rust-toolchain.toml has no channel" }
+          @(
+            "bun=$bunVersion"
+            "rust=$rustVersion"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Setup upstream Bun
+        if: steps.release.outputs.should_build == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.toolchain.outputs.bun }}
+
+      - name: Setup upstream Rust
+        if: steps.release.outputs.should_build == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ steps.toolchain.outputs.rust }}
+
+      - name: Cache Bun dependencies
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: upstream-bun-win-arm64-${{ steps.release.outputs.tag }}-${{ hashFiles('source/bun.lock') }}
+
+      - name: Cache Cargo dependencies
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: upstream-cargo-win-arm64-${{ steps.release.outputs.tag }}-${{ hashFiles('source/Cargo.lock') }}
+
+      - name: Enable native ARM64 MSVC environment
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vsRoot) { throw "Visual Studio ARM64 C++ tools are not installed" }
+          $devCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
+          $environment = & cmd.exe /d /s /c "call `"$devCmd`" -arch=arm64 -host_arch=arm64 >nul && set"
+          foreach ($entry in $environment) {
+            if ($entry -match "^[^=]+=.*$") { $entry | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+          }
+          $toolchain = Join-Path $env:RUNNER_TEMP "omp-arm64-msvc.cmake"
+          @(
+            "set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)"
+            "set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)"
+          ) | Set-Content -Path $toolchain -Encoding utf8
+          @(
+            "CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc=$toolchain"
+            "CFLAGS="
+            "CXXFLAGS="
+            "CL=/MT"
+            "RUSTFLAGS=-C target-feature=+crt-static"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify ARM64 C toolchain
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        run: |
+          $probeDir = Join-Path $env:RUNNER_TEMP "omp-arm64-toolchain-probe"
+          New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+          $source = Join-Path $probeDir "probe.c"
+          "int main(void) { return 0; }" | Set-Content -Path $source -Encoding ascii
+          & cl.exe /nologo /MT "/Fe$probeDir\msvc.exe" $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$probeDir\msvc.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & clang.exe --target=aarch64-pc-windows-msvc -c $source -o "$probeDir\clang.obj"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @(
+            "cmake_minimum_required(VERSION 3.15)"
+            "project(omp_arm64_probe C)"
+            "add_executable(omp_arm64_probe probe.c)"
+          ) | Set-Content -Path (Join-Path $probeDir "CMakeLists.txt") -Encoding ascii
+          $cmakeBuild = Join-Path $probeDir "cmake"
+          & cmake.exe -S $probeDir -B $cmakeBuild -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cmake.exe --build $cmakeBuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $cmakeBuild "omp_arm64_probe.exe")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Patch upstream for compiled Windows ARM64
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        run: |
+          $loaderPath = "source/packages/natives/native/loader-state.js"
+          $loader = Get-Content $loaderPath -Raw
+          if ($loader -notmatch '"win32-arm64"') {
+            $needle = '"win32-x64"];'
+            if (-not $loader.Contains($needle)) { throw "Unsupported upstream loader platform declaration" }
+            $loader = $loader.Replace($needle, '"win32-x64", "win32-arm64"];')
+            Set-Content -Path $loaderPath -Value $loader -NoNewline -Encoding utf8
+          }
+
+          $builderPath = "source/scripts/ci-release-build-binaries.ts"
+          $builder = Get-Content $builderPath -Raw
+          if ($builder -notmatch 'id: "win32-arm64"') {
+            $marker = "const targets: BinaryTarget[] = ["
+            if (-not $builder.Contains($marker)) { throw "Unsupported upstream release target declaration" }
+            $arm64Target = @(
+              "`t{"
+              "`t`tid: `"win32-arm64`","
+              "`t`tplatform: `"win32`","
+              "`t`tarch: `"arm64`","
+              "`t`ttarget: `"bun-windows-arm64`","
+              "`t`toutfile: `"packages/coding-agent/binaries/omp-windows-arm64.exe`","
+              "`t},"
+            ) -join "`n"
+            $builder = $builder.Replace($marker, "$marker`r`n$arm64Target")
+            Set-Content -Path $builderPath -Value $builder -NoNewline -Encoding utf8
+          }
+
+      - name: Install upstream dependencies
+        if: steps.release.outputs.should_build == 'true'
+        working-directory: source
+        run: bun install --frozen-lockfile
+
+      - name: Build upstream native addon
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        env:
+          OMP_NATIVE_CARGO_PROFILE: ci
+        run: bun --cwd=packages/natives run build:bindings
+
+      - name: Assert upstream native addon targets ARM64
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $path = "packages/natives/native/pi_natives.win32-arm64.node"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $offset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          if ($bytes[$offset] -ne 0x50 -or $bytes[$offset + 1] -ne 0x45 -or [System.BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0xAA64) {
+            throw "Native addon is not a Windows ARM64 PE binary"
+          }
+
+      - name: Build upstream release binary
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        env:
+          RELEASE_TARGETS: win32-arm64
+        run: bun run ci:release:build-binaries
+
+      - name: Verify upstream ARM64 binary
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $path = "packages/coding-agent/binaries/omp-windows-arm64.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          $offset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          if ($bytes[$offset] -ne 0x50 -or $bytes[$offset + 1] -ne 0x45 -or [System.BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0xAA64) {
+            throw "Release binary is not a Windows ARM64 PE binary"
+          }
+          $runtimeDir = Join-Path $env:RUNNER_TEMP "omp-win-arm64-smoke"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          $env:HOME = Join-Path $runtimeDir "home"
+          $env:XDG_DATA_HOME = Join-Path $runtimeDir "xdg"
+          $binary = (Resolve-Path $path).Path
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $binary --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows ARM64 binary
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-windows-arm64-${{ steps.release.outputs.tag }}
+          path: source/packages/coding-agent/binaries/omp-windows-arm64.exe
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Publish Windows ARM64 binary
+        if: steps.release.outputs.should_build == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $binary = "source/packages/coding-agent/binaries/omp-windows-arm64.exe"
+          gh release view $env:UPSTREAM_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:UPSTREAM_TAG $binary --clobber
+          } else {
+            gh release create $env:UPSTREAM_TAG --title $env:UPSTREAM_TAG --notes "Native Windows ARM64 build from can1357/oh-my-pi $env:UPSTREAM_TAG." $binary
+          }
