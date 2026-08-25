@@ -16,7 +16,7 @@ describe("cargo-xwin clang-cl shim", () => {
 			await Bun.write(compiler, `#!/bin/sh\nprintf '%s\\n' "$@" > "$CAPTURED_ARGS"\n`);
 			await fs.chmod(compiler, 0o755);
 
-			const proc = Bun.spawn([shim, "-MD", "/manifest:no", "-MDd", "source.c"], {
+			const proc = Bun.spawn([shim, "/MD", "/manifest:no", "-MD", "/MDd", "-MT", "source.c"], {
 				env: {
 					...Bun.env,
 					CAPTURED_ARGS: capturedArgs,
@@ -26,7 +26,13 @@ describe("cargo-xwin clang-cl shim", () => {
 				stderr: "pipe",
 			});
 			expect(await proc.exited).toBe(0);
-			expect((await Bun.file(capturedArgs).text()).trim().split("\n")).toEqual(["-MT", "-MTd", "source.c"]);
+			expect((await Bun.file(capturedArgs).text()).trim().split("\n")).toEqual([
+				"/MT",
+				"-MD",
+				"/MTd",
+				"-MT",
+				"source.c",
+			]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

@@ -2,8 +2,8 @@
 # cargo-xwin's CMake toolchain assumes clang-cl accepts `/manifest:no`, but
 # Ubuntu 22.04's LLVM 14 GNU driver rejects it as a pathname. The flag only
 # suppresses manifest embedding for CMake's throwaway try-compile executable,
-# so remove it. Convert CMake's /MD flags to /MT as well: the shipped addon
-# must not require VCRUNTIME140.dll on clean Windows installations.
+# so remove it. `/MD` is the MSVC dynamic-CRT switch; `-MD`/`-MT` are GNU
+# dependency-file options and must pass through unchanged.
 set -euo pipefail
 
 self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -25,8 +25,8 @@ args=()
 for arg; do
 	case "$arg" in
 	/manifest:no) ;;
-	-MD) args+=("-MT") ;;
-	-MDd) args+=("-MTd") ;;
+	/MD) args+=("/MT") ;;
+	/MDd) args+=("/MTd") ;;
 	*) args+=("$arg") ;;
 	esac
 done
