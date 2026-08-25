@@ -1,9 +1,9 @@
 # Build the omp CLI binary on native Windows arm64.
 #
-# This workflow is self-contained: the Windows 11 arm64 runner builds the
-# addon with the installed ARM64 MSVC toolchain, embeds it in the CLI, and
-# uploads the completed artifacts. No Linux cross-compile tools or artifacts
-# from another workflow participate.
+# This workflow is self-contained: the Windows 11 arm64 image already ships
+# ARM64 MSVC, the Windows SDK, CMake, and Ninja. It builds the addon with that
+# native toolchain, embeds it in the CLI, and uploads the completed artifacts;
+# no Linux cross-compile tooling or MSVC CRT/SDK download participates.
 #
 # Usage:
 #   - Trigger manually (workflow_dispatch) for an ad-hoc native arm64 build.
@@ -54,6 +54,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-08-08
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-win-arm64-${{ hashFiles('**/bun.lock') }}
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: cargo-win-arm64-${{ hashFiles('Cargo.lock') }}
 
       - name: Enable native ARM64 MSVC build environment
         shell: pwsh

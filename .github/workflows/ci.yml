@@ -553,8 +553,8 @@ jobs:
               name: omp-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
-   # Bazel's MSVC toolchain is x86_64-only. Build arm64 on a native Windows
-   # ARM64 runner, using the same MSVC/CRT contract as build-win-arm64.yml.
+   # Bazel's MSVC toolchain is x86_64-only. Build arm64 on the native Windows
+   # ARM64 image, which already has MSVC, the Windows SDK, CMake, and Ninja.
    release_binary_win_arm64:
       name: "Release binary: win32-arm64"
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() }}
@@ -570,6 +570,20 @@ jobs:
          - uses: dtolnay/rust-toolchain@nightly
            with:
               toolchain: nightly-2026-08-08
+
+         - name: Cache Bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.bun/install/cache
+              key: bun-win-arm64-${{ hashFiles('**/bun.lock') }}
+         - name: Cache Cargo dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: |
+                ~/.cargo/registry/cache
+                ~/.cargo/registry/index
+                ~/.cargo/git/db
+              key: cargo-win-arm64-${{ hashFiles('Cargo.lock') }}
          - name: Enable native ARM64 MSVC build environment
            shell: pwsh
            run: |
